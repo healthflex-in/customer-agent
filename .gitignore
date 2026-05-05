@@ -1,0 +1,46 @@
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+config/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+._*
+
+# Audio / media (runtime files)
+received_audio/
+tts_cache/
+audio_files/
+*.wav
+*.mp3
+
+# Transcripts (runtime data)
+transcripts/
+
+# Upload temp
+output/
+
+# ChromaDB (runtime vector store)
+db/
+
+# Node
+node_modules/
+
+# IDE
+.idea/
+.vscode/

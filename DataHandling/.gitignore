@@ -1,0 +1,10 @@
+__pycache__
+config/
+test.py
+
+# Security - Never commit private keys
+*.pem
+*.key
+.env
+.env.local
+.env.*.local

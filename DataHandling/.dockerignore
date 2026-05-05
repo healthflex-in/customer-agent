@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Documentation
+*.md
+!README.md
+
+# Keys (will be mounted as volumes)
+*.pem
+
+# Local development files
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test files
+test_*.py
+*_test.py
+
+# Legacy code
+legacy/
+
+# Large audio/cache files (will be mounted as volumes)
+audio_files/
+transcripts/
+tts_cache/
+received_audio/
+
+# Database files (will be mounted as volumes)
+db/
+
+# Temporary files
+*.tmp
+*.temp
+
+

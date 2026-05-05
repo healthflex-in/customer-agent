@@ -1,0 +1,1 @@
+from docscanner.client import query_openai  # noqa: F401

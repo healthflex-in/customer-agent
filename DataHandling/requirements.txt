@@ -1,0 +1,79 @@
+numpy
+transformers
+gradio
+sounddevice
+gtts
+pydub
+torch
+pymongo
+SpeechRecognition
+pyttsx3
+PyAudio
+boto3
+requests
+pdf2image
+Pillow
+
+GPUtil
+
+# # Use PyTorch's CUDA 12.1 build index. Already present in dockerfile
+# --extra-index-url https://download.pytorch.org/whl/cu121
+# torch==2.5.1+cu121
+# torchvision==0.20.1+cu121
+# torchaudio==2.5.1+cu121
+
+# FastAPI and Server
+fastapi==0.115.9
+uvicorn[standard]==0.23.2
+python-dotenv==1.0.1
+
+# WebSocket dependencies (compatible with google-genai)
+websockets>=13.0.0,<15.1.0
+
+# Database and Vector Store
+chromadb==1.0.4
+redis==5.2.1
+
+# LlamaIndex Core
+llama-index==0.12.25
+llama-index-core==0.12.25
+llama-index-llms-gemini==0.4.14
+llama-index-llms-google-genai==0.1.12
+llama-index-embeddings-huggingface==0.4.0
+llama-index-vector-stores-chroma==0.4.0
+llama-index-llms-vertex==0.4.6
+
+# HuggingFace
+huggingface-hub==0.30.2
+sentence-transformers==2.6.1
+
+# Google Cloud Services
+google-cloud-speech==2.31.1
+google-generativeai==0.8.5
+google-cloud-aiplatform==1.71.1
+google-auth==2.39.0
+google-api-core==2.24.2
+
+# Audio Processing
+pydub==0.25.1
+openai-whisper
+
+# Networking and gRPC
+grpcio>=1.71.0,<1.73.0
+
+# Monitoring and Observability
+arize-phoenix-client==1.4.0
+arize-phoenix-evals==0.20.6
+arize-phoenix-otel==0.9.2
+
+# OpenTelemetry
+opentelemetry-api==1.32.1
+opentelemetry-sdk==1.32.1
+opentelemetry-instrumentation-fastapi==0.53b1
+openinference-instrumentation==0.1.28
+openinference-instrumentation-vertexai==0.1.11
+openinference-instrumentation-openai==0.1.30
+
+# Utilities
+tqdm==4.67.1
+
