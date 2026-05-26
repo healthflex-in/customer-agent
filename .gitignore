@@ -35,8 +35,9 @@ transcripts/
 # Upload temp
 output/
 
-# ChromaDB (runtime vector store)
-db/
+# ChromaDB (runtime vector store) — anchored to the DataHandling root so
+# this pattern does NOT match app/db/ (which holds source code).
+/DataHandling/db/
 
 # Node
 node_modules/
@@ -44,3 +45,9 @@ node_modules/
 # IDE
 .idea/
 .vscode/
+
+# Local-only refactor archive (dead code moved aside, not for git)
+.trash/
+
+# Local docker compose overrides (per-dev port mappings, etc.)
+docker-compose.override.yml

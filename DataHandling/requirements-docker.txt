@@ -41,7 +41,8 @@ google-api-core==2.24.2
 
 # Audio Processing (server-side only)
 pydub==0.25.1
-openai-whisper
+# openai-whisper  # replaced by faster-whisper (CTranslate2 backend, ~4x faster on CPU)
+faster-whisper>=1.0.0
 gtts
 
 # PyTorch (CPU-only, no CUDA) - Install separately with extra index

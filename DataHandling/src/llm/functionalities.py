@@ -131,14 +131,53 @@ class HealthAgent:
             return "Response could not be processed"
 
     def llm_complete(self, prompt):
-        """Call LLM with appropriate error handling"""
+        """Call LLM with appropriate error handling + token/latency logging."""
+        import time as _time
+
         try:
             if self.llm is None:
                 raise ValueError("LLM not initialized")
 
-            # Use the correct method for the LLM type
+            t0 = _time.perf_counter()
             response = self.llm.complete(prompt)
-            # Convert response to string
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+            # Best-effort token-count logging. `response.raw` is a dict for the
+            # google_genai wrapper; the legacy gemini wrapper returns an object
+            # with attributes. Handle both.
+            in_tok = out_tok = None
+            try:
+                raw = getattr(response, "raw", None)
+                usage = None
+                if isinstance(raw, dict):
+                    usage = raw.get("usage_metadata")
+                elif raw is not None:
+                    usage = getattr(raw, "usage_metadata", None)
+                if usage:
+                    if isinstance(usage, dict):
+                        in_tok = usage.get("prompt_token_count")
+                        out_tok = usage.get("candidates_token_count")
+                    else:
+                        in_tok = getattr(usage, "prompt_token_count", None)
+                        out_tok = getattr(usage, "candidates_token_count", None)
+            except Exception:
+                pass
+
+            model_name = getattr(self.llm, "model", "?")
+            if in_tok is not None and out_tok is not None:
+                # Rough $ estimate using Gemini 2.0 Flash on-demand pricing
+                # (input $0.10 / output $0.40 per 1M). Real bill may differ.
+                cost_usd = (in_tok * 0.10 + out_tok * 0.40) / 1_000_000
+                print(
+                    f"[llm] model={model_name} in={in_tok} out={out_tok} "
+                    f"latency={elapsed_ms:.0f}ms est_cost=${cost_usd:.6f}"
+                )
+            else:
+                print(
+                    f"[llm] model={model_name} latency={elapsed_ms:.0f}ms "
+                    f"(token count unavailable)"
+                )
+
             return self.ensure_string(response)
         except Exception as e:
             print(f"Error in LLM completion: {e}")

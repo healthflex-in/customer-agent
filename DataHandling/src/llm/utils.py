@@ -1,4 +1,7 @@
-from llama_index.llms.gemini import Gemini
+# Migrated from the deprecated `llama_index.llms.gemini.Gemini` wrapper to the
+# unified `llama_index.llms.google_genai.GoogleGenAI` wrapper, which uses
+# Google's current SDK and exposes usage metadata (token counts) on responses.
+from llama_index.llms.google_genai import GoogleGenAI
 from llama_index.core import Settings
 from src.enums import ENUMS
 import json
@@ -44,9 +47,15 @@ def load_gemini_key(key_path=enums_obj.config_key_path):
 
 def init_llm(api_key):
     """
-    Initialize the LLM model using the Gemini API key.
+    Initialize the LLM via the new google_genai wrapper.
+
+    Strips the legacy "models/" prefix from the model name if present —
+    the new SDK accepts plain names like "gemini-2.0-flash".
     """
-    llm = Gemini(api_key=api_key, model=enums_obj.gemini_model_name)
+    model_name = enums_obj.gemini_model_name
+    if model_name.startswith("models/"):
+        model_name = model_name[len("models/"):]
+    llm = GoogleGenAI(model=model_name, api_key=api_key)
     Settings.llm = llm
     return llm
 

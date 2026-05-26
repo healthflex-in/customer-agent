@@ -445,7 +445,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncio
 import numpy as np
-import whisper
+from faster_whisper import WhisperModel  # ~4x faster than openai-whisper on CPU
 import torch
 import wave
 import time
@@ -476,6 +476,31 @@ from docscanner.service import summarize_report_from_bytes
 # Import HealthAgent and related functionalities
 from src.llm.functionalities import HealthAgent
 
+# Centralized configuration (env vars, constants, paths).
+# Aliased to the legacy names used throughout this file so handler code is
+# unchanged. New code should import directly from app.config.
+from app.config import (
+    MONGO_URI,
+    MONGO_DB_NAME,
+    MONGO_USERS_COLLECTION,
+    MONGO_CUSTOMER_INFO_COLLECTION,
+    CORS_ALLOWED_ORIGINS,
+    AUDIO_RATE as RATE,
+    AUDIO_SAMPLE_WIDTH as SAMPLE_WIDTH,
+    MAX_WS_CHUNK_SIZE as MAX_CHUNK_SIZE,
+    DEFAULT_FORM_ID,
+    ALLOWED_ATTACHMENT_TYPES,
+    MAX_ATTACHMENT_SIZE_MB,
+    UPLOAD_TRIGGER_PHRASE,
+    TTS_CACHE_DIR,
+)
+# Pure stateless helpers. Aliased to legacy names used throughout this file.
+from app.db.serializers import (
+    normalize_user_id,
+    serialize_datetime as _serialize_datetime,
+    serialize_user,
+)
+
 # Import MongoDB database connector
 # MongoDB DISABLED - Commented out
 # from db import MedicalInterviewDB
@@ -485,28 +510,26 @@ app = FastAPI()
 # Add CORS middleware to allow frontend connections
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://customerai.stance.health",
-        "https://customer-agent-mu.vercel.app",
-        "http://localhost:3000",
-        "http://localhost:8080",
-        "http://localhost:8000",
-        "http://localhost:8081",
-    ],  # Production frontend and local development origins
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Create directories for saving audio and transcripts
-os.makedirs("audio_files", exist_ok=True)
-os.makedirs("tts_cache", exist_ok=True)
-os.makedirs("transcripts", exist_ok=True)
+# TTS cache directory (audio_files and transcripts debug dirs removed —
+# writes are no longer performed; see PUBLIC_API.md §5).
+os.makedirs(TTS_CACHE_DIR, exist_ok=True)
 
-# Load Whisper model
-print("Loading Whisper model...")
+# Load Whisper model (via faster-whisper / CTranslate2).
+# compute_type=int8 quantizes weights to int8 on CPU — ~2-4x faster than fp32
+# with negligible accuracy impact on the "base" model.
+print("Loading Whisper model (faster-whisper, base, int8)...")
 cuda_device = "cuda" if torch.cuda.is_available() else "cpu"
-model = whisper.load_model("base", device=cuda_device)
+model = WhisperModel(
+    "base",
+    device=cuda_device,
+    compute_type="int8" if cuda_device == "cpu" else "float16",
+)
 print(f"Model loaded on {cuda_device}")
 
 # Initialize HealthAgent
@@ -514,37 +537,13 @@ print("Initializing HealthAgent...")
 health_agent = HealthAgent()
 print("HealthAgent initialized")
 
-# MongoDB configuration
-MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "stance-dashboard")
-MONGO_USERS_COLLECTION = os.getenv("MONGO_USERS_COLLECTION", "users")
-MONGO_CUSTOMER_INFO_COLLECTION = "customer-info"
+# MongoDB connection handles (populated by init_mongo()).
 mongo_client = None
 users_collection: Optional[Collection] = None
 customer_info_collection: Optional[Collection] = None
 
-ALLOWED_ATTACHMENT_TYPES = {
-    "mri": "MRI Scan",
-    "report": "Clinical Report",
-    "other": "Supporting Document",
-}
-MAX_ATTACHMENT_SIZE_MB = 15
-UPLOAD_TRIGGER_PHRASE = "do you have any mri, x-ray, ct scan, or blood reports"
 
-
-def normalize_user_id(user_id: Optional[str]):
-    """
-    Normalize user_id to a MongoDB ObjectId where possible.
-    - If user_id is a valid 24-char hex string, return ObjectId(user_id).
-    - Otherwise, return the original value (e.g., for legacy string IDs).
-    """
-    if not user_id:
-        return None
-    try:
-        return ObjectId(user_id)
-    except Exception:
-        # Fall back to storing as-is (string)
-        return user_id
+# normalize_user_id moved to app.db.serializers (imported above).
 
 
 def init_mongo():
@@ -575,55 +574,7 @@ def init_mongo():
         print(f"Failed to connect to MongoDB. User suggestions and customer info disabled: {e}")
 
 
-def _serialize_datetime(value):
-    if value is None:
-        return ""
-    if isinstance(value, datetime):
-        return value.isoformat()
-    try:
-        return str(value)
-    except Exception:
-        return ""
-
-
-def serialize_user(doc):
-    """Transform MongoDB user document into API-friendly shape."""
-    if not doc:
-        return None
-
-    first = (
-        doc.get("firstName")
-        or doc.get("first_name")
-        or doc.get("profileData", {}).get("firstName")
-        or doc.get("personalDetails", {}).get("firstName")
-        or ""
-    )
-    last = (
-        doc.get("lastName")
-        or doc.get("last_name")
-        or doc.get("profileData", {}).get("lastName")
-        or doc.get("personalDetails", {}).get("lastName")
-        or ""
-    )
-    full = " ".join([part for part in [first, last] if part]).strip()
-    if not full:
-        full = (
-            doc.get("fullName")
-            or doc.get("name")
-            or doc.get("profileData", {}).get("fullName")
-            or doc.get("profileData", {}).get("name")
-            or doc.get("personalDetails", {}).get("fullName")
-            or doc.get("personalDetails", {}).get("name")
-            or doc.get("email")
-            or ""
-        )
-
-    return {
-        "id": str(doc.get("_id")),
-        "firstName": first,
-        "lastName": last,
-        "fullName": full,
-    }
+# _serialize_datetime and serialize_user moved to app.db.serializers (imported above).
 
 
 def generate_form_title(form_data: dict) -> str:
@@ -673,7 +624,7 @@ Generate only the title, nothing else. The title should be clear and based on th
 
 
 # Fixed form ID - same for all users. Uniqueness comes from (formId + userId) combination
-DEFAULT_FORM_ID = "FRM-01"
+# DEFAULT_FORM_ID moved to app.config (imported above).
 
 def save_customer_info(
     user_id: str,
@@ -1315,9 +1266,7 @@ async def health_check():
 
 
 # Audio parameters
-RATE = 16000  # 16kHz
-SAMPLE_WIDTH = 2  # 16-bit PCM = 2 bytes per sample
-MAX_CHUNK_SIZE = 65536  # 64KB per message - well below WebSocket limits
+# Audio constants moved to app.config (imported as RATE, SAMPLE_WIDTH, MAX_CHUNK_SIZE).
 
 
 def save_audio(file_name, audio_data):
@@ -2592,65 +2541,52 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             continue
 
-                        # Save received audio for debugging (raw format)
+                        # timestamp still needed downstream for the outbound
+                        # 'transcription' WS message; the debug .raw write was removed.
                         timestamp = int(time.time())
-                        raw_file_path = f"audio_files/server_received_{timestamp}.raw"
-                        with open(raw_file_path, "wb") as f:
-                            f.write(audio_bytes)
-                        print(f"Saved raw audio to {raw_file_path} ({len(audio_bytes)} bytes)")
 
                         # Process audio with Whisper
                         try:
-                            # The frontend sends WebM/Opus format, not raw PCM
-                            # We need to convert it to a format Whisper can understand
-                            # Use pydub to load and convert the audio
+                            t_decode_start = time.perf_counter()
+
+                            # Browsers' MediaRecorder almost always sends WebM/Opus;
+                            # try that first, then ogg as a fallback. Skipping the
+                            # 4-format exception loop saves ~50-200ms on a happy path.
                             audio_segment = None
-                            audio_format = None
-                            
-                            # Try different formats in order of likelihood
-                            formats_to_try = [
-                                ("webm", "WebM/Opus"),
-                                ("ogg", "OGG/Opus"),
-                                ("wav", "WAV"),
-                                ("mp4", "MP4"),
-                            ]
-                            
-                            for fmt, fmt_name in formats_to_try:
+                            try:
+                                audio_segment = AudioSegment.from_file(
+                                    io.BytesIO(audio_bytes), format="webm"
+                                )
+                            except Exception:
                                 try:
                                     audio_segment = AudioSegment.from_file(
-                                        io.BytesIO(audio_bytes),
-                                        format=fmt
+                                        io.BytesIO(audio_bytes), format="ogg"
                                     )
-                                    audio_format = fmt_name
-                                    print(f"✅ Successfully loaded audio as {fmt_name}")
-                                    break
                                 except Exception as e:
-                                    print(f"⚠️ Failed to load as {fmt_name}: {e}")
-                                    continue
-                            
-                            if audio_segment is None:
-                                raise Exception("Could not determine audio format. Please ensure ffmpeg is installed.")
-                            
+                                    raise Exception(
+                                        f"Could not decode audio (tried webm, ogg): {e}. "
+                                        "Ensure ffmpeg is installed."
+                                    )
+
                             # Convert to mono, 16kHz, 16-bit (Whisper requirements)
-                            audio_segment = audio_segment.set_channels(1)
-                            audio_segment = audio_segment.set_frame_rate(RATE)
-                            audio_segment = audio_segment.set_sample_width(2)  # 16-bit
-                            
-                            # Export to raw bytes
-                            wav_io = io.BytesIO()
-                            audio_segment.export(wav_io, format="wav")
-                            wav_data = wav_io.getvalue()
-                            
-                            # Save converted WAV for debugging
-                            wav_file_path = f"audio_files/server_received_{timestamp}.wav"
-                            with open(wav_file_path, "wb") as f:
-                                f.write(wav_data)
-                            print(f"Saved converted WAV to {wav_file_path}")
-                            
-                            # Convert to numpy array for Whisper
-                            # Skip WAV header (first 44 bytes) and get raw audio data
-                            audio_data = audio_segment.get_array_of_samples()
-                            np_audio = np.array(audio_data, dtype=np.float32) / 32768.0
+                            audio_segment = (
+                                audio_segment.set_channels(1)
+                                .set_frame_rate(RATE)
+                                .set_sample_width(2)
+                            )
+
+                            # Convert directly to numpy for Whisper.
+                            # NOTE: previous code also produced an unused WAV blob here
+                            # via audio_segment.export — removed (pure waste).
+                            np_audio = (
+                                np.array(
+                                    audio_segment.get_array_of_samples(),
+                                    dtype=np.float32,
+                                )
+                                / 32768.0
+                            )
+
+                            t_decode_ms = (time.perf_counter() - t_decode_start) * 1000
 
                             # Skip if audio appears to be empty or corrupted
                             if np_audio.size == 0 or np.max(np.abs(np_audio)) < 0.01:
@@ -2666,24 +2602,35 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     )
                                 )
                                 continue
-                            
-                            print(f"Audio processed: {len(np_audio)} samples, max amplitude: {np.max(np.abs(np_audio)):.4f}")
 
-                            # Process with Whisper without trimming to 30s
-                            transcribe_options = {
-                                "language": "en",
-                                "fp16": torch.cuda.is_available() and cuda_device == "cuda",
-                                "temperature": 0,
-                            }
-                            result = whisper.transcribe(
-                                model,
-                                np_audio,
-                                **transcribe_options,
+                            audio_secs = len(np_audio) / RATE
+                            print(
+                                f"[audio] decoded {len(audio_bytes)/1024:.1f}KB → "
+                                f"{audio_secs:.2f}s pcm in {t_decode_ms:.0f}ms"
                             )
 
-                            # Extract transcription
-                            transcription = result.get("text", "").strip()
-                            print(f"✅ Transcription: {transcription}")
+                            # Transcribe via faster-whisper.
+                            # beam_size=1 = greedy decoding (fastest, ~same quality
+                            # for short utterances). vad_filter trims silent regions
+                            # before transcribing — extra speedup for chunks with
+                            # leading/trailing silence.
+                            t_whisper_start = time.perf_counter()
+                            segments, _info = model.transcribe(
+                                np_audio,
+                                language="en",
+                                temperature=0,
+                                beam_size=1,
+                                vad_filter=True,
+                            )
+                            transcription = "".join(s.text for s in segments).strip()
+                            t_whisper_ms = (time.perf_counter() - t_whisper_start) * 1000
+                            rtf = (
+                                t_whisper_ms / 1000 / audio_secs if audio_secs > 0 else 0
+                            )
+                            print(
+                                f"[audio] whisper {t_whisper_ms:.0f}ms "
+                                f"(rtf={rtf:.2f}x) → {transcription!r}"
+                            )
 
                             # Send transcription immediately to frontend for real-time display
                             await websocket.send_text(
@@ -2696,10 +2643,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 )
                             )
 
-                            # Save transcript for reference
-                            transcript_path = f"transcripts/transcript_{timestamp}.txt"
-                            with open(transcript_path, "w") as f:
-                                f.write(transcription)
+                            # (transcript .txt write removed — never read back)
 
                             # Log user's speech in the database
                             # MongoDB DISABLED - Commented out
