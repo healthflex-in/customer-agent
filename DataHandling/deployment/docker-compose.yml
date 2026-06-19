@@ -6,6 +6,7 @@ services:
       context: ../..
       dockerfile: DataHandling/deployment/Dockerfile
     container_name: healthflex-customer-agent
+    working_dir: /app
     ports:
       - "8000:8000"
     env_file:
@@ -14,9 +15,15 @@ services:
       # Google Cloud Credentials paths (not in .env)
       - GOOGLE_APPLICATION_CREDENTIALS=config/google_key.json
       - GEMINI_LLM_SERVICE_CREDENTIALS=config/gemini_key.json
-      
+
       # Database paths
       - CHROMA_DB_PATH=/app/db/vector/chroma_db_collective
+      - PYTHONPATH=/app
+
+      # Langfuse LLM observability (set these to enable tracing)
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
     
     volumes:
       # Mount code directory for instant updates (no rebuild needed for code changes)

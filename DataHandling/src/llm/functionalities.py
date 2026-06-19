@@ -14,15 +14,26 @@ except ImportError:
 
 from typing import Optional, Dict, Any, List
 from llama_index.core import Settings
-from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core.schema import QueryBundle
 from llama_index.core import VectorStoreIndex
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core import Document
 from llama_index.core.llms import ChatMessage, MessageRole
 from llama_index.core.storage.chat_store import SimpleChatStore
 from llama_index.core.memory import ChatMemoryBuffer
-import chromadb
+
+# Optional vector store / embedding packages (removed from Docker image to save ~2 GB).
+# The active LangGraph interview path never queries the vector store, so these are
+# gracefully disabled when not installed.
+try:
+    from llama_index.vector_stores.chroma import ChromaVectorStore
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+    import chromadb
+    HAS_VECTOR_STORE = True
+except ImportError:
+    HAS_VECTOR_STORE = False
+    ChromaVectorStore = None
+    HuggingFaceEmbedding = None
+    chromadb = None
 
 # Fix import paths based on project structure
 try:
@@ -49,6 +60,27 @@ from src.prompts import (
     CORRECTION_DETECTION_PROMPT,
     CORRECTION_APPLY_PROMPT,
     CORRECTION_CONFIRMATION_PROMPT,
+)
+
+# Pure-function layer (Phase 1 + 2 of LangGraph migration).
+# HealthAgent methods below delegate to these; behaviour is unchanged.
+from src.graph.pure_functions.form_validation import (
+    ensure_string as _ensure_string,
+    extract_json_from_response as _extract_json,
+    validate_section as _validate_section,
+)
+from src.graph.pure_functions.intent_detection import (
+    should_check_for_correction as _should_check_correction,
+)
+from src.graph.pure_functions.form_extraction import (
+    extract_form_data_from_text as _extract_form_data,
+    detect_form_correction as _detect_form_correction,
+    apply_form_correction as _apply_form_correction,
+)
+from src.graph.pure_functions.summary import (
+    generate_interview_summary as _generate_summary,
+    classify_summary_response as _classify_summary_response,
+    classify_reports_intent as _classify_reports_intent,
 )
 
 enums_obj = ENUMS()
@@ -92,22 +124,23 @@ class HealthAgent:
         except:
             self.device = "cpu"
 
-        try:
-            # Initialize embedding model
-            self.embed_model = HuggingFaceEmbedding(model_name=self.model_name)
-        except Exception as e:
-            print(f"Error initializing embedding model: {e}")
-            self.embed_model = None
+        self.embed_model = None
+        if HAS_VECTOR_STORE and HuggingFaceEmbedding:
+            try:
+                self.embed_model = HuggingFaceEmbedding(model_name=self.model_name)
+            except Exception as e:
+                print(f"[init] HuggingFace embedding unavailable (non-fatal): {e}")
 
-        # Initialize chromadb, health index, and chat components
-        try:
-            self.init_chromadb()
-            self.init_health_info_index()
-            self.init_chat_components()
-        except Exception as e:
-            print(f"Error initializing database components: {e}")
-            self.health_relevancy_retriever = None
-            self.index = None
+        # Initialize chromadb, health index, and chat components (skipped if vector store unavailable)
+        self.health_relevancy_retriever = None
+        self.index = None
+        if HAS_VECTOR_STORE:
+            try:
+                self.init_chromadb()
+                self.init_health_info_index()
+                self.init_chat_components()
+            except Exception as e:
+                print(f"[init] Vector store unavailable (non-fatal): {e}")
 
         # Initialize form and tracking variables
         self.init_form()
@@ -122,66 +155,119 @@ class HealthAgent:
         self.start_keyword_thread()
 
     def ensure_string(self, text):
-        """Ensure the text is a string and not some other object"""
-        if hasattr(text, "text"):  # Some API responses might have a .text attribute
-            return text.text
-        elif hasattr(text, "__str__"):  # Convert to string if possible
-            return str(text)
-        else:
-            return "Response could not be processed"
+        return _ensure_string(text)
 
     def llm_complete(self, prompt):
-        """Call LLM with appropriate error handling + token/latency logging."""
+        """Call LLM with model rotation fallback on transient 503/429 errors."""
         import time as _time
+        from llama_index.llms.google_genai import GoogleGenAI as _GoogleGenAI
 
-        try:
-            if self.llm is None:
-                raise ValueError("LLM not initialized")
+        if self.llm is None:
+            raise ValueError("LLM not initialized")
 
-            t0 = _time.perf_counter()
-            response = self.llm.complete(prompt)
-            elapsed_ms = (_time.perf_counter() - t0) * 1000
+        # Model rotation: primary first, then fallbacks on demand spikes
+        _MODEL_ROTATION = [
+            "gemini-2.5-flash-lite",   # primary — fast and cheap
+            "gemini-2.5-flash",        # fallback 1 — full model
+            "gemini-2.0-flash",        # fallback 2 — stable older model
+        ]
+        _RETRY_DELAYS = [1, 3, 7]      # seconds before rotating to next model
 
-            # Best-effort token-count logging. `response.raw` is a dict for the
-            # google_genai wrapper; the legacy gemini wrapper returns an object
-            # with attributes. Handle both.
-            in_tok = out_tok = None
-            try:
-                raw = getattr(response, "raw", None)
-                usage = None
-                if isinstance(raw, dict):
-                    usage = raw.get("usage_metadata")
-                elif raw is not None:
-                    usage = getattr(raw, "usage_metadata", None)
-                if usage:
-                    if isinstance(usage, dict):
-                        in_tok = usage.get("prompt_token_count")
-                        out_tok = usage.get("candidates_token_count")
-                    else:
-                        in_tok = getattr(usage, "prompt_token_count", None)
-                        out_tok = getattr(usage, "candidates_token_count", None)
-            except Exception:
-                pass
+        _api_key = getattr(self.llm, "api_key", None) or os.environ.get("GEMINI_API_KEY", "")
 
-            model_name = getattr(self.llm, "model", "?")
-            if in_tok is not None and out_tok is not None:
-                # Rough $ estimate using Gemini 2.0 Flash on-demand pricing
-                # (input $0.10 / output $0.40 per 1M). Real bill may differ.
-                cost_usd = (in_tok * 0.10 + out_tok * 0.40) / 1_000_000
-                print(
-                    f"[llm] model={model_name} in={in_tok} out={out_tok} "
-                    f"latency={elapsed_ms:.0f}ms est_cost=${cost_usd:.6f}"
-                )
+        for attempt, model_name in enumerate(_MODEL_ROTATION):
+            # Switch the active LLM to the current rotation model
+            if attempt > 0:
+                try:
+                    rotated_llm = _GoogleGenAI(model=model_name, api_key=_api_key)
+                    print(f"[llm] Rotating to fallback model: {model_name} (attempt {attempt + 1})")
+                except Exception as _init_err:
+                    print(f"[llm] Could not init fallback model {model_name}: {_init_err}")
+                    continue
             else:
-                print(
-                    f"[llm] model={model_name} latency={elapsed_ms:.0f}ms "
-                    f"(token count unavailable)"
-                )
+                rotated_llm = self.llm
 
-            return self.ensure_string(response)
-        except Exception as e:
-            print(f"Error in LLM completion: {e}")
-            raise
+            try:
+                t0 = _time.perf_counter()
+                response = rotated_llm.complete(prompt)
+                elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+                # Best-effort token-count logging.
+                active_model_name = getattr(rotated_llm, "model", model_name)
+                in_tok = out_tok = None
+                try:
+                    raw = getattr(response, "raw", None)
+                    usage = None
+                    if isinstance(raw, dict):
+                        usage = raw.get("usage_metadata")
+                    elif raw is not None:
+                        usage = getattr(raw, "usage_metadata", None)
+                    if usage:
+                        if isinstance(usage, dict):
+                            in_tok = usage.get("prompt_token_count")
+                            out_tok = usage.get("candidates_token_count")
+                        else:
+                            in_tok = getattr(usage, "prompt_token_count", None)
+                            out_tok = getattr(usage, "candidates_token_count", None)
+                except Exception:
+                    pass
+
+                result_text = self.ensure_string(response)
+
+                if in_tok is not None and out_tok is not None:
+                    # Rough $ estimate: Gemini 2.5 Flash $0.15/$0.60 per 1M tokens
+                    cost_usd = (in_tok * 0.15 + out_tok * 0.60) / 1_000_000
+                    print(
+                        f"[llm] model={active_model_name} in={in_tok} out={out_tok} "
+                        f"latency={elapsed_ms:.0f}ms est_cost=${cost_usd:.6f}"
+                    )
+
+                    # Push token counts + user context into the current Langfuse span
+                    try:
+                        import langfuse as _lf_mod
+                        _lf_client = _lf_mod.get_client()
+                        _lf_client.update_current_observation(
+                            model=active_model_name,
+                            usage={
+                                "input": in_tok,
+                                "output": out_tok,
+                                "unit": "TOKENS",
+                            },
+                            metadata={
+                                "latency_ms": round(elapsed_ms),
+                                "est_cost_usd": round(cost_usd, 6),
+                            },
+                        )
+                        # Attach user/session to the root trace
+                        _user_id = getattr(self, "_langfuse_user_id", None)
+                        _session_id = getattr(self, "_langfuse_session_id", None)
+                        if _user_id or _session_id:
+                            _lf_client.update_current_trace(
+                                name="interview-turn",
+                                user_id=_user_id or "",
+                                session_id=_session_id or "",
+                            )
+                    except Exception:
+                        pass
+                else:
+                    print(
+                        f"[llm] model={active_model_name} latency={elapsed_ms:.0f}ms "
+                        f"(token count unavailable)"
+                    )
+
+                return result_text
+
+            except Exception as e:
+                err_str = str(e)
+                is_transient = any(code in err_str for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+                next_model = _MODEL_ROTATION[attempt + 1] if attempt + 1 < len(_MODEL_ROTATION) else None
+                if is_transient and next_model:
+                    delay = _RETRY_DELAYS[attempt] if attempt < len(_RETRY_DELAYS) else 5
+                    print(f"[llm] {model_name} unavailable (503/429) — waiting {delay}s then trying {next_model}")
+                    _time.sleep(delay)
+                    continue  # loop increments attempt → next model
+                print(f"Error in LLM completion (model={model_name}): {e}")
+                raise
 
     def start_keyword_thread(self):
         """Start the background thread for keyword checking."""
@@ -204,7 +290,10 @@ class HealthAgent:
         self.interview_declined_message = INTERVIEW_DECLINED_PROMPT
 
     def init_chromadb(self):
-        """Initialize chromadb connection and vector store."""
+        """Initialize chromadb connection and vector store (no-op if packages unavailable)."""
+        if not HAS_VECTOR_STORE:
+            self.index = None
+            return
         try:
             self.db_client = chromadb.PersistentClient(path=self.chroma_db_path)
             collection = self.db_client.get_collection(self.collection_name)
@@ -214,7 +303,7 @@ class HealthAgent:
             )
         except Exception as e:
             print(f"Error initializing ChromaDB: {e}")
-            self.index = VectorStoreIndex([Document(text="Fallback document")])
+            self.index = None
 
     def init_health_info_index(self):
         """Initialize health information vector index."""
@@ -596,31 +685,7 @@ class HealthAgent:
             return self.form
 
     def extract_json_from_response(self, response):
-        """Extract valid JSON from an LLM response"""
-        if not response:
-            return None
-
-        # Check if the entire response is JSON
-        response = response.strip()
-        if response.startswith("{") and response.endswith("}"):
-            return response
-
-        # Try to find JSON within the response
-        start = response.find("{")
-        end = response.rfind("}")
-
-        if start != -1 and end != -1 and start < end:
-            return response[start : end + 1]
-
-        # Handle code block format
-        if "```json" in response:
-            parts = response.split("```json")
-            if len(parts) > 1:
-                code_part = parts[1].split("```")[0].strip()
-                if code_part.startswith("{") and code_part.endswith("}"):
-                    return code_part
-
-        return None
+        return _extract_json(response)
 
     def classify_summary_response(self, user_input: str) -> dict:
         """
@@ -855,112 +920,13 @@ IMPORTANT: Do NOT set "has_reports": true just because they mention medical term
         return None
 
     def should_check_for_correction(self, user_input: str) -> bool:
-        """
-        Determine if we should check for corrections based on the user input
-        and conversation context.
-        
-        Only check for corrections if the user explicitly uses correction language.
-        This prevents false positives when users are just answering new questions.
-        
-        Args:
-            user_input: The user's input text
-            
-        Returns:
-            Boolean indicating whether to run correction detection
-        """
-        # Simple confirmation words - don't check for corrections
-        simple_confirmations = {
-            'yes', 'no', 'ok', 'okay', 'sure', 'correct', 'right',
-            'yep', 'yeah', 'nope', 'nah', 'fine', 'good', 'yup',
-            'alright', 'affirmative', 'negative'
-        }
-        
-        # Strip whitespace and punctuation for comparison
-        input_lower = user_input.lower().strip().strip('.,!?;:')
-        
-        # If it's a simple one-word confirmation, skip correction detection
-        if input_lower in simple_confirmations:
-            print(f"[should_check_for_correction] Skipping correction detection - simple confirmation: '{user_input}'")
-            return False
-        
-        # If we're awaiting confirmation and the response is short (3 words or less),
-        # skip correction detection
-        if self.conversation_state.get('awaiting_confirmation', False):
-            word_count = len(user_input.split())
-            if word_count <= 3:
-                # Check if it's a simple yes/no response
-                words_lower = set(word.lower().strip('.,!?;:') for word in user_input.split())
-                if words_lower.intersection(simple_confirmations):
-                    print(f"[should_check_for_correction] Skipping correction detection - awaiting confirmation and got simple response: '{user_input}'")
-                    return False
-        
-        # CRITICAL: Only check for corrections if user explicitly uses correction language
-        # This prevents false positives when users are just answering new questions
-        correction_keywords = [
-            'actually', 'sorry', 'correction', 'correct', 'wrong', 'mistake',
-            'meant', 'meant to say', 'i said', 'i meant', 'let me correct',
-            'change', 'update', 'to clarify', 'clarify', 'misspoke', 'i misspoke',
-            'instead', 'rather'
-        ]
-        
-        # Explicit correction patterns that indicate user is correcting something
-        correction_patterns = [
-            'not x,', 'not x ', 'not x.',  # "not X, it's Y" pattern
-            'was not', 'wasn\'t', 'it was not', 'it wasn\'t',
-            'it\'s not', 'its not', 'is not', 'isn\'t',
-            'not that', 'not the',
-            'sorry, not', 'actually, not', 'i meant', 'i said',
-            'change', 'update', 'correct that', 'fix that'
-        ]
-        
-        input_lower_words = input_lower.split()
-        has_correction_language = False
-        
-        # Check if any correction keyword appears in the input
-        for keyword in correction_keywords:
-            if keyword in input_lower:
-                has_correction_language = True
-                break
-        
-        # Check for explicit correction patterns
-        if not has_correction_language:
-            for pattern in correction_patterns:
-                if pattern in input_lower:
-                    has_correction_language = True
-                    break
-        
-        # Special check for "not X, it's Y" or "not X, but Y" patterns
-        # Only if it's clearly a correction pattern, not just describing status
-        if not has_correction_language and 'not' in input_lower_words:
-            # Look for patterns like "not X, it's Y" or "not X, but Y" where X and Y are different values
-            # This indicates explicit correction, not just status description
-            not_index = input_lower_words.index('not')
-            if not_index < len(input_lower_words) - 2:
-                # Check if "not" is part of a correction pattern
-                # Must have "it's", "but", "actually", "i meant" nearby to be a correction
-                context_words = input_lower_words[max(0, not_index-2):min(len(input_lower_words), not_index+5)]
-                context_str = ' '.join(context_words)
-                if any(word in context_str for word in ['but', 'actually', 'it\'s', 'its', 'i meant', 'i said', 'sorry']):
-                    has_correction_language = True
-        
-        # Exclude common status descriptions that contain "not" but aren't corrections
-        status_descriptions = [
-            'not improved', 'not getting worse', 'not better', 'not worse',
-            'remained the same', 'stayed the same', 'is the same', 'has been the same',
-            'condition is not', 'status is not', 'it\'s not improved', 'it\'s not worse'
-        ]
-        for status_desc in status_descriptions:
-            if status_desc in input_lower:
-                # This is describing status, not correcting
-                has_correction_language = False
-                break
-        
-        if not has_correction_language:
-            print(f"[should_check_for_correction] Skipping correction detection - no explicit correction language in: '{user_input}'")
-            return False
-        
-        print(f"[should_check_for_correction] Checking for correction - explicit correction language detected in: '{user_input}'")
-        return True
+        awaiting = self.conversation_state.get('awaiting_confirmation', False)
+        result = _should_check_correction(user_input, awaiting_confirmation=awaiting)
+        if result:
+            print(f"[should_check_for_correction] Correction language detected: '{user_input}'")
+        else:
+            print(f"[should_check_for_correction] Skipping correction detection: '{user_input}'")
+        return result
 
     def detect_correction(self, user_message, is_summary_mode=False):
         """
@@ -1570,101 +1536,9 @@ Return ONLY the summary text (narrative + key points + confirmation question).
             return (False, "I encountered an error while trying to apply your correction. Could you please try again?")
 
     def validator(self, current_section=None):
-        """
-        Validate the form data for the current section.
-
-        Args:
-            current_section: Section to validate (defaults to self.current_section)
-
-        Returns:
-            Boolean indicating if all required fields are filled
-        """
         section = current_section or self.current_section
-
-        # Reset missing fields
-        self.missing_fields = []
-
-        # Special handling for "Previous Consultations" section
-        if section == "Previous Consultations":
-            previous_consultations_field = "Previous Diagnosis or Advice and Prescribed Treatment Taken"
-            status_field = "Current Status of Issue (Improved, Same, Worse)"
-            
-            previous_value = self.form[section].get(previous_consultations_field, "").strip()
-            status_value = self.form[section].get(status_field, "").strip()
-            
-            # CRITICAL: Check if data was incorrectly extracted
-            # If status is filled but no consultations mentioned, it's likely incorrect extraction
-            consultation_keywords = [
-                "doctor", "physiotherapist", "hospital", "consulted", "visited",
-                "diagnosis", "diagnosed", "prescribed", "treatment", "medicine",
-                "injection", "exercise", "physio", "clinic"
-            ]
-            has_consultation_mention = False
-            if previous_value:
-                has_consultation_mention = any(
-                    keyword in previous_value.lower() 
-                    for keyword in consultation_keywords
-                )
-            
-            # If status is filled but no consultations mentioned, clear it and mark as incomplete
-            if status_value and not previous_value and not has_consultation_mention:
-                print(f"[validator] WARNING: Status field filled but no consultations mentioned. This is incorrect extraction. Clearing.")
-                self.form[section][status_field] = ""
-                self.missing_fields.append(previous_consultations_field)
-                self.missing_fields.append(status_field)
-                return False
-            
-            # Check if user indicated no previous consultations
-            previous_value_lower = previous_value.lower() if previous_value else ""
-            no_consultation_indicators = [
-                "no previous",
-                "didn't visit",
-                "did not visit",
-                "haven't consulted",
-                "have not consulted",
-                "no consultations",
-                "no doctor",
-                "no hospital",
-                "never consulted",
-                "not consulted",
-                "none",
-                "nothing"
-            ]
-            
-            has_no_consultations = any(indicator in previous_value_lower for indicator in no_consultation_indicators)
-            
-            # CRITICAL: If no previous consultations indicated, both fields should be set to "None" or the first field should have the "no" indicator
-            if has_no_consultations:
-                print(f"[validator] Detected no previous consultations")
-                # If first field has "no" indicator, status field should be empty or "None"
-                # Section is complete if first field has the indicator
-                if not previous_value:
-                    self.missing_fields.append(previous_consultations_field)
-            else:
-                # Normal validation - BOTH fields must be filled
-                # If only status is filled but no consultations mentioned, it's incomplete
-                if not previous_value and status_value:
-                    # Status field filled but no consultations mentioned - this is incorrect extraction
-                    print(f"[validator] WARNING: Status field filled but no consultations mentioned. Clearing incorrect data.")
-                    # Clear the status field as it was incorrectly extracted
-                    self.form[section][status_field] = ""
-                    self.missing_fields.append(previous_consultations_field)
-                    self.missing_fields.append(status_field)
-                elif not previous_value:
-                    # First field is empty
-                    self.missing_fields.append(previous_consultations_field)
-                elif not status_value:
-                    # Status field is empty (but consultations were mentioned)
-                    self.missing_fields.append(status_field)
-        else:
-            # For all other sections, check all fields normally
-            for field, value in self.form[section].items():
-                if not value:
-                    self.missing_fields.append(field)
-
+        self.missing_fields = _validate_section(self.form, section)
         print(f"Missing fields in {section}: {self.missing_fields}")
-
-        # If there are missing fields, return False
         return len(self.missing_fields) == 0
 
     def all_ops(self):

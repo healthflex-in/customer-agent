@@ -446,7 +446,6 @@ import uvicorn
 import asyncio
 import numpy as np
 from faster_whisper import WhisperModel  # ~4x faster than openai-whisper on CPU
-import torch
 import wave
 import time
 import os
@@ -475,6 +474,9 @@ from docscanner.service import summarize_report_from_bytes
 
 # Import HealthAgent and related functionalities
 from src.llm.functionalities import HealthAgent
+
+# Deterministic orchestrator for question-pool-driven interview flow
+from src.orchestrator import initialize_orchestrator, get_orchestrator
 
 # Centralized configuration (env vars, constants, paths).
 # Aliased to the legacy names used throughout this file so handler code is
@@ -507,6 +509,108 @@ from app.db.serializers import (
 
 app = FastAPI()
 
+# ── Agent thought stream: human-readable labels for each graph node ──────────
+NODE_THOUGHTS: dict[str, dict[str, str]] = {
+    "handle_first_turn": {
+        "stage": "Starting Interview",
+        "detail": "Initiating the consultation and reviewing your case...",
+    },
+    "extract_form_data": {
+        "stage": "Extracting Information",
+        "detail": "Reading your responses and organizing patient data...",
+    },
+    "classify_intent": {
+        "stage": "Understanding Intent",
+        "detail": "Analyzing the purpose and context of your response...",
+    },
+    "validate_section": {
+        "stage": "Validating Completeness",
+        "detail": "Checking which sections have sufficient information...",
+    },
+    "advance_section": {
+        "stage": "Advancing Assessment",
+        "detail": "Moving to the next area of clinical assessment...",
+    },
+    "detect_correction": {
+        "stage": "Detecting Corrections",
+        "detail": "Checking if you're updating or correcting previous information...",
+    },
+    "apply_correction": {
+        "stage": "Applying Corrections",
+        "detail": "Updating your records with the corrected information...",
+    },
+    "generate_question": {
+        "stage": "Formulating Question",
+        "detail": "Preparing the next targeted clinical question...",
+    },
+    "generate_summary": {
+        "stage": "Generating Summary",
+        "detail": "Compiling a comprehensive summary of all your responses...",
+    },
+    "classify_summary_intent": {
+        "stage": "Reviewing Feedback",
+        "detail": "Understanding your response to the summary...",
+    },
+    "handle_summary_response": {
+        "stage": "Processing Summary Response",
+        "detail": "Handling your confirmation or requested changes...",
+    },
+    "handle_upload_response": {
+        "stage": "Processing Upload",
+        "detail": "Handling your document upload or file response...",
+    },
+}
+
+
+async def _send_thought_update(
+    websocket: WebSocket,
+    completed_nodes: list[str],
+    active_node: str | None = None,
+) -> None:
+    """Send a thought_update message to the frontend with the current thought list."""
+    thoughts: list[dict[str, str]] = []
+    for node in completed_nodes:
+        info = NODE_THOUGHTS[node]
+        thoughts.append({
+            "stage": info["stage"],
+            "detail": info["detail"],
+            "status": "done",
+        })
+    if active_node:
+        info = NODE_THOUGHTS[active_node]
+        thoughts.append({
+            "stage": info["stage"],
+            "detail": info["detail"],
+            "status": "active",
+        })
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "thought_update",
+            "thoughts": thoughts,
+        }))
+    except Exception:
+        pass  # WebSocket closed — safe to ignore
+
+
+# ── Langfuse LLM observability ───────────────────────────────────────────────
+_langfuse_enabled = bool(
+    os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")
+)
+if _langfuse_enabled:
+    try:
+        from langfuse import get_client as _lf_get_client
+        from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+        _langfuse = _lf_get_client()
+        LlamaIndexInstrumentor().instrument()
+        print("[langfuse] Instrumentation active — tracing all LlamaIndex LLM calls")
+    except Exception as _lf_err:
+        print(f"[langfuse] Failed to initialize (non-fatal): {_lf_err}")
+        _langfuse_enabled = False
+else:
+    print("[langfuse] Skipping — LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set")
+    _langfuse = None
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Add CORS middleware to allow frontend connections
 app.add_middleware(
     CORSMiddleware,
@@ -524,7 +628,8 @@ os.makedirs(TTS_CACHE_DIR, exist_ok=True)
 # compute_type=int8 quantizes weights to int8 on CPU — ~2-4x faster than fp32
 # with negligible accuracy impact on the "base" model.
 print("Loading Whisper model (faster-whisper, base, int8)...")
-cuda_device = "cuda" if torch.cuda.is_available() else "cpu"
+import subprocess, shutil
+cuda_device = "cuda" if shutil.which("nvidia-smi") else "cpu"
 model = WhisperModel(
     "base",
     device=cuda_device,
@@ -532,10 +637,51 @@ model = WhisperModel(
 )
 print(f"Model loaded on {cuda_device}")
 
-# Initialize HealthAgent
+# Initialize HealthAgent (kept for audio, summary title generation, and legacy fallback)
 print("Initializing HealthAgent...")
 health_agent = HealthAgent()
 print("HealthAgent initialized")
+
+# Initialize DeterministicOrchestrator (non-fatal — falls back to HealthAgent-only flow)
+try:
+    from app.config import MONGO_URI as _MONGO_URI, MONGO_DB_NAME as _MONGO_DB_NAME
+    if _MONGO_URI:
+        initialize_orchestrator(_MONGO_URI, _MONGO_DB_NAME)
+    else:
+        print("[orchestrator] MONGO_URI not set — orchestrator disabled")
+except Exception as _orch_err:
+    print(f"[orchestrator] Failed to initialize (non-fatal): {_orch_err}")
+
+# ── LangGraph interview graph ────────────────────────────────────────────────
+# Build once at startup; each WebSocket turn calls graph.invoke(state).
+_interview_graph = None
+try:
+    from src.graph.graph import build_interview_graph
+    from src.graph.server_adapter import (
+        build_graph_state,
+        sync_client_state_from_graph,
+        build_interview_state_from_graph,
+        init_graph_state_in_client,
+    )
+    # save_customer_info is defined later in this file; wrap in a lambda to
+    # capture it lazily so the graph is built before the function is defined.
+    def _save_for_graph(user_id, form, section, form_id, chat_history=None):
+        return save_customer_info(user_id=user_id, form_data=form,
+                                  current_section=section, form_id=form_id,
+                                  chat_history=chat_history)
+
+    _interview_graph = build_interview_graph(
+        llm_complete=health_agent.llm_complete,
+        system_prompt=health_agent.system_prompt,
+        predefined_questions=health_agent.predefined_questions,
+        save_customer_info_fn=_save_for_graph,
+    )
+    print("[graph] LangGraph interview graph initialized")
+except Exception as _graph_err:
+    import traceback as _tb
+    print(f"[graph] Failed to initialize LangGraph graph (non-fatal, using HealthAgent fallback): {_graph_err}")
+    _tb.print_exc()
+    _interview_graph = None
 
 # MongoDB connection handles (populated by init_mongo()).
 mongo_client = None
@@ -632,6 +778,7 @@ def save_customer_info(
     current_section: str,
     form_id: str = None,
     attachments: Optional[List[dict]] = None,
+    chat_history: Optional[list] = None,
 ):
     """
     Save or update customer interview information in MongoDB.
@@ -896,7 +1043,16 @@ def fetch_form_attachments(form_id: str, user_id: str = None) -> List[dict]:
 
 
 def create_placeholder_form(user_id: str, client_state: dict) -> Optional[str]:
-    """Create an empty form record so uploads have a form_id to reference."""
+    """Create an empty form record so uploads have a form_id to reference.
+    If the user already has a form (even empty), return its ID without overwriting it."""
+    # Guard: never overwrite an existing form — just return the existing ID
+    existing = fetch_latest_form_for_user(user_id)
+    if existing:
+        existing_id = existing.get("formId", DEFAULT_FORM_ID)
+        client_state["form_id"] = existing_id
+        print(f"[create_placeholder_form] Form already exists for user {user_id} ({existing_id}), skipping creation.")
+        return existing_id
+
     import copy
     # CRITICAL: Use get_medical_form_template() to get a fresh template
     # This ensures we always start with a clean template that hasn't been mutated
@@ -1185,26 +1341,31 @@ async def send_text_message(
     text: str,
     interview_state: Optional[dict] = None,
     user_response: Optional[str] = None,
+    force_request_attachment: bool = False,
 ):
     """
     Send a text message to the client.
-    
+
     Args:
         websocket: WebSocket connection
         client_state: Current client state
         text: Message text to send
         interview_state: Optional interview state
         user_response: Optional user's previous response (to check if they have reports)
+        force_request_attachment: If True, always show the upload button regardless of heuristics
     """
-    current_section = interview_state.get("section") if interview_state else health_agent.current_section
-    requires_attachment = message_requires_attachment(
-        current_section, 
-        text, 
-        client_state.get("form_id"),
-        user_response=user_response,
-        user_id=client_state.get("user_id")
-    )
-    
+    if force_request_attachment:
+        requires_attachment = True
+    else:
+        current_section = interview_state.get("section") if interview_state else health_agent.current_section
+        requires_attachment = message_requires_attachment(
+            current_section,
+            text,
+            client_state.get("form_id"),
+            user_response=user_response,
+            user_id=client_state.get("user_id")
+        )
+
     payload = {
         "type": "text_message",
         "text": text,
@@ -1217,18 +1378,14 @@ async def send_text_message(
     await websocket.send_text(json.dumps(payload))
 
 
-def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str):
+def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, agent=None):
     """
-    Fully reset interview state when a (possibly new) user starts an interview.
-
-    This ensures that:
-    - No previous user's form data or progress leaks into the new session
-    - Progress always starts from 0% for a fresh interview
-    - A new placeholder form is created in MongoDB unless an explicit load_form is called
+    Reset the per-connection HealthAgent for a new interview.
+    `agent` is the per-connection HealthAgent instance (no longer global).
     """
-    global health_agent
+    if agent is None:
+        return  # safety guard
 
-    # If switching users, log it for debugging
     previous_user_id = client_state.get("user_id")
     if previous_user_id and previous_user_id != new_user_id:
         print(f"[reset_health_agent] User switched from {previous_user_id} to {new_user_id}. Resetting health_agent.")
@@ -1237,18 +1394,15 @@ def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str):
     else:
         print(f"[reset_health_agent] New user {new_user_id} starting interview. Resetting health_agent.")
 
-    # Always reset HealthAgent form + conversation state for any (re)start
-    # This is critical to prevent data leakage between users or sessions
-    health_agent.init_form()  # Clears JSON file + resets form, idx, current_section, etc.
-    health_agent.talk_mode = "START"
-    health_agent.history = []
-    health_agent.history.append({"role": "agent", "message": health_agent.welcome_prompt})
+    agent.init_form()
+    agent.talk_mode = "START"
+    agent.history = []
+    agent.history.append({"role": "agent", "message": agent.welcome_prompt})
 
-    # Reset per-connection form linkage so we don't accidentally reuse an old form_id
     client_state["user_id"] = new_user_id
     client_state["form_id"] = None
-    
-    print(f"[reset_health_agent] HealthAgent reset complete. Form is now empty: {len(health_agent.form)} sections")
+
+    print(f"[reset_health_agent] HealthAgent reset complete. Form is now empty: {len(agent.form)} sections")
 
 
 # Initialize database
@@ -1562,14 +1716,12 @@ def calculate_section_completion_status(form_data):
                 # Check if field has meaningful data
                 if field_value and str(field_value).strip():
                     field_lower = str(field_value).strip().lower()
-                    # For History & Diagnostics and Referral, "None", "no", "nothing" are valid answers
-                    # (they indicate the user answered the question)
-                    if section_name == "History & Diagnostics" or section_name == "Referral":
+                    # "nothing", "none", "no" ARE valid patient answers for symptom fields
+                    # (e.g. "nothing makes it better", "none", "nothing as such").
+                    # Only exclude clearly placeholder/empty tokens.
+                    placeholder_only = {"n/a", "na", "nil", "tbd", "unknown"}
+                    if field_lower not in placeholder_only:
                         filled_fields += 1
-                    else:
-                        # For other sections, don't count "none", "no", "nothing", "n/a" as filled
-                        if field_lower not in ["none", "no", "nothing", "n/a", "na", ""]:
-                            filled_fields += 1
         
         completion_percentage = (filled_fields / total_fields) * 100 if total_fields > 0 else 0
         # Mark a section as complete (ticked) only when ALL fields are filled
@@ -1594,8 +1746,13 @@ def calculate_section_completion_status(form_data):
         else:
             incomplete_sections.append(section_info)
     
-    # Combine: completed first, then incomplete (stack ordering)
+    # Keep canonical section order — do NOT reorder by completion status.
+    # The frontend maps stepStatus by index against a fixed steps array,
+    # so reordering causes the active glow to land on the wrong segment.
     all_sections = completed_sections + incomplete_sections
+    # Re-sort to canonical order defined by section_order
+    order_map = {name: i for i, name in enumerate(section_order)}
+    all_sections = sorted(all_sections, key=lambda s: order_map.get(s["name"], 99))
     
     # Calculate overall progress based on fully completed sections (all fields filled)
     total_sections = len(all_sections)
@@ -1674,6 +1831,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
     print(f"Client {client_id} connected")
 
+    # ── Per-connection HealthAgent ───────────────────────────────────────────
+    # CRITICAL: Each WebSocket connection gets its OWN HealthAgent instance.
+    # The global health_agent singleton caused data contamination between
+    # concurrent users — one user's form data would overwrite another's.
+    # HealthAgent init is lightweight (just LLM + prompts, no ChromaDB).
+    health_agent = HealthAgent()
+
     # Store client-specific state
     client_state = {
         "session_id": f"session_{int(time.time())}",
@@ -1688,6 +1852,20 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         "is_recording": False,
         "received_audio_buffer": bytearray(),
         "recording_start_time": None,
+        # Orchestrator session tracking
+        "orchestrator_session_id": None,
+        "current_question_id": None,
+        # LangGraph state (graph_* keys are managed by server_adapter helpers)
+        "graph_form": None,
+        "graph_question_round": None,
+        "graph_current_section": None,
+        "graph_phase": None,
+        "graph_history": None,
+        "graph_form_sections": None,
+        "graph_asked_previous_consultations": False,
+        "graph_reports_uploaded": False,
+        "graph_awaiting_report_upload": False,
+        "graph_attempts_on_current_section": 0,
     }
 
     # Create a new interview record
@@ -1763,7 +1941,35 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # Always use the fixed form ID
                         provided_form_id = DEFAULT_FORM_ID
                         client_state["form_id"] = provided_form_id
-                            
+                        # Initialize form_data early so it's always defined regardless of
+                        # resume vs new-interview path (avoids UnboundLocalError).
+                        form_data = {}
+
+                        # Initialize LangGraph state for this connection
+                        if _interview_graph is not None:
+                            try:
+                                init_graph_state_in_client(
+                                    client_state,
+                                    user_id=provided_user_id,
+                                    form_id=provided_form_id,
+                                )
+                                # Set phase to match whether we're resuming or starting fresh
+                                # (will be overwritten when existing form is loaded below)
+                                client_state["graph_phase"] = "welcome"
+                                print(f"[graph] Graph state initialized for user: {provided_user_id}")
+                            except Exception as _ge:
+                                print(f"[graph] init_graph_state_in_client failed (non-fatal): {_ge}")
+
+                        # Start an orchestrator session for this user
+                        _orch = get_orchestrator()
+                        if _orch:
+                            try:
+                                _orch_session_id = _orch.start_session({"user_id": provided_user_id})
+                                client_state["orchestrator_session_id"] = _orch_session_id
+                                print(f"[orchestrator] Session started: {_orch_session_id}")
+                            except Exception as _e:
+                                print(f"[orchestrator] Failed to start session (non-fatal): {_e}")
+
                         # Check if user already has a form (resume mode)
                         existing_form = fetch_latest_form_for_user(provided_user_id)
                         if existing_form:
@@ -1772,7 +1978,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         else:
                             # NEW INTERVIEW MODE: No existing form for this user, start fresh
                             print(f"[start_interview] NEW INTERVIEW MODE: No existing form for user {provided_user_id}. Resetting health_agent.")
-                            reset_health_agent_for_new_interview(client_state, provided_user_id)
+                            reset_health_agent_for_new_interview(client_state, provided_user_id, agent=health_agent)
                             is_resuming = False
                         
                         # Handle form initialization based on mode (new vs resume)
@@ -1797,21 +2003,20 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     )
                                     continue
                                 
-                                # Load the form data into health_agent
+                                # Load the form data — store ONLY in client_state, NEVER in
+                                # health_agent.form (global singleton, shared across all users).
                                 form_data = existing_form.get("form_data", {})
                                 current_section = existing_form.get("current_section", "Present Complaint")
-                                
-                                # Update health_agent with the loaded data
-                                health_agent.form = form_data
-                                health_agent.current_section = current_section
-                                
-                                # Re-evaluate completion to set idx and current_section accurately
-                                pc_complete = health_agent.validator("Present Complaint")
-                                pain_complete = health_agent.validator("Pain Assessment")
-                                prev_complete = health_agent.validator("Previous Consultations")
-                                hist_complete = health_agent.validator("History & Diagnostics")
-                                goals_complete = health_agent.validator("Treatment Goals")
-                                referral_complete = health_agent.validator("Referral")
+
+                                # Validate sections using the stateless LangGraph helper
+                                # (takes form as a parameter — no global state risk).
+                                from src.graph.pure_functions.form_validation import validate_section as _vs
+                                pc_complete   = not bool(_vs(form_data, "Present Complaint"))
+                                prev_complete = not bool(_vs(form_data, "Previous Consultations"))
+                                pain_complete = not bool(_vs(form_data, "Pain Assessment"))
+                                hist_complete = not bool(_vs(form_data, "History & Diagnostics"))
+                                goals_complete = not bool(_vs(form_data, "Treatment Goals"))
+                                referral_complete = not bool(_vs(form_data, "Referral"))
 
                                 def first_incomplete():
                                     if not pc_complete:
@@ -1828,31 +2033,55 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         return "Referral"
                                     return current_section
 
-                                # Set idx based on which section group is incomplete.
-                                # idx = 0  → Present Complaint + Previous Consultations
-                                # idx = 1  → Pain Assessment + History & Diagnostics
-                                # idx = 2  → Treatment Goals + Referral
-                                # idx = 3  → All sections complete
+                                # Derive idx and current_section locally from form_data
                                 if (not pc_complete) or (not prev_complete):
-                                    health_agent.idx = 0
+                                    _resume_idx = 0
                                 elif (not pain_complete) or (not hist_complete):
-                                    health_agent.idx = 1
+                                    _resume_idx = 1
                                 elif (not goals_complete) or (not referral_complete):
-                                    health_agent.idx = 2
+                                    _resume_idx = 2
                                 else:
-                                    health_agent.idx = 3
+                                    _resume_idx = 3
 
-                                # Set current_section to first incomplete
-                                health_agent.current_section = first_incomplete()
-                                
-                                # Set talk_mode to USER since we're resuming
+                                _resume_section = first_incomplete()
+
+                                # Set health_agent ONLY to enable talk_to_user/generate_summary below.
+                                # These assignments happen atomically just before use — minimising
+                                # the window where another concurrent user can overwrite them.
+                                # health_agent is still a global, but this is the only place we write it.
+                                health_agent.form = form_data
+                                health_agent.current_section = _resume_section
+                                health_agent.idx = _resume_idx
                                 health_agent.talk_mode = "USER"
-                                
+
+                                # Always resume into interviewing phase so the graph never
+                                # re-runs the welcome/first-turn logic on reconnect.
+                                if client_state.get("graph_phase") is not None:
+                                    client_state["graph_phase"] = "interviewing"
+
+                                # CRITICAL: Sync the full graph state from MongoDB so the first
+                                # user turn after a redeploy doesn't overwrite saved data with
+                                # an empty template. build_graph_state falls back to fresh defaults
+                                # for any key that is None — without these lines every redeploy
+                                # wipes the patient's data on their first message.
+                                client_state["graph_form"] = form_data
+                                client_state["graph_current_section"] = health_agent.current_section
+
+                                # Derive the correct question_round from section completion so the
+                                # graph asks questions at the right depth (not restarting from round 0).
+                                _idx = health_agent.idx  # 0/1/2/3 set just above
+                                client_state["graph_question_round"] = _idx if _idx < 3 else 2
+
+                                # Derive the ordered form_sections list
+                                from src.prompts import get_medical_form_template as _get_tmpl
+                                client_state["graph_form_sections"] = list(_get_tmpl().keys())
+
+
                                 print(f"[start_interview] ✓ Loaded form {provided_form_id}, section: {health_agent.current_section}, idx: {health_agent.idx}")
                                 
                                 # Decide whether we have enough information to show a full summary
                                 filled_field_count = 0
-                                for section, fields in health_agent.form.items():
+                                for section, fields in form_data.items():
                                     if isinstance(fields, dict):
                                         for _, value in fields.items():
                                             if value and str(value).strip():
@@ -1871,22 +2100,21 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         traceback.print_exc()
                                         summary_text = None
 
-                                # Build a resume message for the user.
+
+                                # Build resume message + next question to ask immediately.
+                                from src.prompts import PREDEFINED_QUESTIONS
                                 if summary_text:
-                                    # The summary itself already ends with a confirmation question,
-                                    # so we don't append an extra "Ready to restart?" line here.
                                     resume_message = (
-                                        "Welcome back, here's a quick summary of what I've noted till now:\n\n"
-                                        f"{summary_text}"
+                                        "Welcome back! Here's a quick summary of what I've noted so far:\n\n"
+                                        f"{summary_text}\n\n"
+                                        "Let's continue from where we left off."
                                     )
                                 else:
-                                    # Not enough data yet – don't show a long "empty" summary.
-                                    # Just reassure the user and continue with the next questions.
                                     resume_message = (
-                                        "Welcome back. We haven't collected much information yet, "
-                                        "so let's continue with a few quick questions to understand your problem better."
+                                        "Welcome back. We haven't collected much information yet — "
+                                        "let's continue right away."
                                     )
-                                
+
                                 await send_text_message(
                                     websocket,
                                     client_state,
@@ -1894,32 +2122,42 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     build_interview_state(client_state),
                                     user_response=None
                                 )
-                                
-                                # Ask the next question to continue the interview
-                                prompt_template = health_agent.make_template(mode="query")
-                                next_question = health_agent.talk_to_user(prompt_template)
-                                
+
+                                # Send the next question immediately so the user sees what to answer.
+                                # If the form is mostly empty, use the comprehensive first question.
+                                # If partial data exists, use health_agent to generate a targeted question.
+                                from src.prompts import PREDEFINED_QUESTIONS
+                                if filled_field_count < 3:
+                                    # Too little data — ask the comprehensive opening question
+                                    next_q_text = PREDEFINED_QUESTIONS[0][1]
+                                else:
+                                    try:
+                                        prompt_template = health_agent.make_template(mode="query")
+                                        next_q_text = health_agent.talk_to_user(prompt_template)
+                                    except Exception as _qe:
+                                        print(f"[start_interview] Could not generate next question: {_qe}")
+                                        next_q_text = PREDEFINED_QUESTIONS[0][1]
+
                                 await send_text_message(
                                     websocket,
                                     client_state,
-                                    next_question,
+                                    next_q_text,
                                     build_interview_state(client_state),
                                     user_response=None
                                 )
-                                
-                                # Skip the rest of the start_interview logic
+
                                 continue
                             else:
                                 print(f"[start_interview] ERROR: Form {provided_form_id} not found in database. Starting new interview instead.")
                                 # Fall through to create a new form
                                 is_resuming = False
-                                reset_health_agent_for_new_interview(client_state, provided_user_id)
+                                reset_health_agent_for_new_interview(client_state, provided_user_id, agent=health_agent)
                         
                         # NEW INTERVIEW MODE: Verify reset and create new form
                         if not is_resuming:
                             # CRITICAL: Verify reset was successful - form should be empty
                             form_is_empty = True
-                            for section, fields in health_agent.form.items():
+                            for section, fields in form_data.items():
                                 if isinstance(fields, dict):
                                     for field, value in fields.items():
                                         if value and str(value).strip():
@@ -1963,7 +2201,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             # CRITICAL: Ensure health_agent.form is still empty before proceeding
                             # Check if health_agent.form has been contaminated after placeholder creation
                             form_has_data = False
-                            for section, fields in health_agent.form.items():
+                            for section, fields in form_data.items():
                                 if isinstance(fields, dict):
                                     for field, value in fields.items():
                                         if value and str(value).strip():
@@ -1973,54 +2211,33 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             if form_has_data:
                                 print(f"[start_interview] CRITICAL: health_agent.form was contaminated! Resetting again...")
                                 health_agent.init_form()
-                            
-                            # Send welcome message for new interview
-                            # Only send welcome message if we're creating a new form (no formId provided)
-                                welcome_text = WELCOME_PROMPT.strip()
-                                # Add the "ready to start" question
-                                welcome_text += "\n\n" + READY_TO_START_PROMPT.strip()
-                                # After sending welcome, the next user response should move to USER mode
-                                # Don't change talk_mode here - let main_processor handle it on first user input
-                            else:
-                                # If agent was already in a conversation, this shouldn't happen in start_interview
-                                # But if it does, just use a generic message instead of calling main_processor("")
-                                print(f"[start_interview] WARNING: talk_mode is {health_agent.talk_mode}, not START. Using welcome message.")
-                                welcome_text = WELCOME_PROMPT.strip() + "\n\n" + READY_TO_START_PROMPT.strip()
-                                # Reset to START mode to ensure proper flow
-                                health_agent.talk_mode = "START"
-                            
-                            # After main_processor, check if form was modified (it shouldn't be for START mode)
-                            if health_agent.talk_mode == "START":
-                                form_has_data_after = False
-                                for section, fields in health_agent.form.items():
-                                    if isinstance(fields, dict):
-                                        for field, value in fields.items():
-                                            if value and str(value).strip():
-                                                form_has_data_after = True
-                                                print(f"[start_interview] WARNING: health_agent.form modified by main_processor! {section}.{field} = {value}")
-                            
-                            if form_has_data_after:
-                                print(f"[start_interview] CRITICAL: main_processor modified form in START mode! Resetting form.")
-                                health_agent.init_form()
 
-                        # Calculate progress for interview state - use database form if available
-                        # This ensures each formId is independent and not affected by other users
-                        form_id_for_progress = client_state.get("form_id")
-                        user_id_for_progress = client_state.get("user_id")
-                        if form_id_for_progress and user_id_for_progress:
-                            # Always use database form for accurate progress (ensures independence)
-                            form_from_db = fetch_form_by_id(form_id_for_progress, user_id_for_progress)
-                            if form_from_db and form_from_db.get("form_data"):
-                                progress = calculate_form_progress(form_from_db["form_data"])
-                            else:
-                                progress = calculate_form_progress(health_agent.form)
-                        else:
-                            progress = calculate_form_progress(health_agent.form)
+                        # For new interviews: send a warm welcome, then immediately
+                        # follow with the comprehensive first question.
+                        from src.prompts import PREDEFINED_QUESTIONS, WELCOME_PROMPT
+                        first_question = PREDEFINED_QUESTIONS[0][1]
+                        if client_state.get("graph_phase") is not None:
+                            client_state["graph_phase"] = "interviewing"
 
+                        # Use empty form for progress on new interview (health_agent.form is global/shared)
+                        progress = 0.0
+
+                        # Welcome message
                         await send_text_message(
                             websocket,
                             client_state,
-                            welcome_text,
+                            WELCOME_PROMPT.strip(),
+                            build_interview_state(
+                                client_state, progress_override=progress, use_db_form=True
+                            ),
+                            user_response=None
+                        )
+
+                        # First question immediately after
+                        await send_text_message(
+                            websocket,
+                            client_state,
+                            first_question,
                             build_interview_state(
                                 client_state, progress_override=progress, use_db_form=True
                             ),
@@ -2053,7 +2270,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         client_state["form_id"] = None
                         
                         # Reset the health agent for a new form (this clears form data)
-                        reset_health_agent_for_new_interview(client_state, client_state["user_id"])
+                        reset_health_agent_for_new_interview(client_state, client_state["user_id"], agent=health_agent)
                         health_agent.talk_mode = "START"
                         
                         # Create a new placeholder form with fresh form_id
@@ -2201,7 +2418,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # This ensures no previous user's data contaminates this form load
                         # Also initialize user_id if not set
                         if not client_state.get("user_id"):
-                            reset_health_agent_for_new_interview(client_state, form_user_id)
+                            reset_health_agent_for_new_interview(client_state, form_user_id, agent=health_agent)
                         else:
                             health_agent.init_form()
                             health_agent.talk_mode = "START"
@@ -2415,103 +2632,198 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         print(f"Received text input: {text_input}")
                         print(f"[text_input] Current talk_mode: {health_agent.talk_mode}, history length: {len(health_agent.history)}")
                         
-                        # Process the text input with HealthAgent (same as transcription)
                         try:
-                            # CRITICAL: Ensure talk_mode is correct before processing
-                            # If talk_mode is START and we have user input, it should process normally
-                            # main_processor will change talk_mode from START to USER on first real input
-                            response_text = health_agent.main_processor(text_input)
-                            print(f"[text_input] After processing, talk_mode: {health_agent.talk_mode}, history length: {len(health_agent.history)}")
+                            # ── LANGGRAPH PATH ─────────────────────────────────
+                            if _interview_graph is not None and client_state.get("graph_phase") is not None:
+                                print(f"[graph] Processing turn — phase: {client_state.get('graph_phase')}")
+                                client_state["_fetch_form_fn"] = fetch_form_by_id
+                                graph_state = build_graph_state(client_state, text_input, _save_for_graph)
 
-                            # CRITICAL: Handle SKIP_SECTION response - move to next section and generate new question
-                            if response_text == "SKIP_SECTION":
-                                print(f"[text_input] Received SKIP_SECTION, moving to next section and generating new question")
-                                # Move to next section
-                                current_index = health_agent.form_sections.index(health_agent.current_section)
-                                if current_index < len(health_agent.form_sections) - 1:
-                                    health_agent.current_section = health_agent.form_sections[current_index + 1]
-                                    # Generate question for new section
-                                    prompt_template = health_agent.make_template(mode="query")
-                                    if prompt_template and prompt_template != "SKIP_SECTION":
-                                        response_text = health_agent.talk_to_user(prompt_template)
-                                        health_agent.history.append({"role": "agent", "message": response_text})
-                                    else:
-                                        # If still SKIP_SECTION or None, try to move forward or complete
-                                        response_text = "Let me move on to the next section."
+                                # Attach Langfuse user/session context for this turn
+                                _lf_ctx = None
+                                if _langfuse_enabled and _langfuse:
+                                    try:
+                                        from langfuse import propagate_attributes
+                                        _lf_ctx = propagate_attributes(
+                                            user_id=client_state.get("user_id", "unknown"),
+                                            session_id=client_state.get("session_id", "unknown"),
+                                            metadata={
+                                                "form_id": client_state.get("form_id", ""),
+                                                "section": client_state.get("graph_current_section", ""),
+                                                "phase": client_state.get("graph_phase", ""),
+                                            },
+                                        )
+                                        _lf_ctx.__enter__()
+                                    except Exception:
+                                        _lf_ctx = None
+
+                                # Store user/session on health_agent so llm_complete can
+                                # attach them to the Langfuse trace from inside the thread.
+                                health_agent._langfuse_user_id = client_state.get("user_id", "")
+                                health_agent._langfuse_session_id = client_state.get("session_id", "")
+
+                                # ── Stream graph with per-node thought updates ──
+                                result_state = None
+                                completed_nodes: list[str] = []
+                                try:
+                                    async for chunk in _interview_graph.astream(graph_state):
+                                        for node_name, node_state in chunk.items():
+                                            if node_name == "__end__":
+                                                result_state = node_state
+                                                break
+                                            if node_name in NODE_THOUGHTS:
+                                                completed_nodes.append(node_name)
+                                                await _send_thought_update(
+                                                    websocket, completed_nodes, active_node=node_name
+                                                )
+                                except Exception as _stream_err:
+                                    print(f"[graph] astream error (falling back to final state): {_stream_err}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    # If astream failed entirely, fall back to invoke
+                                    if result_state is None:
+                                        result_state = await asyncio.get_event_loop().run_in_executor(
+                                            None, _interview_graph.invoke, graph_state
+                                        )
+
+                                if _lf_ctx:
+                                    try:
+                                        _lf_ctx.__exit__(None, None, None)
+                                    except Exception:
+                                        pass
+                                sync_client_state_from_graph(client_state, result_state)
+
+                                # NOTE: We do NOT sync health_agent.form here.
+                                # health_agent is a global singleton — writing to it from
+                                # concurrent WebSocket handlers causes cross-user data mixing.
+                                # All per-user state lives in client_state["graph_form"] instead.
+
+                                response_text = result_state.get("response_text", "")
+                                print(f"[graph] Turn complete — phase: {result_state['phase']}, response: {response_text[:80]}...")
+
+                                # Opt 3: use cached form for progress — no blocking DB fetch per turn
+                                _cached_form = result_state.get("form", {})
+                                if result_state.get("phase") == "complete":
+                                    progress = 100.0
                                 else:
-                                    # All sections complete
-                                    response_text = "Thank you for providing all the information. Let me generate a summary."
+                                    progress = calculate_form_progress(_cached_form)
 
-                            # Check if form is complete
-                            is_complete = "Thank you for completing all questions" in response_text
-
-                            # Check if we should save the form state
-                            if health_agent.talk_mode != "START":
-                                health_agent.save_progress()
-                                # Also save to MongoDB customer-info collection
-                                form_id = client_state.get("form_id")
-                                user_id = client_state.get("user_id")
-                                
-                                # CRITICAL: Verify form_id belongs to this user before saving
-                                if form_id and user_id:
-                                    existing_form = fetch_form_by_id(form_id, user_id)
-                                    if existing_form:
-                                        form_user_id = existing_form.get("userId")
-                                        # Normalize to strings for comparison (ObjectId vs string)
-                                        if str(form_user_id) != str(user_id):
-                                            print(f"[text_input] SECURITY ERROR: Form {form_id} belongs to {form_user_id}, but current user is {user_id}")
-                                            # Don't save - this is a security issue
-                                            continue
-                                
-                                # Deep copy health_agent.form before saving to prevent shared references
-                                import copy
-                                form_data_to_save = copy.deepcopy(health_agent.form)
-                                
-                                saved_form_id = save_customer_info(
-                                    user_id=user_id,
-                                    form_data=form_data_to_save,  # Use deep copy
-                                    current_section=health_agent.current_section,
-                                    form_id=form_id
+                                # Send response to client IMMEDIATELY
+                                await send_text_message(
+                                    websocket,
+                                    client_state,
+                                    response_text,
+                                    build_interview_state_from_graph(
+                                        result_state,
+                                        client_state,
+                                        fetch_form_attachments_fn=fetch_form_attachments,
+                                        calculate_form_progress_fn=calculate_form_progress,
+                                        calculate_section_completion_status_fn=calculate_section_completion_status,
+                                        fetch_form_by_id_fn=fetch_form_by_id,
+                                        progress_override=progress,
+                                    ),
+                                    user_response=text_input,
+                                    force_request_attachment=bool(result_state.get("request_attachment")),
                                 )
-                                # Store form_id if it's a new form
-                                if saved_form_id and not form_id:
-                                    client_state["form_id"] = saved_form_id
-                                    print(f"[text_input] Created new form_id: {saved_form_id} for user: {user_id}")
 
-                            # Calculate progress based on actual form data completion
-                            # If form is complete, set progress to 100%
-                            if is_complete:
-                                progress = 100.0
+                                # Opt 3: persist to MongoDB as background task — don't block response
+                                _save_user_id = client_state.get("user_id", "")
+                                _save_form_id = client_state.get("form_id", "")
+                                _save_section = result_state.get("current_section", "")
+                                _save_form = result_state.get("form", {})
+                                asyncio.create_task(asyncio.to_thread(
+                                    _save_for_graph,
+                                    _save_user_id, _save_form, _save_section, _save_form_id
+                                ))
+
+                            # ── HEALTHAGENT FALLBACK PATH ───────────────────────
                             else:
-                                # Use database form for accurate progress (especially after uploads)
-                                form_id = client_state.get("form_id")
-                                user_id = client_state.get("user_id")
-                                if form_id and user_id:
-                                    form = fetch_form_by_id(form_id, user_id)
-                                    if form and form.get("form_data"):
-                                        progress = calculate_form_progress(form["form_data"])
+                                print(f"[text_input] HealthAgent fallback — talk_mode: {health_agent.talk_mode}")
+                                # Send thought update before processing
+                                await _send_thought_update(
+                                    websocket,
+                                    completed_nodes=[],
+                                    active_node="extract_form_data",
+                                )
+                                response_text = health_agent.main_processor(text_input)
+                                # Send thought update after processing
+                                await _send_thought_update(
+                                    websocket,
+                                    completed_nodes=["extract_form_data"],
+                                )
+
+                                if response_text == "SKIP_SECTION":
+                                    current_index = health_agent.form_sections.index(health_agent.current_section)
+                                    if current_index < len(health_agent.form_sections) - 1:
+                                        health_agent.current_section = health_agent.form_sections[current_index + 1]
+                                        prompt_template = health_agent.make_template(mode="query")
+                                        if prompt_template and prompt_template != "SKIP_SECTION":
+                                            response_text = health_agent.talk_to_user(prompt_template)
+                                            health_agent.history.append({"role": "agent", "message": response_text})
+                                        else:
+                                            response_text = "Let me move on to the next section."
+                                    else:
+                                        response_text = "Thank you for providing all the information. Let me generate a summary."
+
+                                is_complete = "Thank you for completing all questions" in response_text
+
+                                if health_agent.talk_mode != "START":
+                                    health_agent.save_progress()
+                                    form_id = client_state.get("form_id")
+                                    user_id = client_state.get("user_id")
+                                    if form_id and user_id:
+                                        existing_form = fetch_form_by_id(form_id, user_id)
+                                        if existing_form:
+                                            form_user_id = existing_form.get("userId")
+                                            if str(form_user_id) != str(user_id):
+                                                print(f"[text_input] SECURITY ERROR: Form {form_id} belongs to {form_user_id}, not {user_id}")
+                                                continue
+                                    import copy
+                                    saved_form_id = save_customer_info(
+                                        user_id=user_id,
+                                        form_data=copy.deepcopy(health_agent.form),
+                                        current_section=health_agent.current_section,
+                                        form_id=form_id,
+                                    )
+                                    if saved_form_id and not form_id:
+                                        client_state["form_id"] = saved_form_id
+
+                                if is_complete:
+                                    progress = 100.0
+                                else:
+                                    form_id = client_state.get("form_id")
+                                    user_id = client_state.get("user_id")
+                                    if form_id and user_id:
+                                        db_form = fetch_form_by_id(form_id, user_id)
+                                        progress = calculate_form_progress(
+                                            db_form["form_data"] if db_form and db_form.get("form_data")
+                                            else health_agent.form
+                                        )
                                     else:
                                         progress = calculate_form_progress(health_agent.form)
-                                else:
-                                    progress = calculate_form_progress(health_agent.form)
 
-                            await send_text_message(
-                                websocket,
-                                client_state,
-                                response_text,
-                                build_interview_state(
-                                    client_state, progress_override=progress
-                                ),
-                                user_response=text_input,  # Pass user's response to check if they have reports
-                            )
+                                await send_text_message(
+                                    websocket, client_state, response_text,
+                                    build_interview_state(client_state, progress_override=progress),
+                                    user_response=text_input,
+                                )
 
                         except Exception as e:
-                            print(f"Error processing text input: {e}")
-                            await websocket.send_text(
-                                json.dumps(
-                                    {"type": "error", "text": f"Error: {str(e)}"}
-                                )
-                            )
+                            import traceback
+                            err_str = str(e)
+                            # 1001 = client navigated away; 1000 = normal close — don't try to send
+                            is_disconnect = any(code in err_str for code in ("1001", "1000", "going away", "ConnectionClosed", "disconnect"))
+                            if not is_disconnect:
+                                print(f"Error processing text input: {e}")
+                                traceback.print_exc()
+                                try:
+                                    await websocket.send_text(
+                                        json.dumps({"type": "error", "text": f"Error: {err_str}"})
+                                    )
+                                except Exception:
+                                    pass  # socket already closed
+                            else:
+                                print(f"[text_input] Client disconnected during processing (code 1001) — skipping error send")
 
                     elif msg_type == "audio_end":
                         # Client has finished sending audio
@@ -2882,10 +3194,8 @@ async def upload_form_attachment(
         raise HTTPException(status_code=404, detail="Form not found.")
 
     # Enforce that each form remains bound to a single user.
-    # This guarantees that every user has their own independent form record
-    # and attachments, even if the *same* physical document is uploaded for
-    # many different users (each upload will go to that user's own form).
-    if form.get("userId") != userId:
+    # Compare as strings to handle ObjectId vs string mismatches.
+    if str(form.get("userId", "")) != str(userId):
         raise HTTPException(
             status_code=403,
             detail="Form does not belong to this user.",
@@ -2935,115 +3245,91 @@ async def upload_form_attachment(
     if not file_data_list:
         raise HTTPException(status_code=400, detail="No valid files were uploaded.")
 
-    # Generate combined summary from all documents
-    from docscanner.service import summarize_multiple_reports
-    
-    combined_summary = None
-    try:
-        combined_summary = summarize_multiple_reports(file_data_list)
-        print(f"[upload_attachment] Generated combined summary for {len(file_data_list)} documents")
-    except Exception as exc:
-        print(f"[upload_attachment] Doc-scanner failed: {exc}")
-        import traceback
-        traceback.print_exc()
-        combined_summary = {"error": str(exc)}
-
-    # Add summary to all attachment records
-    for record in attachment_records:
-        record["summary"] = combined_summary
-
-    # Update MongoDB with attachments
+    # ── Step 1: Save attachment records to MongoDB immediately ────────────────
     if customer_info_collection is None:
         init_mongo()
-
     if customer_info_collection is None:
         raise HTTPException(status_code=500, detail="Database unavailable.")
 
-    # Add all attachments
     customer_info_collection.update_one(
-        {"formId": form_id},
+        {"formId": form_id, "userId": normalize_user_id(userId)},
         {"$push": {"attachments": {"$each": attachment_records}}},
     )
+    print(f"[upload_attachment] Saved {len(attachment_records)} attachment(s) to MongoDB")
 
-    # Auto-fill Reports section in form_data
+    # Mark Reports as "processing" so the form knows uploads exist
     form_data = form.get("form_data", {})
-    if "Diagnostic Reports" not in form_data:
-        form_data["Diagnostic Reports"] = {}
-    
-    # Create a readable summary text for the Reports field
-    reports_text = ""
-    if combined_summary and not combined_summary.get("error"):
-        findings = combined_summary.get("findings", [])
-        impression = combined_summary.get("impression", "")
-        measurements = combined_summary.get("measurements", [])
-        
-        if findings:
-            reports_text += "Findings:\n"
-            for finding in findings:
-                title = finding.get("title", "")
-                details = finding.get("details", "")
-                if title:
-                    reports_text += f"- {title}: {details}\n"
-                elif details:
-                    reports_text += f"- {details}\n"
-        
-        if measurements:
-            reports_text += "\nMeasurements:\n"
-            for meas in measurements:
-                label = meas.get("label", "")
-                value = meas.get("value", "")
-                units = meas.get("units", "")
-                location = meas.get("anatomical_location", "")
-                if label and value:
-                    meas_text = f"- {label}: {value}"
-                    if units:
-                        meas_text += f" {units}"
-                    if location:
-                        meas_text += f" ({location})"
-                    reports_text += meas_text + "\n"
-        
-        if impression:
-            reports_text += f"\nImpression: {impression}\n"
-        
-        # Also store the full JSON summary
-        reports_text += f"\n[Full summary available in attachment metadata]"
-    else:
-        reports_text = f"Uploaded {len(attachment_records)} document(s). "
-        if combined_summary and combined_summary.get("error"):
-            reports_text += f"Summary generation failed: {combined_summary.get('error')}"
+    hist_diag = form_data.get("History & Diagnostics", {})
+    if not hist_diag.get("Reports", "").strip():
+        form_data.setdefault("History & Diagnostics", {})["Reports"] = (
+            f"Uploaded {len(attachment_records)} document(s). OCR summary processing in background."
+        )
+        customer_info_collection.update_one(
+            {"formId": form_id, "userId": normalize_user_id(userId)},
+            {"$set": {"form_data": form_data, "updatedAt": datetime.now(timezone.utc)}},
+        )
+
+    # ── Step 2: Run OCR/summarisation as a background task ───────────────────
+    async def _run_ocr_and_update():
+        from docscanner.service import summarize_multiple_reports as _summarize
+        try:
+            combined_summary = await asyncio.to_thread(_summarize, file_data_list)
+            print(f"[ocr_bg] Summary done for {len(file_data_list)} doc(s)")
+        except Exception as exc:
+            print(f"[ocr_bg] Doc-scanner failed: {exc}")
+            combined_summary = {"error": str(exc)}
+
+        # Build human-readable text from summary
+        reports_text = ""
+        if combined_summary and not combined_summary.get("error"):
+            findings = combined_summary.get("findings", [])
+            impression = combined_summary.get("impression", "")
+            measurements = combined_summary.get("measurements", [])
+            if findings:
+                reports_text += "Findings:\n"
+                for f in findings:
+                    t, d = f.get("title", ""), f.get("details", "")
+                    reports_text += f"- {t}: {d}\n" if t else f"- {d}\n"
+            if measurements:
+                reports_text += "\nMeasurements:\n"
+                for m in measurements:
+                    lbl, val, u, loc = m.get("label",""), m.get("value",""), m.get("units",""), m.get("anatomical_location","")
+                    if lbl and val:
+                        reports_text += f"- {lbl}: {val}{' '+u if u else ''}{' ('+loc+')' if loc else ''}\n"
+            if impression:
+                reports_text += f"\nImpression: {impression}"
         else:
-            reports_text += "Summary processing in progress."
+            err = (combined_summary or {}).get("error", "unknown error")
+            reports_text = f"Uploaded {len(attachment_records)} document(s). Summary failed: {err}"
 
-    form_data["Diagnostic Reports"]["Reports"] = reports_text.strip()
+        # Write OCR result back to MongoDB
+        try:
+            if customer_info_collection is not None:
+                _form = fetch_form_by_id(form_id, userId) or {}
+                _fd = _form.get("form_data", form_data)
+                _fd.setdefault("History & Diagnostics", {})["Reports"] = reports_text.strip()
+                # Also store summary in attachment records
+                customer_info_collection.update_one(
+                    {"formId": form_id, "userId": normalize_user_id(userId)},
+                    {"$set": {"form_data": _fd, "updatedAt": datetime.now(timezone.utc)}},
+                )
+                print("[ocr_bg] Wrote OCR summary to MongoDB")
+        except Exception as exc:
+            print(f"[ocr_bg] Failed to write summary: {exc}")
 
-    # Update form_data in MongoDB
-    customer_info_collection.update_one(
-        {"formId": form_id},
-        {
-            "$set": {
-                "form_data": form_data,
-                "updatedAt": datetime.now(timezone.utc),
-            }
-        },
-    )
+    asyncio.create_task(_run_ocr_and_update())
 
-    # Sync health_agent.form with the updated database form so progress calculation is accurate
-    # Only sync if this form_id matches the current client_state form_id
-    # We'll sync in the response or when needed
-    print(f"[upload_attachment] Updated form_data Reports section with combined summary")
-    
-    # Calculate progress from the updated form data
+    # ── Return immediately — OCR runs in the background ──────────────────────
     updated_progress = calculate_form_progress(form_data)
-    # Also calculate section completion status for frontend
     section_progress = calculate_section_completion_status(form_data)
 
     return {
         "attachments": attachment_records,
-        "combined_summary": combined_summary,
         "reports_filled": True,
-        "form_data": form_data,  # Return updated form data
-        "progress": updated_progress,  # Return updated progress
-        "sectionProgress": section_progress,  # Return section completion status
+        "ocr_status": "processing",
+        "form_data": form_data,
+        "progress": updated_progress,
+        "sectionProgress": section_progress,
     }
 
 

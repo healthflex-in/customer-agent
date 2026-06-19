@@ -57,6 +57,7 @@ google-api-core==2.24.2
 # Audio Processing
 pydub==0.25.1
 openai-whisper
+faster-whisper
 
 # Networking and gRPC
 grpcio>=1.71.0,<1.73.0
@@ -73,6 +74,10 @@ opentelemetry-instrumentation-fastapi==0.53b1
 openinference-instrumentation==0.1.28
 openinference-instrumentation-vertexai==0.1.11
 openinference-instrumentation-openai==0.1.30
+
+# Langfuse LLM observability
+langfuse>=2.0.0
+openinference-instrumentation-llama-index>=3.0.0
 
 # Utilities
 tqdm==4.67.1

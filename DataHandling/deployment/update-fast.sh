@@ -66,7 +66,13 @@ ssh -i "$KEY_FILE" "${EC2_USER}@${EC2_HOST}" bash -s << 'ENDSSH'
     # Set permissions
     sudo chown -R ubuntu:ubuntu DataHandling/ 2>/dev/null || true
     chmod -R 755 DataHandling/ 2>/dev/null || true
-    
+
+    # Clear Python bytecode cache — stale .pyc files cause old code to run
+    # even after source files are updated via rsync
+    find DataHandling/src -name "*.pyc" -delete 2>/dev/null || true
+    find DataHandling/src -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+    echo "✓ .pyc cache cleared"
+
     # Restart container (code is mounted as volume, so changes are immediate)
     echo "Restarting container..."
     sudo docker-compose restart

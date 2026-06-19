@@ -16,68 +16,51 @@ python-multipart
 # WebSocket dependencies
 websockets>=13.0.0,<15.1.0
 
-# Database and Vector Store
-chromadb==1.0.4
-
-# LlamaIndex Core
+# LlamaIndex Core (Gemini/Google GenAI only — Vertex removed, not used)
 llama-index==0.12.25
 llama-index-core==0.12.25
 llama-index-llms-gemini==0.4.14
 llama-index-llms-google-genai==0.1.12
-llama-index-embeddings-huggingface==0.4.0
-llama-index-vector-stores-chroma==0.4.0
-llama-index-llms-vertex==0.4.6
 
-# HuggingFace
-huggingface-hub==0.30.2
-sentence-transformers==2.6.1
-
-# Google Cloud Services
-google-cloud-speech==2.31.1
+# Google Cloud Services (auth + generative AI only — speech/aiplatform removed)
 google-generativeai==0.8.5
-google-cloud-aiplatform==1.71.1
 google-auth==2.39.0
 google-api-core==2.24.2
 
-# Audio Processing (server-side only)
+# Audio Processing
 pydub==0.25.1
-# openai-whisper  # replaced by faster-whisper (CTranslate2 backend, ~4x faster on CPU)
 faster-whisper>=1.0.0
 gtts
-
-# PyTorch (CPU-only, no CUDA) - Install separately with extra index
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchaudio
 
 # Networking and gRPC
 grpcio>=1.71.0,<1.73.0
 
-# Monitoring and Observability
-arize-phoenix-client==1.4.0
-arize-phoenix-evals==0.20.6
-arize-phoenix-otel==0.9.2
-
-# OpenTelemetry
+# OpenTelemetry (base only — vertexai/openai instrumentation removed)
 opentelemetry-api==1.32.1
 opentelemetry-sdk==1.32.1
 opentelemetry-instrumentation-fastapi==0.53b1
 openinference-instrumentation==0.1.28
-openinference-instrumentation-vertexai==0.1.11
-openinference-instrumentation-openai==0.1.30
+
+# Langfuse LLM observability
+langfuse>=2.0.0
+openinference-instrumentation-llama-index>=3.0.0
+
+# LangGraph
+langgraph>=0.2.0
 
 # Utilities
 tqdm==4.67.1
-transformers
 pdf2image
 
-# Excluded for Docker (GUI/Desktop dependencies):
-# - gradio (needs GTK, X11)
-# - sounddevice (needs ALSA, PulseAudio)
-# - pyttsx3 (needs espeak, desktop audio)
-# - PyAudio (needs portaudio system libs)
-# - SpeechRecognition (uses PyAudio)
-# - pdf2image (needs poppler-utils)
-# - GPUtil (GPU monitoring, not needed in container)
-# - redis (not using Redis in this setup)
-
+# Removed (not used in production):
+# - torch / torchaudio        (~1.4 GB) — audio/utils.py is never imported; server uses faster-whisper
+# - transformers              (~400 MB) — same, only in unused audio/utils.py
+# - sentence-transformers     (~100 MB) — not imported anywhere
+# - huggingface-hub           (pulled by above)
+# - llama-index-embeddings-huggingface — needs torch; VectorStore never queried in graph path
+# - llama-index-vector-stores-chroma / chromadb — initialized but never queried in active path
+# - llama-index-llms-vertex   (~20 MB)  — not imported anywhere
+# - google-cloud-speech       (~50 MB)  — not imported anywhere
+# - google-cloud-aiplatform   (~200 MB) — not imported anywhere
+# - arize-phoenix-*           (~100 MB) — not imported in production code
+# - openinference-instrumentation-vertexai/openai — Vertex/OpenAI not used

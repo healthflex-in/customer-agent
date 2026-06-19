@@ -8,9 +8,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: healthflex-customer-agent
+    container_name: healthflex-customer-agent-dev
     ports:
-      - "8000:8000"
+      - "8001:8000"
     env_file:
       - ./DataHandling/.env
     environment:
@@ -24,17 +24,17 @@ services:
     volumes:
       # Mount code directory for instant updates (no rebuild needed)
       - ./DataHandling:/app:rw
-      
+
       # Persist audio files, transcripts, and cache
-      - ./DataHandling/audio_files:/app/audio_files
-      - ./DataHandling/transcripts:/app/transcripts
-      - ./DataHandling/tts_cache:/app/tts_cache
-      - ./DataHandling/output:/app/output
-      - ./DataHandling/received_audio:/app/received_audio
-      
+      - ./DataHandling_dev/audio_files:/app/audio_files
+      - ./DataHandling_dev/transcripts:/app/transcripts
+      - ./DataHandling_dev/tts_cache:/app/tts_cache
+      - ./DataHandling_dev/output:/app/output
+      - ./DataHandling_dev/received_audio:/app/received_audio
+
       # Persist vector database
-      - ./DataHandling/db:/app/db
-      
+      - ./DataHandling_dev/db:/app/db
+
       # Mount config files (Google credentials) - read only
       - ./DataHandling/config:/app/config:ro
     

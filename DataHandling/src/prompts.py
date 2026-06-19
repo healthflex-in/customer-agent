@@ -108,7 +108,7 @@ _MEDICAL_FORM_TEMPLATE_BASE = {
         "Primary Complaint": "",
         "Duration of the Issue": "",
         "Onset (Gradual or Sudden)": "",
-        "Mechanism of Injury (If Any)": "",
+        "Mechanism of Injury or Cause": "",
     },
     "Previous Consultations": {
         "Previous Diagnosis or Advice and Prescribed Treatment Taken": "",
@@ -148,7 +148,7 @@ CRITICAL RULES:
 - Be extremely forgiving with transcription errors:
    → "cost" → "cause", "ligament" → "ligament", "back pain" → "backbone", "eight" or "ate" → "8", "ten" → "10"
    → "since two months", "for 3 weeks", "last year" → extract duration
-   → "after fall", "twisted ankle", "lifting weight" → Mechanism of Injury
+   → "after fall", "twisted ankle", "lifting weight" → Mechanism of Injury or Cause
    → Any number said near "pain" or "hurts" → assume it's pain scale (0–10)
 - If patient mentions MRI, X-ray, scan, report even once → put in "Reports"
 - Never leave a field blank if any clue exists — use clinical judgment
