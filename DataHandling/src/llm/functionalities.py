@@ -86,6 +86,26 @@ from src.graph.pure_functions.summary import (
 enums_obj = ENUMS()
 
 
+def sanitize_patient_input(text: str) -> str:
+    """Strip control chars, limit length, block obvious prompt injection."""
+    import re
+    if not text:
+        return text
+    text = text[:2000]
+    text = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', text)
+    injection_patterns = [
+        r'ignore (all |previous |prior )?instructions',
+        r'you are now',
+        r'forget everything',
+        r'system prompt',
+        r'jailbreak',
+    ]
+    for pat in injection_patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            text = re.sub(pat, '[filtered]', text, flags=re.IGNORECASE)
+    return text.strip()
+
+
 class HealthAgent:
     def __init__(self):
         """
@@ -165,13 +185,14 @@ class HealthAgent:
         if self.llm is None:
             raise ValueError("LLM not initialized")
 
-        # Model rotation: primary first, then fallbacks on demand spikes
+        # Model rotation: rotate fast under load — shorter delays, more fallbacks
         _MODEL_ROTATION = [
             "gemini-2.5-flash-lite",   # primary — fast and cheap
-            "gemini-2.5-flash",        # fallback 1 — full model
-            "gemini-2.0-flash",        # fallback 2 — stable older model
+            "gemini-2.5-flash",        # fallback 1 — full model, usually available
+            "gemini-2.0-flash",        # fallback 2 — older stable model
+            "gemini-1.5-flash",        # fallback 3 — last resort, very stable
         ]
-        _RETRY_DELAYS = [1, 3, 7]      # seconds before rotating to next model
+        _RETRY_DELAYS = [0.5, 1, 3]    # shorter waits: rotate fast under heavy load
 
         _api_key = getattr(self.llm, "api_key", None) or os.environ.get("GEMINI_API_KEY", "")
 
@@ -261,6 +282,10 @@ class HealthAgent:
                 err_str = str(e)
                 is_transient = any(code in err_str for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
                 next_model = _MODEL_ROTATION[attempt + 1] if attempt + 1 < len(_MODEL_ROTATION) else None
+                # Total budget check: if this is the last model and still failing, raise immediately
+                if attempt >= len(_MODEL_ROTATION) - 1:
+                    print(f"[llm] All {len(_MODEL_ROTATION)} models exhausted, raising immediately")
+                    raise
                 if is_transient and next_model:
                     delay = _RETRY_DELAYS[attempt] if attempt < len(_RETRY_DELAYS) else 5
                     print(f"[llm] {model_name} unavailable (503/429) — waiting {delay}s then trying {next_model}")

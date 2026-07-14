@@ -475,9 +475,6 @@ from docscanner.service import summarize_report_from_bytes
 # Import HealthAgent and related functionalities
 from src.llm.functionalities import HealthAgent
 
-# Deterministic orchestrator for question-pool-driven interview flow
-from src.orchestrator import initialize_orchestrator, get_orchestrator
-
 # Centralized configuration (env vars, constants, paths).
 # Aliased to the legacy names used throughout this file so handler code is
 # unchanged. New code should import directly from app.config.
@@ -507,7 +504,119 @@ from app.db.serializers import (
 # MongoDB DISABLED - Commented out
 # from db import MedicalInterviewDB
 
-app = FastAPI()
+# ── Structured logging ──────────────────────────────────────────────────────
+try:
+    import structlog
+    structlog.configure(
+        processors=[
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.add_log_level,
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(20),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+    )
+    _log = structlog.get_logger()
+    _HAS_STRUCTLOG = True
+except ImportError:
+    _HAS_STRUCTLOG = False
+    class _FallbackLog:
+        def info(self, event, **kw): print(f"[INFO] {event}", kw or "")
+        def warning(self, event, **kw): print(f"[WARN] {event}", kw or "")
+        def error(self, event, **kw): print(f"[ERROR] {event}", kw or "")
+    _log = _FallbackLog()
+
+# ── Prometheus metrics ───────────────────────────────────────────────────────
+try:
+    from prometheus_client import Counter, Histogram, Gauge, make_asgi_app as _make_metrics_app
+    from starlette_prometheus import PrometheusMiddleware
+    LLM_CALLS      = Counter('llm_calls_total', 'LLM calls', ['model', 'status'])
+    LLM_LATENCY    = Histogram('llm_latency_seconds', 'LLM latency', ['model'])
+    WS_CONNECTIONS = Gauge('ws_active_connections', 'Active WebSocket sessions')
+    MODEL_FALLBACKS = Counter('model_fallbacks_total', 'Model rotation events', ['from_model', 'to_model'])
+    INTERVIEW_TURNS = Counter('interview_turns_total', 'Turns processed', ['phase'])
+    _HAS_PROMETHEUS = True
+except ImportError:
+    _HAS_PROMETHEUS = False
+    class _Noop:
+        def inc(self, *a, **k): pass
+        def dec(self, *a, **k): pass
+        def observe(self, *a, **k): pass
+        def labels(self, *a, **k): return self
+    LLM_CALLS = LLM_LATENCY = WS_CONNECTIONS = MODEL_FALLBACKS = INTERVIEW_TURNS = _Noop()
+
+# ── FastAPI-native rate limiter (no external library needed) ─────────────────
+from collections import defaultdict
+class _RateLimiter:
+    """Token-bucket rate limiter using FastAPI dependency injection."""
+    def __init__(self, max_per_minute: int = 30):
+        self._counts: dict = defaultdict(list)
+        self._max = max_per_minute
+    def check(self, key: str) -> bool:
+        now = time.monotonic()
+        calls = [t for t in self._counts[key] if now - t < 60]
+        calls.append(now)
+        self._counts[key] = calls
+        return len(calls) <= self._max
+
+_rate_limiter = _RateLimiter(max_per_minute=30)
+
+# ── Active connections tracker for graceful shutdown ─────────────────────────
+_active_ws_connections: set = set()
+_shutting_down = False
+
+# ── Input sanitization ───────────────────────────────────────────────────────
+import re as _re
+def sanitize_patient_input(text: str) -> str:
+    """Strip control chars, limit length, neutralize prompt injection."""
+    if not text:
+        return text
+    text = text[:2000]
+    text = _re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', text)
+    _injection = [
+        r'ignore\s+(all\s+)?(previous|prior)?\s*instructions?',
+        r'you are now',  r'forget everything',  r'system prompt',  r'jailbreak',
+        r'act as',  r'pretend (you are|to be)',
+    ]
+    for pat in _injection:
+        text = _re.sub(pat, '[filtered]', text, flags=_re.IGNORECASE)
+    return text.strip()
+
+# ── FastAPI app with lifespan for graceful startup/shutdown ──────────────────
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app_instance):
+    global _shutting_down
+    _log.info("server_startup", service="healthflex-agent")
+    yield
+    # ── Graceful shutdown ───────────────────────────────────────────────────
+    _shutting_down = True
+    _log.info("server_shutdown_initiated", active_sessions=len(_active_ws_connections))
+    # Notify active WebSocket sessions
+    for ws in list(_active_ws_connections):
+        try:
+            await ws.send_text(json.dumps({
+                "type": "system",
+                "message": "Server restarting — your progress is saved. Reconnect in a few seconds."
+            }))
+        except Exception:
+            pass
+    # Wait up to 15s for sessions to wind down
+    for _ in range(15):
+        if not _active_ws_connections:
+            break
+        await asyncio.sleep(1)
+    _log.info("server_shutdown_complete")
+
+app = FastAPI(lifespan=lifespan, title="Healthflex Customer Agent", version="2.0.0")
+
+if _HAS_PROMETHEUS:
+    app.add_middleware(PrometheusMiddleware)
+    metrics_app = _make_metrics_app()
+    app.mount("/metrics", metrics_app)
 
 # ── Agent thought stream: human-readable labels for each graph node ──────────
 NODE_THOUGHTS: dict[str, dict[str, str]] = {
@@ -635,22 +744,13 @@ model = WhisperModel(
     device=cuda_device,
     compute_type="int8" if cuda_device == "cpu" else "float16",
 )
-print(f"Model loaded on {cuda_device}")
+print(f"Whisper 'base' model loaded on {cuda_device}")
 
 # Initialize HealthAgent (kept for audio, summary title generation, and legacy fallback)
 print("Initializing HealthAgent...")
 health_agent = HealthAgent()
 print("HealthAgent initialized")
 
-# Initialize DeterministicOrchestrator (non-fatal — falls back to HealthAgent-only flow)
-try:
-    from app.config import MONGO_URI as _MONGO_URI, MONGO_DB_NAME as _MONGO_DB_NAME
-    if _MONGO_URI:
-        initialize_orchestrator(_MONGO_URI, _MONGO_DB_NAME)
-    else:
-        print("[orchestrator] MONGO_URI not set — orchestrator disabled")
-except Exception as _orch_err:
-    print(f"[orchestrator] Failed to initialize (non-fatal): {_orch_err}")
 
 # ── LangGraph interview graph ────────────────────────────────────────────────
 # Build once at startup; each WebSocket turn calls graph.invoke(state).
@@ -670,11 +770,49 @@ try:
                                   current_section=section, form_id=form_id,
                                   chat_history=chat_history)
 
+    # In-memory checkpointer — MongoDB is the persistent source of truth.
+    from src.graph.graph import create_checkpointer as _create_checkpointer
+    _checkpointer = _create_checkpointer()
+
+    # Initialize reasoning-grade LLM (gemini-2.5-flash) for form extraction.
+    # Kept separate from the main LLM (flash-lite) so only extraction pays
+    # for the more capable model.
+    _reasoning_llm_complete = None
+    try:
+        from src.llm.utils import init_reasoning_llm
+        # Try every possible env var name for the Gemini API key
+        _api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+                    or os.getenv("GOOGLE_GEMINI_API_KEY"))
+        print(f"[graph] Reasoning LLM — API key present: {'yes' if _api_key else 'NO'}")
+        if not _api_key:
+            # Last resort: pull from health_agent if it has it cached
+            try:
+                from src.llm.utils import load_gemini_key
+                _api_key = load_gemini_key()
+                print(f"[graph] Reasoning LLM — loaded key from config: {'yes' if _api_key else 'NO'}")
+            except Exception:
+                pass
+        if _api_key:
+            _r_llm = init_reasoning_llm(_api_key)
+            def _reasoning_llm_complete(prompt: str) -> str:
+                resp = _r_llm.complete(prompt)
+                text = getattr(resp, 'text', None) or str(resp)
+                return text.strip()
+            print("[graph] Reasoning LLM (gemini-2.5-flash) initialized for form extraction")
+        else:
+            print("[graph] WARNING: No API key — reasoning LLM disabled, using flash-lite fallback")
+    except Exception as _r_err:
+        import traceback as _rtb
+        print(f"[graph] Reasoning LLM init failed: {_r_err}")
+        _rtb.print_exc()
+
     _interview_graph = build_interview_graph(
         llm_complete=health_agent.llm_complete,
         system_prompt=health_agent.system_prompt,
         predefined_questions=health_agent.predefined_questions,
         save_customer_info_fn=_save_for_graph,
+        checkpointer=_checkpointer,
+        reasoning_llm=_reasoning_llm_complete,
     )
     print("[graph] LangGraph interview graph initialized")
 except Exception as _graph_err:
@@ -710,6 +848,25 @@ def init_mongo():
         db = mongo_client[MONGO_DB_NAME]
         users_collection = db[MONGO_USERS_COLLECTION]
         customer_info_collection = db[MONGO_CUSTOMER_INFO_COLLECTION]
+
+        # Unique index: prevents duplicate documents for the same (userId, formId)
+        customer_info_collection.create_index(
+            [("userId", 1), ("formId", 1)],
+            unique=True,
+            name="unique_user_form",
+        )
+
+        # TTL index: auto-delete empty/abandoned forms after 7 days.
+        # Only applies to docs where title is still "New Form" (never filled).
+        # Completed forms have a real title so this won't touch them.
+        # MongoDB checks the expireAfterSeconds on the createdAt field.
+        customer_info_collection.create_index(
+            [("createdAt", 1)],
+            expireAfterSeconds=7 * 24 * 3600,  # 7 days
+            partialFilterExpression={"title": "New Form"},
+            name="ttl_abandoned_forms",
+        )
+
         print(
             f"Connected to MongoDB collections: {MONGO_DB_NAME}.{MONGO_USERS_COLLECTION}, {MONGO_DB_NAME}.{MONGO_CUSTOMER_INFO_COLLECTION}"
         )
@@ -852,24 +1009,27 @@ def save_customer_info(
             "userId": normalized_user_id
         })
         
-        if existing:
-            attachments_to_store = (
-                attachments if attachments is not None else existing.get("attachments", [])
-            )
-            # Update existing document
-            customer_doc["createdAt"] = existing.get("createdAt", datetime.now())
-            customer_doc["attachments"] = attachments_to_store
-            customer_info_collection.update_one(
-                {"formId": form_id, "userId": normalized_user_id},
-                {"$set": customer_doc}
-            )
-            print(f"Updated customer info for user {user_id}, form {form_id} in MongoDB")
-        else:
-            # Create new document
-            customer_doc["createdAt"] = datetime.now()
-            customer_doc["attachments"] = attachments if attachments is not None else []
-            customer_info_collection.insert_one(customer_doc)
-            print(f"Created customer info for user {user_id}, form {form_id} in MongoDB")
+        # ── Atomic upsert — no duplicate documents possible ─────────────────
+        # Using update_one with upsert=True + $setOnInsert for createdAt means:
+        # • If document exists → only the mutable fields are updated (no duplicate)
+        # • If document is new → full document is created with createdAt set once
+        # This replaces the previous find→insert/update pattern which had a race
+        # condition where two concurrent saves could both insert a new document.
+        attachments_to_store = (
+            attachments if attachments is not None else
+            (existing.get("attachments", []) if existing else [])
+        )
+        customer_doc["attachments"] = attachments_to_store
+
+        customer_info_collection.update_one(
+            {"formId": form_id, "userId": normalized_user_id},
+            {
+                "$set": customer_doc,
+                "$setOnInsert": {"createdAt": datetime.now()},
+            },
+            upsert=True,
+        )
+        print(f"Saved customer info for user {user_id}, form {form_id} in MongoDB")
         
         return form_id
             
@@ -1043,105 +1203,28 @@ def fetch_form_attachments(form_id: str, user_id: str = None) -> List[dict]:
 
 
 def create_placeholder_form(user_id: str, client_state: dict) -> Optional[str]:
-    """Create an empty form record so uploads have a form_id to reference.
-    If the user already has a form (even empty), return its ID without overwriting it."""
-    # Guard: never overwrite an existing form — just return the existing ID
+    """Return the form_id for this user WITHOUT creating a MongoDB document.
+
+    We no longer eagerly insert empty 'New Form' documents — that was creating
+    one empty doc per connected user, polluting the collection. Instead we just
+    assign the well-known DEFAULT_FORM_ID to client_state. The actual MongoDB
+    document is created (via upsert) only when the first real data is saved.
+    If the user already has a form in MongoDB, we find it and reuse its id.
+    """
+    # Check if a form already exists — if so, reuse it
     existing = fetch_latest_form_for_user(user_id)
     if existing:
         existing_id = existing.get("formId", DEFAULT_FORM_ID)
         client_state["form_id"] = existing_id
-        print(f"[create_placeholder_form] Form already exists for user {user_id} ({existing_id}), skipping creation.")
+        print(f"[create_placeholder_form] Reusing existing form {existing_id} for user {user_id}")
         return existing_id
 
-    import copy
-    # CRITICAL: Use get_medical_form_template() to get a fresh template
-    # This ensures we always start with a clean template that hasn't been mutated
-    from src.prompts import get_medical_form_template
-    
-    # Get a fresh template (always clean, even if MEDICAL_FORM_TEMPLATE was mutated)
-    form_data_copy = get_medical_form_template()
-    
-    # VERIFY the copied form is actually empty before using it
-    has_data_in_copy = False
-    for section, fields in form_data_copy.items():
-        if isinstance(fields, dict):
-            for field, value in fields.items():
-                if value and str(value).strip():
-                    has_data_in_copy = True
-                    print(f"[create_placeholder_form] ERROR: Deep copied template has non-empty data! {section}.{field} = {value}")
-    
-    if has_data_in_copy:
-        print(f"[create_placeholder_form] CRITICAL ERROR: Deep copied template still has data! Creating fresh empty form manually.")
-        # Manually create an empty form structure as last resort
-        form_data_copy = {
-            "Present Complaint": {
-                "Primary Complaint": "",
-                "Duration of the Issue": "",
-                "Onset (Gradual or Sudden)": "",
-                "Mechanism of Injury (If Any)": "",
-            },
-            "Previous Consultations": {
-                "Previous Diagnosis or Advice and Prescribed Treatment Taken": "",
-                "Current Status of Issue (Improved, Same, Worse)": "",
-            },
-            "Pain Assessment": {
-                "Primary Location of Pain": "",
-                "Severity (1-10)": "",
-                "Aggravating Factors": "",
-                "Relieving Factors": "",
-            },
-            "Medical History": {
-                "Systemic Illness and Surgical History": "",
-            },
-            "Lifestyle Factors": {
-                "Current Lifestyle": "",
-            },
-            "Treatment Goals": {
-                "Short-Term Goals (within 3 months)": "",
-                "Long-Term Goals (after 3 months)": "",
-                "Specific Expectations from Treatment": "",
-            },
-            "Diagnostic Reports": {
-                "Reports": "",
-            },
-            "Referral": {
-                "Source": "",
-            },
-        }
-    
-    print(f"[create_placeholder_form] Creating new form with empty template. Form keys: {list(form_data_copy.keys())}")
-    
-    # Double-check: Verify form_data_copy is empty before saving
-    for section, fields in form_data_copy.items():
-        if isinstance(fields, dict):
-            for field, value in fields.items():
-                if value and str(value).strip():
-                    print(f"[create_placeholder_form] CRITICAL: form_data_copy has data before save! {section}.{field} = {value}")
-    
-    # Get the first section as current_section (should be from template, not health_agent)
-    current_section = list(form_data_copy.keys())[0] if form_data_copy else "Present Complaint"
-    
-    form_id = save_customer_info(
-        user_id=user_id,
-        form_data=form_data_copy,
-        current_section=current_section,
-        form_id=None,  # Explicitly None to force new form creation
-        attachments=[],
-    )
-    if form_id:
-        client_state["form_id"] = form_id
-        print(f"[create_placeholder_form] Created new form_id: {form_id} for user: {user_id}")
-        
-        # Immediately verify what was actually saved
-        saved_form = fetch_form_by_id(form_id, user_id)
-        if saved_form:
-            saved_data = saved_form.get("form_data", {})
-            for section, fields in saved_data.items():
-                if isinstance(fields, dict):
-                    for field, value in fields.items():
-                        if value and str(value).strip():
-                            print(f"[create_placeholder_form] CRITICAL ERROR: Form {form_id} was saved with data! {section}.{field} = {value}")
-    return form_id
+    # No existing form — assign DEFAULT_FORM_ID without writing to MongoDB.
+    # The document will be created when the first interview answer is saved.
+    client_state["form_id"] = DEFAULT_FORM_ID
+    print(f"[create_placeholder_form] Assigned form_id {DEFAULT_FORM_ID} for new user {user_id} (no DB write until first answer)")
+    return DEFAULT_FORM_ID
+
 
 
 def build_interview_state(client_state: dict, progress_override: Optional[float] = None, use_db_form: bool = False):
@@ -1416,7 +1499,15 @@ init_mongo()
 @app.get("/health")
 async def health_check():
     """Health check endpoint for Docker and monitoring."""
-    return {"status": "healthy", "service": "healthflex-customer-agent"}
+    return {
+        "status": "ok",
+        "service": "healthflex-customer-agent",
+        "components": {
+            "mongodb": "ok" if customer_info_collection is not None else "degraded",
+            "graph": "ok" if _interview_graph is not None else "degraded",
+            "whisper": "ok"
+        }
+    }
 
 
 # Audio parameters
@@ -1828,8 +1919,19 @@ async def stream_audio_to_client(websocket, audio_data, message_id):
 
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
+    if _shutting_down:
+        await websocket.close(code=1001, reason="Server restarting — reconnect shortly")
+        return
+
     await websocket.accept()
+    _active_ws_connections.add(websocket)
+    WS_CONNECTIONS.inc()
+    _log.info("ws_connected", client_id=client_id)
     print(f"Client {client_id} connected")
+
+    # Per-session processing lock — prevents text+audio race condition.
+    # Only one message is processed at a time per session.
+    _session_lock = asyncio.Lock()
 
     # ── Per-connection HealthAgent ───────────────────────────────────────────
     # CRITICAL: Each WebSocket connection gets its OWN HealthAgent instance.
@@ -1853,7 +1955,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         "received_audio_buffer": bytearray(),
         "recording_start_time": None,
         # Orchestrator session tracking
-        "orchestrator_session_id": None,
         "current_question_id": None,
         # LangGraph state (graph_* keys are managed by server_adapter helpers)
         "graph_form": None,
@@ -1867,6 +1968,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         "graph_awaiting_report_upload": False,
         "graph_attempts_on_current_section": 0,
     }
+    _session_processing = False  # simple flag to prevent concurrent processing
 
     # Create a new interview record
     # MongoDB DISABLED - Using placeholder values instead
@@ -1960,15 +2062,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             except Exception as _ge:
                                 print(f"[graph] init_graph_state_in_client failed (non-fatal): {_ge}")
 
-                        # Start an orchestrator session for this user
-                        _orch = get_orchestrator()
-                        if _orch:
-                            try:
-                                _orch_session_id = _orch.start_session({"user_id": provided_user_id})
-                                client_state["orchestrator_session_id"] = _orch_session_id
-                                print(f"[orchestrator] Session started: {_orch_session_id}")
-                            except Exception as _e:
-                                print(f"[orchestrator] Failed to start session (non-fatal): {_e}")
 
                         # Check if user already has a form (resume mode)
                         existing_form = fetch_latest_form_for_user(provided_user_id)
@@ -2628,14 +2721,175 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         text_input = data.get("text", "").strip()
                         if not text_input:
                             continue
-                        
+
+                        text_input = sanitize_patient_input(text_input)
+                        if not _rate_limiter.check(client_state.get("user_id", "anon")):
+                            await websocket.send_text(json.dumps({"type": "error", "text": "Too many messages. Please slow down."}))
+                            continue
+
                         print(f"Received text input: {text_input}")
                         print(f"[text_input] Current talk_mode: {health_agent.talk_mode}, history length: {len(health_agent.history)}")
-                        
+
+                        # ── Off-topic question shortcut — answer WITHOUT touching the graph ──
+                        # Detects two categories:
+                        # 1. Brand questions → query ChromaDB (Stance brandbook)
+                        # 2. General medical/educational questions → answer from LLM knowledge
+                        # In both cases the interview state is fully preserved and Sage
+                        # guides the patient back to the form after answering.
+                        _ti_lower = text_input.lower()
+
+                        # "stance" alone always means Stance Health — catch it too
+                        _is_just_stance = (
+                            _ti_lower.strip() in {"what is stance", "what is stance?",
+                                                   "stance?", "stance health", "stance health?"}
+                            or _ti_lower.startswith("what is stance")
+                            or _ti_lower.startswith("tell me about stance")
+                            or "stance health" in _ti_lower
+                            or ("stance" in _ti_lower and len(_ti_lower.split()) <= 6
+                                and "knee" not in _ti_lower and "pain" not in _ti_lower)
+                        )
+                        _brand_signals = [
+                            "about stance", "what is stance", "tell me about stance",
+                            "stance health", "your clinic", "the clinic", "your services",
+                            "physiotherapy service", "how does stance", "about you",
+                            "who are you", "what do you do", "what does stance",
+                            "stance team", "stance location", "where are you located",
+                            "how many center", "how many clinic", "how many branch",
+                            "appointment", "book a session", "treatment options",
+                            "what do you offer", "tell me more about stance",
+                        ]
+                        _edu_signals = [
+                            "tell me more about", "can u tell me", "can you tell me",
+                            "what are the causes", "what causes", "what is the reason",
+                            "what are the symptoms", "how does", "explain", "what is",
+                            "what are", "how do i", "what should i", "what can",
+                            "tell me about", "more about", "info on", "information on",
+                            "difference between", "what happens", "why does",
+                        ]
+
+                        # Assessment requests — patient asking Sage for a clinical opinion
+                        _assessment_signals = [
+                            "what do you think", "what do u think", "your opinion",
+                            "what would you say", "what's the situation", "what is the situation",
+                            "what could it be", "what might it be", "likely diagnosis",
+                            "preliminary assessment", "what do you reckon", "any idea",
+                            "what's wrong", "what is wrong", "your assessment",
+                            "sounds like", "does it sound like", "is it serious",
+                            "should i be worried", "how bad is it", "what should i do",
+                        ]
+                        _is_assessment = any(s in _ti_lower for s in _assessment_signals)
+                        _is_brand = _is_just_stance or any(s in _ti_lower for s in _brand_signals)
+                        _is_edu = any(s in _ti_lower for s in _edu_signals)
+
+                        if _is_assessment:
+                            try:
+                                # Build a summary of what's been collected so far
+                                _form = client_state.get("graph_form") or {}
+                                _collected = []
+                                for _sec, _fields in _form.items():
+                                    if isinstance(_fields, dict):
+                                        for _k, _v in _fields.items():
+                                            if _v and str(_v).strip():
+                                                _collected.append(f"{_k}: {_v}")
+
+                                _summary = "\n".join(_collected) if _collected else "No information collected yet."
+                                _assess_prompt = f"""You are Sage, a warm and knowledgeable physiotherapy assistant at Stance Health.
+
+Based on what the patient has shared so far, give a brief, empathetic preliminary impression (3-5 sentences).
+Be honest but reassuring. Use simple language. Make clear this is preliminary — the clinical assessment
+will be done properly by the physiotherapist.
+
+Do NOT suggest a definitive diagnosis. Do say something like "Based on what you've described..."
+and end with "Your physiotherapist will do a full assessment to confirm this."
+
+Information collected:
+{_summary}
+
+Patient just asked: "{text_input}"
+
+Your response:"""
+                                _assess_ans = await asyncio.to_thread(health_agent.llm_complete, _assess_prompt)
+                                _assess_ans = (_assess_ans or "").strip()
+                                if _assess_ans:
+                                    print(f"[assessment] Provided preliminary clinical impression")
+                                    for _word in (_assess_ans + " ").split(" "):
+                                        if _word:
+                                            await websocket.send_text(json.dumps({"type": "token", "content": _word + " "}))
+                                    await send_text_message(
+                                        websocket, client_state, _assess_ans,
+                                        build_interview_state(client_state),
+                                        user_response=text_input,
+                                    )
+                                    continue
+                            except Exception as _ae:
+                                print(f"[assessment] Error: {_ae} — falling through to graph")
+
+                        if _is_brand or _is_edu:
+                            try:
+                                from src.graph.nodes.extract import _answer_brand_question, _answer_medical_question
+
+                                if _is_brand:
+                                    # Query brandbook ChromaDB (stance_brand_collection)
+                                    _ans = await asyncio.to_thread(
+                                        _answer_brand_question, text_input, health_agent.llm_complete
+                                    )
+                                else:
+                                    # Query Snell's anatomy ChromaDB (single_book_collection)
+                                    _ans = await asyncio.to_thread(
+                                        _answer_medical_question, text_input, health_agent.llm_complete
+                                    )
+
+                                if not _ans:
+                                    # Pure LLM fallback if RAG returns nothing useful
+                                    _fb_type = "brand" if _is_brand else "medical education"
+                                    _edu_prompt = f"""You are Sage, a warm and knowledgeable assistant for Stance Health.
+
+Stance Health is India's first technology-enabled MSK (musculoskeletal) health platform,
+specialising in physiotherapy, sports rehabilitation, posture correction, and pain management.
+"Stance" and "Stance Health" always refer to this clinic.
+
+A patient asked: "{text_input}"
+
+{"IMPORTANT: Do NOT invent specific facts (number of centers, prices, addresses). If unsure, say to visit stancehealth.com." if _is_brand else "Answer with accurate, helpful medical information."}
+
+Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's continue with your assessment' — just answer naturally."""
+                                    _ans = await asyncio.to_thread(health_agent.llm_complete, _edu_prompt)
+                                    _ans = _ans.strip() if _ans else ""
+
+                                if _ans:
+                                    print(f"[off_topic] Answered educational/brand question")
+                                    for _word in (_ans + " ").split(" "):
+                                        if _word:
+                                            await websocket.send_text(json.dumps({"type": "token", "content": _word + " "}))
+                                    await send_text_message(
+                                        websocket, client_state, _ans,
+                                        build_interview_state(client_state),
+                                        user_response=text_input,
+                                    )
+                                    continue
+                            except Exception as _bre:
+                                print(f"[off_topic] Error: {_bre} — falling through to graph")
+
+                        if _session_processing:
+                            await websocket.send_text(json.dumps({"type": "error", "text": "Please wait for the previous response."}))
+                            continue
+                        _session_processing = True
                         try:
                             # ── LANGGRAPH PATH ─────────────────────────────────
                             if _interview_graph is not None and client_state.get("graph_phase") is not None:
                                 print(f"[graph] Processing turn — phase: {client_state.get('graph_phase')}")
+
+                                # Send thought stages so the frontend shows the AgentThoughtStream card
+                                _current_sec = client_state.get("graph_current_section", "")
+                                await websocket.send_text(json.dumps({
+                                    "type": "thought_update",
+                                    "thoughts": [
+                                        {"stage": "Reading your response", "detail": f"Processing: {text_input[:40]}...", "status": "active"},
+                                        {"stage": "Extracting medical details", "detail": _current_sec or "Present Complaint", "status": "pending"},
+                                        {"stage": "Formulating next question", "detail": "", "status": "pending"},
+                                    ]
+                                }))
+
                                 client_state["_fetch_form_fn"] = fetch_form_by_id
                                 graph_state = build_graph_state(client_state, text_input, _save_for_graph)
 
@@ -2662,35 +2916,46 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 health_agent._langfuse_user_id = client_state.get("user_id", "")
                                 health_agent._langfuse_session_id = client_state.get("session_id", "")
 
-                                # ── Stream graph with per-node thought updates ──
+                                # ── Run graph + send thought updates around it ──
+                                # Stream via astream(stream_mode=["messages","values"], version="v2").
+                                # "messages" yields LLM tokens as they arrive → frontend shows
+                                # words appearing instantly instead of waiting for full response.
+                                # "values" gives us the final accumulated state.
                                 result_state = None
-                                completed_nodes: list[str] = []
+                                streamed_tokens = []
                                 try:
-                                    async for chunk in _interview_graph.astream(graph_state):
-                                        for node_name, node_state in chunk.items():
-                                            if node_name == "__end__":
-                                                result_state = node_state
-                                                break
-                                            if node_name in NODE_THOUGHTS:
-                                                completed_nodes.append(node_name)
-                                                await _send_thought_update(
-                                                    websocket, completed_nodes, active_node=node_name
-                                                )
+                                    async for chunk in _interview_graph.astream(
+                                        graph_state,
+                                        stream_mode=["messages", "values"],
+                                        version="v2",
+                                    ):
+                                        if chunk["type"] == "messages":
+                                            msg_chunk, meta = chunk["data"]
+                                            token = getattr(msg_chunk, "content", "") or ""
+                                            # Only stream tokens from response-generating nodes
+                                            node = meta.get("langgraph_node", "")
+                                            if token and node in ("generate_question", "generate_summary",
+                                                                   "handle_summary_response", "apply_correction",
+                                                                   "handle_upload_response"):
+                                                streamed_tokens.append(token)
+                                                await websocket.send_text(json.dumps({
+                                                    "type": "token",
+                                                    "content": token,
+                                                }))
+                                        elif chunk["type"] == "values":
+                                            result_state = chunk["data"]  # accumulate final state
                                 except Exception as _stream_err:
-                                    print(f"[graph] astream error (falling back to final state): {_stream_err}")
-                                    import traceback
-                                    traceback.print_exc()
-                                    # If astream failed entirely, fall back to invoke
-                                    if result_state is None:
-                                        result_state = await asyncio.get_event_loop().run_in_executor(
-                                            None, _interview_graph.invoke, graph_state
-                                        )
+                                    print(f"[graph] astream error: {_stream_err} — falling back to invoke")
+                                    result_state = await asyncio.get_event_loop().run_in_executor(
+                                        None, _interview_graph.invoke, graph_state
+                                    )
 
                                 if _lf_ctx:
                                     try:
                                         _lf_ctx.__exit__(None, None, None)
                                     except Exception:
                                         pass
+
                                 sync_client_state_from_graph(client_state, result_state)
 
                                 # NOTE: We do NOT sync health_agent.form here.
@@ -2698,8 +2963,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 # concurrent WebSocket handlers causes cross-user data mixing.
                                 # All per-user state lives in client_state["graph_form"] instead.
 
-                                response_text = result_state.get("response_text", "")
-                                print(f"[graph] Turn complete — phase: {result_state['phase']}, response: {response_text[:80]}...")
+                                response_text = result_state.get("response_text", "") if result_state else "".join(streamed_tokens)
+                                _log.info("graph_turn_complete", phase=result_state['phase'], response_preview=response_text[:80])
 
                                 # Opt 3: use cached form for progress — no blocking DB fetch per turn
                                 _cached_form = result_state.get("form", {})
@@ -2824,6 +3089,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     pass  # socket already closed
                             else:
                                 print(f"[text_input] Client disconnected during processing (code 1001) — skipping error send")
+                        finally:
+                            _session_processing = False
 
                     elif msg_type == "audio_end":
                         # Client has finished sending audio
@@ -2931,8 +3198,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 np_audio,
                                 language="en",
                                 temperature=0,
-                                beam_size=1,
+                                beam_size=5,
                                 vad_filter=True,
+                                vad_parameters=dict(min_silence_duration_ms=500),
+                                condition_on_previous_text=False,
+                                no_speech_threshold=0.6,
+                                compression_ratio_threshold=2.4,
+                                log_prob_threshold=-1.0,
                             )
                             transcription = "".join(s.text for s in segments).strip()
                             t_whisper_ms = (time.perf_counter() - t_whisper_start) * 1000
@@ -2941,8 +3213,32 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             print(
                                 f"[audio] whisper {t_whisper_ms:.0f}ms "
-                                f"(rtf={rtf:.2f}x) → {transcription!r}"
+                                f"(rtf={rtf:.2f}x) → {transcription[:80]!r}"
                             )
+
+                            # ── Whisper hallucination detection ──────────────────────────────
+                            # Whisper often produces repetitive garbage on silence/noise.
+                            # Detect by measuring word-level uniqueness ratio.
+                            def _is_hallucination(text: str) -> bool:
+                                words = text.lower().split()
+                                if len(words) < 15:
+                                    return False
+                                unique_ratio = len(set(words)) / len(words)
+                                if unique_ratio < 0.12:  # < 12% unique words
+                                    return True
+                                # Check if a 4-word phrase repeats 5+ times
+                                phrase = " ".join(words[:4])
+                                if text.lower().count(phrase) >= 5:
+                                    return True
+                                return False
+
+                            if _is_hallucination(transcription):
+                                print(f"[audio] Whisper hallucination detected — discarding transcription")
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "text": "Audio unclear — please try speaking again.",
+                                }))
+                                continue
 
                             # Send transcription immediately to frontend for real-time display
                             await websocket.send_text(
@@ -3014,6 +3310,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
+        WS_CONNECTIONS.dec()
+        _active_ws_connections.discard(websocket)
+        _log.info("ws_disconnected", client_id=client_id)
         print("Client disconnected")
         # Close database connection
         # MongoDB DISABLED - Commented out
@@ -3123,6 +3422,84 @@ async def get_users(
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch users: {str(e)}"
         )
+
+
+@app.get("/api/users/{user_id}/consent")
+async def get_consent_status(user_id: str):
+    """
+    Check whether a user has accepted the consent policy.
+    Checks two sources:
+    1. users.profileData.consentAccepted (set by our API or legacy)
+    2. consentrecords collection (written by consent.stance.health via recordConsent GraphQL mutation)
+    """
+    try:
+        from app.config import MONGO_DB_NAME
+        users_col = ensure_users_collection()
+        user_oid = ObjectId(user_id)
+
+        # Source 1: users.profileData.consentAccepted
+        user = users_col.find_one(
+            {"_id": user_oid},
+            {"profileData.consentAccepted": 1, "profileData.consentAcceptedAt": 1}
+        )
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        profile = user.get("profileData", {})
+        if profile.get("consentAccepted"):
+            return {
+                "consentAccepted": True,
+                "source": "profileData",
+                "consentAcceptedAt": str(profile.get("consentAcceptedAt", "")),
+            }
+
+        # Source 2: consentrecords collection (created by consent.stance.health)
+        try:
+            db = users_col.database
+            consent_col = db["consentrecords"]
+            record = consent_col.find_one(
+                {"userId": user_oid, "isActive": True},
+                {"acceptedAt": 1}
+            )
+            if record:
+                return {
+                    "consentAccepted": True,
+                    "source": "consentrecords",
+                    "consentAcceptedAt": str(record.get("acceptedAt", "")),
+                }
+        except Exception as ce:
+            print(f"[consent] consentrecords check failed (non-fatal): {ce}")
+
+        return {"consentAccepted": False}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to check consent: {str(e)}")
+
+
+@app.post("/api/users/{user_id}/consent")
+async def accept_consent(user_id: str):
+    """Record that a user has accepted the consent policy."""
+    try:
+        from datetime import datetime, timezone
+        collection = ensure_users_collection()
+        user_oid = ObjectId(user_id)
+        result = collection.update_one(
+            {"_id": user_oid},
+            {"$set": {
+                "profileData.consentAccepted": True,
+                "profileData.consentAcceptedAt": datetime.now(timezone.utc),
+                "profileData.consentPolicyVersion": "1.1.0",
+            }}
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"success": True, "consentAccepted": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to record consent: {str(e)}")
 
 
 @app.get("/api/users/{user_id}/forms")

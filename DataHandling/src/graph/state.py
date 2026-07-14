@@ -35,6 +35,8 @@ class InterviewState(TypedDict):
     reports_uploaded: bool
     awaiting_report_upload: bool
     attempts_on_current_section: int
+    referral_asked: bool           # True once the referral/Source question has been asked
+    visit_context: str             # "specific_complaint" | "general_assessment" | "unknown"
 
     # ── Conversation history ────────────────────────────────────
     history: list                # [{"role": "agent"|"user", "message": "..."}]
@@ -74,6 +76,8 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         reports_uploaded=False,
         awaiting_report_upload=False,
         attempts_on_current_section=0,
+        referral_asked=False,
+        visit_context="unknown",
         history=[{"role": "agent", "message": WELCOME_PROMPT}],
         missing_fields=[],
         summary_intent=None,

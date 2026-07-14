@@ -35,6 +35,13 @@ Write the summary as if you are explaining it to the patient in simple, everyday
 7. End with exactly: "Is this information correct, or would you like to make any changes?"
 8. NEVER say "The form is complete" or any variation.
 
+CRITICAL — handle empty/negative field values honestly:
+- Fields with values like "None", "No specific goals", "Not mentioned", "Not applicable", "No past surgeries", "No goals mentioned", "nothing" → summarize as ABSENCE, not presence.
+  e.g. "You haven't mentioned any specific treatment goals" NOT "you have clear goals"
+  e.g. "No past surgeries or health conditions were mentioned" NOT "your health history is clear"
+- NEVER infer positive attributes from empty or negative field values.
+- Only state something as a fact if the form field contains a real positive value.
+
 Return ONLY the summary text."""
 
     try:
@@ -73,29 +80,32 @@ def classify_summary_response(
     Returns dict with keys: intent, correction_text, has_reports, wants_upload.
     """
     prompt = f"""You are assisting with a medical intake interview. The patient has just been shown
-this summary:
+a summary and asked: "Is this information correct, or would you like to make any changes?"
 
-SUMMARY:
-{summary_text}
+The patient responded: "{user_input}"
 
-The patient responded:
-"{user_input}"
+Classify their intent. Choose EXACTLY ONE intent from below:
 
-Classify their intent and respond ONLY with compact JSON:
+- "confirm": patient says YES — the summary is correct (e.g. "yes", "correct", "looks good", "that's right", "ok", "sure", "yep")
+- "new_complaint": patient reveals a NEW specific health issue, pain, or symptom that was NOT in the summary
+  Use when: patient says "i have neck pain", "actually my knee hurts", "i forgot to mention my back", "i have a complaint", "wait i have pain" etc.
+  This means they want to ADD new medical information, not correct existing data.
+- "request_change": patient wants to CORRECT or UPDATE something already stated in the summary
+  CRITICAL: "no" in response to "Is this correct?" → request_change (no, it is NOT correct)
+  Also: "not right", "wrong", "incorrect", "change X to Y", "actually it was X"
+- "has_reports": patient mentions having diagnostic reports (MRI, X-ray, scans)
+- "no_reports": patient confirms they do NOT have reports
+- "question": patient is asking a question about the process
+
+Priority: if the patient mentions a body part or symptom (pain, neck, back, knee, shoulder, etc.) → "new_complaint" over "request_change".
+
+Respond ONLY with compact JSON:
 {{
-  "intent": "confirm" | "request_change" | "has_reports" | "no_reports" | "question",
+  "intent": "confirm" | "new_complaint" | "request_change" | "has_reports" | "no_reports" | "question",
   "correction_text": string | null,
   "has_reports": true | false | null,
   "wants_upload": true | false | null
-}}
-
-Rules:
-- "confirm": summary is correct, no changes wanted.
-- "request_change": wants to change/update/correct something.
-- "has_reports": indicates they HAVE diagnostic reports.
-- "no_reports": indicates they do NOT have diagnostic reports.
-- "question": asking about the process.
-"""
+}}"""
     try:
         raw = llm_complete(prompt)
         json_str = extract_json_from_response(raw)
@@ -104,7 +114,7 @@ Rules:
         data = json.loads(json_str)
         if not isinstance(data, dict):
             return {}
-        valid_intents = {"confirm", "request_change", "has_reports", "no_reports", "question"}
+        valid_intents = {"confirm", "new_complaint", "request_change", "has_reports", "no_reports", "question"}
         if data.get("intent") not in valid_intents:
             return {}
         return {
@@ -148,9 +158,12 @@ def classify_reports_intent(
     )
 
     # Fast definite-negative check: if the user clearly has no reports, skip the LLM call
+    # Use more specific phrases to avoid false positives like "we don't have to worry about it"
     no_reports_indicators = [
         "no reports", "no mri", "no x-ray", "no ct", "no scans", "no scan",
-        "don't have", "dont have", "do not have", "i don't have any",
+        "don't have any reports", "dont have any reports", "i don't have reports",
+        "i dont have reports", "do not have any reports",
+        "i don't have any", "i dont have any",
         "nothing", "none", "nope", "no i don't", "no i dont",
     ]
     explicitly_no = any(ind in lowered for ind in no_reports_indicators)

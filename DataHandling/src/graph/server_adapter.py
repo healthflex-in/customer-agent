@@ -83,6 +83,20 @@ def build_graph_state(
     history = client_state.get("graph_history") or fresh["history"]
     form_sections = client_state.get("graph_form_sections") or fresh["form_sections"]
 
+    # Check if REST upload already saved attachments → mark as uploaded so graph
+    # doesn't keep prompting for uploads. Must be computed before InterviewState().
+    _reports_uploaded = client_state.get("graph_reports_uploaded", False)
+    if not _reports_uploaded and client_state.get("graph_awaiting_report_upload", False):
+        try:
+            _fetch = client_state.get("_fetch_form_fn")
+            if _fetch:
+                _doc = _fetch(client_state.get("form_id", ""), client_state.get("user_id", ""))
+                if _doc and _doc.get("attachments"):
+                    _reports_uploaded = True
+                    client_state["graph_reports_uploaded"] = True
+        except Exception:
+            pass
+
     return InterviewState(
         # Identity
         user_id=user_id,
@@ -98,26 +112,13 @@ def build_graph_state(
         form_sections=form_sections,
         # Phase
         phase=phase,
-        # Conversation flags — these are not persisted in client_state;
-        # the graph nodes own them within a single turn.
+        # Conversation flags
         asked_previous_consultations=client_state.get("graph_asked_previous_consultations", False),
-        # If the REST upload endpoint already saved attachments, mark as uploaded
-        # so the WebSocket graph path doesn't keep asking for uploads.
-        _reports_uploaded = client_state.get("graph_reports_uploaded", False)
-        if not _reports_uploaded and client_state.get("graph_awaiting_report_upload", False):
-            # Check if attachments now exist in MongoDB (uploaded via REST)
-            try:
-                _fetch = client_state.get("_fetch_form_fn")
-                if _fetch:
-                    _doc = _fetch(client_state.get("form_id", ""), client_state.get("user_id", ""))
-                    if _doc and _doc.get("attachments"):
-                        _reports_uploaded = True
-                        client_state["graph_reports_uploaded"] = True
-            except Exception:
-                pass
         reports_uploaded=_reports_uploaded,
         awaiting_report_upload=client_state.get("graph_awaiting_report_upload", False),
         attempts_on_current_section=client_state.get("graph_attempts_on_current_section", 0),
+        referral_asked=client_state.get("graph_referral_asked", False),
+        visit_context=client_state.get("graph_visit_context", "unknown"),
         # History
         history=history,
         # Intra-turn scratch fields — always reset at the start of each turn
@@ -172,6 +173,10 @@ def sync_client_state_from_graph(
     client_state["graph_attempts_on_current_section"] = result_state.get(
         "attempts_on_current_section", 0
     )
+    client_state["graph_referral_asked"] = result_state.get("referral_asked", False)
+    visit_context = result_state.get("visit_context", "unknown")
+    if visit_context and visit_context != "unknown":
+        client_state["graph_visit_context"] = visit_context
 
 
 # ---------------------------------------------------------------------------
@@ -335,3 +340,5 @@ def init_graph_state_in_client(
     client_state["graph_reports_uploaded"] = False
     client_state["graph_awaiting_report_upload"] = False
     client_state["graph_attempts_on_current_section"] = 0
+    client_state["graph_referral_asked"] = False
+    client_state["graph_visit_context"] = "unknown"

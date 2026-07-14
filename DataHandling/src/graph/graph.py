@@ -48,20 +48,29 @@ from src.graph.edges import (
 )
 
 
-def build_interview_graph(llm_complete, system_prompt, predefined_questions, save_customer_info_fn=None):
+def create_checkpointer():
+    """
+    No checkpointer — MongoDB Atlas is the persistent source of truth.
+    MemorySaver requires thread_id on every graph call and provides no benefit
+    since full state is passed explicitly on each turn via graph_state.
+    """
+    return None
+
+
+def build_interview_graph(llm_complete, system_prompt, predefined_questions, save_customer_info_fn=None, checkpointer=None, reasoning_llm=None):
     """
     Build and compile the LangGraph StateGraph for the medical interview.
 
-    save_customer_info_fn is accepted for API compatibility but is no longer
-    used inside the graph — DB persistence is handled as a background task
-    in server.py after the graph returns.
+    checkpointer: optional LangGraph checkpointer (Postgres or in-memory).
+    When provided, full graph state is persisted per thread_id — interviews
+    survive server restarts and can resume from the last completed node.
     """
     graph = StateGraph(InterviewState)
 
     # ── Register nodes ────────────────────────────────────────────────────────
-    graph.add_node("handle_first_turn", make_handle_first_turn_node(predefined_questions, WELCOME_PROMPT))
+    graph.add_node("handle_first_turn", make_handle_first_turn_node(llm_complete, predefined_questions, WELCOME_PROMPT, reasoning_llm=reasoning_llm))
     # Combined node: extraction + gap-fill + intent classification (concurrent)
-    graph.add_node("extract_form_data", make_extract_form_data_node(llm_complete))
+    graph.add_node("extract_form_data", make_extract_form_data_node(llm_complete, reasoning_llm=reasoning_llm))
     # classify_intent is now a no-op stub (logic merged into extract_form_data)
     graph.add_node("classify_intent", make_classify_intent_node(llm_complete))
     graph.add_node("validate_section", make_validate_section_node())
@@ -159,4 +168,7 @@ def build_interview_graph(llm_complete, system_prompt, predefined_questions, sav
         },
     )
 
-    return graph.compile()
+    # Compile with optional checkpointer for durable session state.
+    # With a checkpointer each turn is checkpointed after every node —
+    # interviews survive restarts and can resume mid-question.
+    return graph.compile(checkpointer=checkpointer)

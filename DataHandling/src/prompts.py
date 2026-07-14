@@ -5,6 +5,87 @@ I'll need about 5 minutes to understand your clinical history so I can share it 
 Please note that this information is critical to proceed with your session.
 """
 
+# ──────────────────────────────────────────────────────────────
+# FIRST-TURN CONDUCTOR — LLM reads opening message, thinks, responds
+# ──────────────────────────────────────────────────────────────
+FIRST_TURN_CONDUCTOR_PROMPT = """You are Sage, a medical intake assistant at Stance Health. A patient just sent their first message.
+
+Patient's message: "{user_input}"
+
+Read the message carefully, like an experienced clinician would. Understand what the patient communicated — including imperfect speech, voice-to-text errors, and informal language. Then:
+
+1. Classify their visit
+2. Ask ONLY for what is genuinely not yet covered in their message
+
+Classify as:
+- specific_complaint — specific pain, injury, or symptom described
+- general_assessment — wellness check, general curiosity, no specific complaint
+- clinic_inquiry — asking about Stance Health services/location/booking
+- unknown — unclear
+
+Generate ONE focused question for what's genuinely missing:
+- If they gave comprehensive info → ask about the 1-3 things not yet mentioned
+- If they gave minimal info → ask 2-4 grouped intake questions (location, severity, duration, onset, aggravating, relieving, consultations, health/lifestyle, goals, referral)
+- Group related items together, max 4 bullets
+
+HARD RULES:
+- QUESTION only — no marketing paragraphs, no promotional language whatsoever
+- NEVER re-ask something they already mentioned
+- SHORT and SPECIFIC
+
+Reply in EXACTLY this format (3 lines):
+THINKING: [what's covered vs genuinely missing]
+VISIT_CONTEXT: specific_complaint|general_assessment|clinic_inquiry|unknown
+QUESTION: [focused intake question — no preamble, just the question]"""
+
+# ──────────────────────────────────────────────────────────────
+# INTELLIGENT QUESTION CONDUCTOR — LLM sees full context, decides next question
+# ──────────────────────────────────────────────────────────────
+INTELLIGENT_QUESTION_PROMPT = """You are Sage, a medical intake assistant at Stance Health. You are mid-interview with a patient.
+
+## Visit type
+{visit_context_description}
+
+## Full conversation so far
+{history_text}
+
+## Your task
+Read the ENTIRE conversation above. Determine what the patient has already communicated — and ask ONLY about what is genuinely not yet addressed.
+
+**What to collect for a specific_complaint visit:**
+- Exact complaint + body location
+- Severity (0–10)
+- Duration (how long it's been happening)
+- Onset (sudden or gradual)
+- What makes it worse
+- What gives relief
+- Previous doctor/physio consultations
+- Health conditions, past surgeries
+- Lifestyle (job, smoking/drinking, exercise)
+- Diagnostic reports (MRI, X-ray, scans)
+- Treatment goals
+- How they found Stance Health (referral source)
+
+**What to collect for a general_assessment visit:**
+- General health conditions, past surgeries
+- Lifestyle (job, habits, activity level)
+- Treatment/wellness goals
+- Referral source
+(Skip: specific pain details, injury mechanism, previous complaint-specific treatment)
+
+**Rules:**
+- Read like a clinician: understand what the patient MEANT, not just literal words
+- Voice-to-text errors are normal — infer meaning from context
+- If the patient addressed a topic in ANY way (even informally, with negation, or imperfectly), it is COVERED — do NOT ask again
+- Group related missing items into max 4–5 bullets, never ask one field per bullet
+- NEVER ask about something the patient already told you
+- NEVER output marketing language or statements without a question
+- If everything is covered → respond with exactly DONE
+
+Reply in EXACTLY this format:
+THINKING: [what's covered vs genuinely missing, read from the conversation]
+QUESTION: [max 4-5 grouped bullets for what's genuinely missing, or DONE]"""
+
 READY_TO_START_PROMPT = """
 Are you ready to get started now?
 If not, you can exit for now, but please come back and complete this before your session.
@@ -51,6 +132,17 @@ Extract the information from the user's response and structure it according to t
 Example output format:
 {}
 """
+
+# ──────────────────────────────────────────────────────────────
+# GENERAL VISIT — no specific complaint, skip pain/complaint questions
+# ──────────────────────────────────────────────────────────────
+GENERAL_VISIT_Q1 = (
+    "Welcome! Happy to learn more about you so we can make the most of your visit.\n\n"
+    "• Do you have any existing health conditions (e.g. diabetes, BP, thyroid) or past surgeries/fractures?\n"
+    "• What's your lifestyle like — do you exercise regularly or have a physically active job? Do you smoke or drink?\n"
+    "• What are you hoping to get out of your visit today — any wellness goals, posture concerns, or things you'd like to explore?\n"
+    "• How did you come to know about Stance Health? (Friend/family, Google, Instagram, etc.)"
+)
 
 # ──────────────────────────────────────────────────────────────
 # HIGH-YIELD 3 QUESTIONS → FILLS 95%+ OF FORM ACCURATELY
@@ -139,21 +231,106 @@ _MEDICAL_FORM_TEMPLATE_BASE = {
 MEDICAL_FORM_TEMPLATE = _MEDICAL_FORM_TEMPLATE_BASE
 
 # ──────────────────────────────────────────────────────────────
-# ENHANCED EXTRACTION PROMPTS (critical for accuracy with speech-to-text)
+# REASONING EXTRACTOR — replaces FORMAT_PROMPT multi-pass stack
+# Uses gemini-2.5-flash to reason through the full conversation
+# and fill the form with genuine understanding, not keyword matching
+# ──────────────────────────────────────────────────────────────
+REASONING_EXTRACTOR_PROMPT = """You are an intelligent medical intake analyst for Stance Health, India's first technology-enabled MSK health platform.
+
+Read the entire conversation below and fill the patient intake form by REASONING through what was said — not by keyword matching.
+
+## Full Conversation
+{conversation}
+
+## Current Form (partially filled)
+{current_form}
+
+## Instructions
+
+**Step 1 — Understand the patient's intent and visit type**
+Ask yourself: Why is this patient here?
+- Do they have a specific pain, injury, or condition? → specific_complaint
+- Are they here for a general check-up, wellness, or just exploring? → general_assessment
+- Are they asking about the clinic? → clinic_inquiry
+This shapes everything below.
+
+**Step 2 — Reason through each form section**
+
+Present Complaint:
+- Did they describe a specific pain/symptom? Extract: what, where, severity (0–10), how long, how it started, what causes it
+- Did they say "no issues", "no pain", "just a check-up", "general visit"? → Primary Complaint = "General visit — no specific complaint"
+- For general_assessment: fill ALL Present Complaint fields as "Not applicable — general visit"
+
+Previous Consultations:
+- Did they mention seeing a doctor, physiotherapist, or hospital for this? → fill with what they said
+- Did they say "haven't spoken to a doctor", "no hospital visits", "not consulted anyone"? → "None — no previous consultations"
+
+Pain Assessment:
+- Location, severity, aggravating factors, relieving factors
+- For general_assessment or no-pain visits: fill as "Not applicable — no pain reported"
+- "ice pack helps" → Relieving Factors = "Ice pack application"
+
+History & Diagnostics:
+- Any ongoing illnesses (diabetes, BP, thyroid, heart issues)? Any past surgeries or fractures?
+- "no issues", "I'm healthy", "no conditions" → Systemic Illness = "No known systemic illness or health conditions"
+- Lifestyle: exercise habits, job type, smoking/drinking
+- Reports: MRI, X-ray, CT scan, blood tests. "No MRI, no X-rays" → Reports = "None"
+
+Treatment Goals:
+- Short-term (3 months) and long-term goals
+- "understand my body", "figure out what's happening", "get back to playing" → infer appropriate goals
+- "don't think I'll need treatment", "no future goals" → "No specific treatment goals"
+- Genuinely not mentioned → leave empty
+
+Referral:
+- ONLY fill if they mentioned HOW they found the clinic: friend, Google, Instagram, Facebook, YouTube, doctor referral
+- "my friend told me" → Source = "Friend/word of mouth"
+- DO NOT store symptom answers, pain descriptions, or anything medical as Source
+
+**Step 3 — Rules**
+- Store NEGATIVE answers: "no pain" → mark pain fields as "No pain reported" or "Not applicable"
+- Use clinical intelligence, not literal matching: patients speak conversationally and voice-to-text introduces errors. Understand what the patient MEANT from context — the same way an experienced clinician reading the transcript would. Fill fields based on meaning, not exact wording.
+- Interpret goals, desires, and aspirations broadly: anything the patient wants to achieve, feel, or be able to do is a treatment goal.
+- For general_assessment visits, pre-fill complaint and pain sections with "Not applicable — general visit"
+- Leave truly unknown fields as empty string ""
+- Return ONLY valid JSON matching the exact structure below. No explanation, no markdown.
+
+Fill this structure:
+{form_structure}"""
+
+# ──────────────────────────────────────────────────────────────
+# ENHANCED EXTRACTION PROMPTS (kept for fallback)
 # ──────────────────────────────────────────────────────────────
 FORMAT_PROMPT = """
 You are an expert medical data extractor. Extract EVERY piece of information the patient said into the exact JSON structure below.
 
 CRITICAL RULES:
-- Be extremely forgiving with transcription errors:
-   → "cost" → "cause", "ligament" → "ligament", "back pain" → "backbone", "eight" or "ate" → "8", "ten" → "10"
+- ALWAYS correct spelling mistakes before storing — store the clean, correct English version:
+   → "stright" → "straight", "recieve" → "receive", "swollén" → "swollen"
+   → "brusing" → "bruising", "ligment" → "ligament", "phisio" → "physio"
+   → "fourty" → "forty", "yrs" → "years", "mins" → "minutes"
+   → Any obvious typo or phonetic spelling → correct it silently
+- Be extremely forgiving with transcription/speech errors:
+   → "cost" → "cause", "eight" or "ate" → "8", "ten" → "10"
    → "since two months", "for 3 weeks", "last year" → extract duration
    → "after fall", "twisted ankle", "lifting weight" → Mechanism of Injury or Cause
    → Any number said near "pain" or "hurts" → assume it's pain scale (0–10)
+   → "stright" or "striaght" → "straight"
+- Store CLEAN, READABLE text — not raw misspelled patient input
 - If patient mentions MRI, X-ray, scan, report even once → put in "Reports"
 - Never leave a field blank if any clue exists — use clinical judgment
 - Combine all answers from the entire conversation
 - Most recent or most specific answer overrides earlier ones
+
+CRITICAL — NEGATIVE / DENIAL ANSWERS must be stored, not ignored:
+- "i dont have any past surgeries" → "Systemic Illness and Surgical History": "No past surgeries"
+- "no fractures" → "Systemic Illness and Surgical History": "No fractures"
+- "i dont smoke or drink" / "no smoking, no alcohol" → "Current Lifestyle": "Non-smoker, does not drink"
+- "i dont exercise" / "i dont do any exercise" → "Current Lifestyle": (add to existing or set) "No regular exercise"
+- "no health conditions" / "i am healthy" → "Systemic Illness and Surgical History": "No known systemic illness"
+- "no reports" / "i dont have any scans" → "Reports": "None"
+- "no goals" / "nothing" (in response to a goals question) → fill the goals field with "No specific goals mentioned"
+- Any clear denial or negation about a topic → store the negation as the field value, NEVER leave it blank
 
 CRITICAL: "Previous Consultations" section:
 - ONLY fill "Previous Consultations" fields if the patient EXPLICITLY mentions:

@@ -46,18 +46,25 @@ def load_gemini_key(key_path=enums_obj.config_key_path):
 
 
 def init_llm(api_key):
-    """
-    Initialize the LLM via the new google_genai wrapper.
-
-    Strips the legacy "models/" prefix from the model name if present —
-    the new SDK accepts plain names like "gemini-2.0-flash".
-    """
+    """Initialize the main LLM (flash-lite) for conversation flow."""
     model_name = enums_obj.gemini_model_name
     if model_name.startswith("models/"):
         model_name = model_name[len("models/"):]
     llm = GoogleGenAI(model=model_name, api_key=api_key)
     Settings.llm = llm
     return llm
+
+
+def init_reasoning_llm(api_key):
+    """
+    Initialize the reasoning-grade LLM (gemini-2.5-flash) used exclusively for
+    form extraction. Flash understands context, intent, and implicit answers far
+    better than flash-lite — critical for accurate form filling from natural speech.
+    """
+    model_name = enums_obj.reasoning_model_name
+    if model_name.startswith("models/"):
+        model_name = model_name[len("models/"):]
+    return GoogleGenAI(model=model_name, api_key=api_key)
 
 
 def final_form_filling(llm, prompt, history, form):

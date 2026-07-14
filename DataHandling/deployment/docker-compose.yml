@@ -12,43 +12,31 @@ services:
     env_file:
       - ./DataHandling/.env
     environment:
-      # Google Cloud Credentials paths (not in .env)
       - GOOGLE_APPLICATION_CREDENTIALS=config/google_key.json
       - GEMINI_LLM_SERVICE_CREDENTIALS=config/gemini_key.json
-
-      # Database paths
       - CHROMA_DB_PATH=/app/db/vector/chroma_db_collective
       - PYTHONPATH=/app
-
-      # Langfuse LLM observability (set these to enable tracing)
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
-      - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
-    
+      - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-https://us.cloud.langfuse.com}
     volumes:
-      # Mount code directory for instant updates (no rebuild needed for code changes)
-      # This allows update-fast.sh to work without rebuilding the image
       - ./DataHandling:/app:rw
-      
-      # Persist audio files, transcripts, and cache
       - ./DataHandling/audio_files:/app/audio_files
       - ./DataHandling/transcripts:/app/transcripts
       - ./DataHandling/tts_cache:/app/tts_cache
       - ./DataHandling/output:/app/output
       - ./DataHandling/received_audio:/app/received_audio
-      
-      # Persist vector database
       - ./DataHandling/db:/app/db
-      
-      # Mount config files (Google credentials) - read only
       - ./DataHandling/config:/app/config:ro
-    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     restart: unless-stopped
-    
     networks:
       - healthflex-network
-    
-    # Resource limits (adjust based on your EC2 instance)
     deploy:
       resources:
         limits:
@@ -61,4 +49,3 @@ services:
 networks:
   healthflex-network:
     driver: bridge
-

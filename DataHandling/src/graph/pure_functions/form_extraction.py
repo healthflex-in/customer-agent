@@ -40,6 +40,7 @@ def extract_form_data_from_text(
     prompt_template: str,
     llm_complete: Callable[[str], str],
     current_section: str = "",
+    last_question: str = "",
 ) -> dict:
     """
     Parse free-text user response and return an updated form dict.
@@ -48,10 +49,17 @@ def extract_form_data_from_text(
     updated_form = copy.deepcopy(form)
     example_output = '{"Patient Information": {"Age": "35", "Gender": "male"}}'
 
-    # Slot {0} of TEMPLATE_PROMPT must contain the patient's actual words.
-    # FORMAT_PROMPT provides extraction instructions; prepend the user input so
-    # the LLM knows what text to extract from.
-    patient_input_block = f'Patient\'s response:\n"{user_input}"\n\n{prompt_template}'
+    # Include the last agent question when available — critical for short/denial
+    # responses like "nothing", "no", "none" where the LLM must know WHAT was asked
+    # to correctly fill (or negate) the relevant fields.
+    if last_question:
+        patient_input_block = (
+            f'Question that was asked:\n"{last_question}"\n\n'
+            f'Patient\'s response:\n"{user_input}"\n\n{prompt_template}'
+        )
+    else:
+        patient_input_block = f'Patient\'s response:\n"{user_input}"\n\n{prompt_template}'
+
     enhanced_prompt = TEMPLATE_PROMPT.format(
         patient_input_block, json.dumps(updated_form, indent=2), example_output
     )
@@ -90,9 +98,10 @@ def extract_form_data_from_text(
             updated_form, formatted_data, user_input
         )
         updated_form = _post_process_referral(updated_form)
-        # Direct fill for Referral when extraction LLM fails on short answers
-        if current_section == "Referral":
-            updated_form = _post_process_referral_from_input(updated_form, user_input)
+        # Always run — "How did you hear about us?" is asked in Round 0 while
+        # current_section is still on another section, so we can't gate on "Referral".
+        # The function guards itself: if Source is already filled it returns immediately.
+        updated_form = _post_process_referral_from_input(updated_form, user_input)
 
         print("Updated form sections after formatting:")
         for section, fields in updated_form.items():
@@ -117,8 +126,17 @@ def _post_process_previous_consultations(
     prev_val = pc.get(prev_field, "").strip()
     status_val = pc.get(status_field, "").strip()
 
-    # If the field is still empty and we're on the Previous Consultations section,
-    # use the LLM to determine whether the user said "no prior consultations".
+    # Also clear a falsely-extracted value: when the LLM extracts "physio" from
+    # "no i have not seen any physio", the negation is missed. Override if the
+    # extracted value is just a provider-type keyword without real content.
+    _false_positive_keywords = {"physio", "physiotherapist", "doctor", "hospital", "clinic",
+                                "orthopedic", "surgeon", "specialist", "consultant"}
+    if prev_val and prev_val.lower().strip() in _false_positive_keywords:
+        prev_val = ""
+        form["Previous Consultations"][prev_field] = ""
+
+    # If the field is empty (or was just cleared) and we're on the Previous Consultations
+    # section, use the keyword check to determine whether the user said no prior consultations.
     if not prev_val and current_section == "Previous Consultations" and llm_complete:
         if _llm_check_no_prior_consultations(user_input, llm_complete):
             form["Previous Consultations"][prev_field] = (
@@ -198,15 +216,28 @@ def _post_process_referral_from_input(form: dict, user_input: str) -> dict:
         return form  # Already filled by extraction — nothing to do
 
     user_lower = user_input.lower().strip()
-    # Known referral channels mentioned directly
-    referral_kws = ["friend", "family", "relative", "colleague", "google", "instagram",
-                    "facebook", "youtube", "social media", "online", "website",
-                    "ad", "advertisement", "referral", "twitter", "whatsapp",
-                    "doctor referred", "referred by", "word of mouth", "newspaper"]
-    # Short yes/no answers — "yes my friend", "yes google", etc.
-    if any(kw in user_lower for kw in referral_kws):
-        form["Referral"]["Source"] = user_input.strip()
-        print(f"[referral_fill] Source filled from input: '{user_input.strip()}'")
+
+    # Known referral/discovery channels — extract the CHANNEL NAME, not the raw sentence
+    channel_map = {
+        "youtube": "YouTube", "instagram": "Instagram", "facebook": "Facebook",
+        "google": "Google", "twitter": "Twitter", "whatsapp": "WhatsApp",
+        "social media": "Social media", "online": "Found online",
+        "website": "Stance Health website", "ad ": "Online ad", "advert": "Online ad",
+        "friend": "Friend/word of mouth", "family": "Family referral",
+        "relative": "Family referral", "colleague": "Colleague referral",
+        "word of mouth": "Word of mouth", "newspaper": "Newspaper",
+        "doctor referred": "Doctor referral", "referred by": "Referral",
+        "podcast": "Podcast", "blog": "Blog/article",
+    }
+    matched_channel = None
+    for kw, label in channel_map.items():
+        if kw in user_lower:
+            matched_channel = label
+            break
+
+    if matched_channel:
+        form["Referral"]["Source"] = matched_channel
+        print(f"[referral_fill] Source extracted as channel: '{matched_channel}'")
     elif user_lower not in {"no", "nope", "nah", "none", "nothing", "n/a"}:
         # Any other non-negative answer: store as-is and let validate_section decide
         form["Referral"]["Source"] = user_input.strip()

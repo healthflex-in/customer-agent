@@ -48,6 +48,9 @@ def after_handle_summary_response(state: InterviewState) -> str:
     intent = (state.get("summary_intent") or {}).get("intent")
     if intent == "confirm":
         return END
+    if intent == "new_complaint":
+        # Patient revealed new health info — reopen interview, ask follow-ups
+        return "generate_question"
     if intent == "request_change":
         return "apply_correction"
     if intent in ("has_reports", "no_reports"):

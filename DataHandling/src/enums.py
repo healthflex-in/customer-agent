@@ -9,6 +9,9 @@ class ENUMS:
         self.root_folder = "."
         self.config_key_path = str(Path("config") / "config_key.txt")
         self.gemini_model_name = "gemini-2.5-flash-lite"
+        # Separate reasoning-grade model used only for form extraction.
+        # Flash is significantly better at understanding context and intent.
+        self.reasoning_model_name = "gemini-2.5-flash"
         self.config_key_not_found_error = "config_key.txt not found. please create this file with your gemini api key."
         self.embedding_model_name = "BAAI/bge-small-en-v1.5"
         self.chat_history_json_path = str(

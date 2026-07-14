@@ -33,7 +33,30 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
 
         patch: dict = {}
 
-        if intent == "confirm":
+        if intent == "new_complaint":
+            # Patient revealed a new specific complaint — reopen the interview,
+            # clear all "Not applicable" placeholders from complaint/pain sections,
+            # and switch to specific_complaint mode so the conductor asks follow-ups.
+            _na_values = {
+                "not applicable", "general visit — no specific complaint",
+                "not applicable — no pain reported", "not applicable — general visit",
+                "not applicable — general visit.", "none",
+            }
+            updated_form = {
+                section: dict(fields) if isinstance(fields, dict) else fields
+                for section, fields in state["form"].items()
+            }
+            for _sec in ["Present Complaint", "Pain Assessment", "Previous Consultations"]:
+                if _sec in updated_form and isinstance(updated_form[_sec], dict):
+                    for _field in list(updated_form[_sec].keys()):
+                        if str(updated_form[_sec].get(_field, "")).strip().lower() in _na_values:
+                            updated_form[_sec][_field] = ""
+            patch["form"] = updated_form
+            patch["phase"] = "interviewing"
+            patch["visit_context"] = "specific_complaint"
+            # response_text left empty — generate_question will ask about the complaint
+
+        elif intent == "confirm":
             response_text = (
                 "Thank you for confirming. Your medical information has been recorded. "
                 "You can now close this page. Our team will review your information and get back to you soon."
