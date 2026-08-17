@@ -445,7 +445,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncio
 import numpy as np
-from faster_whisper import WhisperModel  # ~4x faster than openai-whisper on CPU
+# faster_whisper removed — STT now uses Google Cloud Speech-to-Text (see app/audio/stt.py)
 import wave
 import time
 import os
@@ -459,7 +459,7 @@ import uuid
 from dotenv import load_dotenv
 load_dotenv()
 # Legacy imports (kept for compatibility even if audio streaming disabled)
-import gtts  # Google Text-to-Speech
+# import gtts  # Google Text-to-Speech — not in docker requirements, not used in active path
 from pydub import AudioSegment  # For audio conversion
 from pymongo import MongoClient
 from pymongo.collection import Collection
@@ -733,18 +733,7 @@ app.add_middleware(
 # writes are no longer performed; see PUBLIC_API.md §5).
 os.makedirs(TTS_CACHE_DIR, exist_ok=True)
 
-# Load Whisper model (via faster-whisper / CTranslate2).
-# compute_type=int8 quantizes weights to int8 on CPU — ~2-4x faster than fp32
-# with negligible accuracy impact on the "base" model.
-print("Loading Whisper model (faster-whisper, base, int8)...")
-import subprocess, shutil
-cuda_device = "cuda" if shutil.which("nvidia-smi") else "cpu"
-model = WhisperModel(
-    "base",
-    device=cuda_device,
-    compute_type="int8" if cuda_device == "cpu" else "float16",
-)
-print(f"Whisper 'base' model loaded on {cuda_device}")
+# STT now uses Google Cloud Speech-to-Text — no local model to load at startup.
 
 # Initialize HealthAgent (kept for audio, summary title generation, and legacy fallback)
 print("Initializing HealthAgent...")
@@ -765,10 +754,16 @@ try:
     )
     # save_customer_info is defined later in this file; wrap in a lambda to
     # capture it lazily so the graph is built before the function is defined.
-    def _save_for_graph(user_id, form, section, form_id, chat_history=None):
+    def _save_for_graph(user_id, form, section, form_id, chat_history=None,
+                        preferred_doc_id=None):
+        # NOTE: preferred_doc_id must be passed in by the caller — this function
+        # runs at module scope (and inside background threads) where the per-
+        # connection `client_state` is NOT in scope. Referencing it here raised
+        # NameError on every call, silently dropping the FRM-01 intake save.
         return save_customer_info(user_id=user_id, form_data=form,
                                   current_section=section, form_id=form_id,
-                                  chat_history=chat_history)
+                                  chat_history=chat_history,
+                                  preferred_doc_id=preferred_doc_id)
 
     # In-memory checkpointer — MongoDB is the persistent source of truth.
     from src.graph.graph import create_checkpointer as _create_checkpointer
@@ -793,12 +788,38 @@ try:
             except Exception:
                 pass
         if _api_key:
-            _r_llm = init_reasoning_llm(_api_key)
-            def _reasoning_llm_complete(prompt: str) -> str:
-                resp = _r_llm.complete(prompt)
-                text = getattr(resp, 'text', None) or str(resp)
-                return text.strip()
-            print("[graph] Reasoning LLM (gemini-2.5-flash) initialized for form extraction")
+            # Use google.genai SDK directly so we can set thinking_budget=0.
+            # gemini-2.5-flash has thinking ON by default (dynamic budget) which
+            # adds several seconds of latency for every extraction call.
+            # thinking_budget=0 disables it, giving flash-2.0 speed with 2.5 quality.
+            try:
+                from google import genai as _genai_r
+                from google.genai import types as _genai_r_types
+                _r_client = _genai_r.Client(api_key=_api_key)
+                from src.enums import ENUMS as _ENUMS_r
+                _r_model_name = _ENUMS_r().reasoning_model_name
+                if _r_model_name.startswith("models/"):
+                    _r_model_name = _r_model_name[len("models/"):]
+                _r_gen_config = _genai_r_types.GenerateContentConfig(
+                    temperature=0.1,
+                    thinking_config=_genai_r_types.ThinkingConfig(thinking_budget=0),
+                )
+                def _reasoning_llm_complete(prompt: str) -> str:
+                    resp = _r_client.models.generate_content(
+                        model=_r_model_name,
+                        contents=prompt,
+                        config=_r_gen_config,
+                    )
+                    return (resp.text or "").strip()
+                print("[graph] Reasoning LLM (gemini-2.5-flash, thinking=off) initialized for form extraction")
+            except Exception as _r_sdk_err:
+                print(f"[graph] Direct SDK init failed ({_r_sdk_err}), falling back to LlamaIndex")
+                _r_llm = init_reasoning_llm(_api_key)
+                def _reasoning_llm_complete(prompt: str) -> str:
+                    resp = _r_llm.complete(prompt)
+                    text = getattr(resp, 'text', None) or str(resp)
+                    return text.strip()
+                print("[graph] Reasoning LLM (gemini-2.5-flash) initialized for form extraction")
         else:
             print("[graph] WARNING: No API key — reasoning LLM disabled, using flash-lite fallback")
     except Exception as _r_err:
@@ -809,7 +830,6 @@ try:
     _interview_graph = build_interview_graph(
         llm_complete=health_agent.llm_complete,
         system_prompt=health_agent.system_prompt,
-        predefined_questions=health_agent.predefined_questions,
         save_customer_info_fn=_save_for_graph,
         checkpointer=_checkpointer,
         reasoning_llm=_reasoning_llm_complete,
@@ -825,6 +845,7 @@ except Exception as _graph_err:
 mongo_client = None
 users_collection: Optional[Collection] = None
 customer_info_collection: Optional[Collection] = None
+tagged_questions_collection: Optional[Collection] = None
 
 
 # normalize_user_id moved to app.db.serializers (imported above).
@@ -832,7 +853,7 @@ customer_info_collection: Optional[Collection] = None
 
 def init_mongo():
     """Initialize MongoDB client for user directory lookups and customer info."""
-    global mongo_client, users_collection, customer_info_collection
+    global mongo_client, users_collection, customer_info_collection, tagged_questions_collection
 
     if not MONGO_URI:
         print("MONGO_URI not set. User suggestions and customer info endpoints will be disabled.")
@@ -848,6 +869,7 @@ def init_mongo():
         db = mongo_client[MONGO_DB_NAME]
         users_collection = db[MONGO_USERS_COLLECTION]
         customer_info_collection = db[MONGO_CUSTOMER_INFO_COLLECTION]
+        tagged_questions_collection = db["tagged-questions"]
 
         # Unique index: prevents duplicate documents for the same (userId, formId)
         customer_info_collection.create_index(
@@ -874,10 +896,415 @@ def init_mongo():
         mongo_client = None
         users_collection = None
         customer_info_collection = None
+        tagged_questions_collection = None
         print(f"Failed to connect to MongoDB. User suggestions and customer info disabled: {e}")
 
 
 # _serialize_datetime and serialize_user moved to app.db.serializers (imported above).
+
+
+_PROM_SCALE_MAP = {
+    "prom_ohs":    "Oxford Hip Score (OHS)",
+    "prom_oss":    "Oxford Shoulder Score (OSS)",
+    "prom_phq9":   "PHQ-9 (Depression)",
+    "prom_gad7":   "GAD-7 (Anxiety)",
+    "prom_nps":    "Numeric Pain Scale (NPS)",
+    "prom_rmdq":   "RMDQ (Back Disability)",
+    "prom_koos":   "KOOS (Knee)",
+    "prom_dash":   "DASH (Arm/Shoulder/Hand)",
+    "prom_odi":    "Oswestry Disability Index (ODI)",
+    "prom_whoqol": "WHOQOL (Quality of Life)",
+}
+
+
+def _prom_field_label(suffix: str) -> str:
+    return suffix.replace("_", " ").title()
+
+
+def _build_prom_template_from_ids(question_ids: list) -> dict:
+    """Group question IDs by PROM scale to build a structured form template."""
+    template: dict = {}
+    for qid in question_ids:
+        scale_name = "Other Assessments"
+        suffix = qid
+        for prefix, name in _PROM_SCALE_MAP.items():
+            if qid.startswith(prefix + "_"):
+                scale_name = name
+                suffix = qid[len(prefix) + 1:]
+                break
+        if scale_name not in template:
+            template[scale_name] = {}
+        template[scale_name][_prom_field_label(suffix)] = ""
+    return template
+
+
+def _prom_scale_is_answered(val) -> bool:
+    """Return True only when a PROM scale value has at least one real answer.
+    Empty dicts (skeleton placeholders) and empty strings both return False."""
+    if isinstance(val, dict):
+        return any(str(v).strip() for v in val.values() if v)
+    return bool(val and str(val).strip())
+
+
+def _collapse_prom_form(form: dict) -> dict:
+    """
+    Collapse nested PROM form {scale: {question: answer, ...}} into
+    {scale: "Question: answer; Question: answer"} — one line per scale.
+    Empty fields are omitted. Non-dict sections passed through unchanged.
+    """
+    collapsed = {}
+    for section, data in form.items():
+        if isinstance(data, dict):
+            parts = [
+                f"{field}: {value}"
+                for field, value in data.items()
+                if value and str(value).strip()
+            ]
+            collapsed[section] = "; ".join(parts)
+        else:
+            collapsed[section] = data
+    return collapsed
+
+
+def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
+    """
+    Return (resolved_texts, prom_form_template) for (user_id, form_id).
+    Returns ([], {}) if nothing found.
+    """
+    if tagged_questions_collection is None:
+        return [], {}
+    try:
+        from bson import ObjectId
+        queries = []
+        try:
+            oid = ObjectId(user_id)
+            queries += [{"userId": oid, "formId": form_id}, {"userId": oid}]
+        except Exception:
+            pass
+        queries += [{"userId": user_id, "formId": form_id}, {"userId": user_id}]
+
+        doc = None
+        _from_customer_info = False
+        for q in queries:
+            doc = tagged_questions_collection.find_one(q)
+            if doc:
+                break
+
+        # Fallback: check customer_info_collection for template docs that embed the
+        # questions array directly (new template format from the clinic admin system)
+        if not doc and customer_info_collection is not None:
+            for q in queries:
+                doc = customer_info_collection.find_one(q)
+                if doc and doc.get("questions"):
+                    _from_customer_info = True
+                    print(f"[tagged-questions] Found embedded questions in customer-info for user={user_id}")
+                    break
+                doc = None
+
+        if not doc:
+            print(f"[tagged-questions] No doc found for user={user_id} form={form_id}")
+            return [], {}
+
+        raw_questions = doc.get("questions", [])
+        if not isinstance(raw_questions, list):
+            return [], {}
+
+        # Standard response options for PROM scales (inferred when not in question-bank)
+        _PROM_DEFAULT_METAS: dict = {
+            "prom_ohs":   {"type": "single_choice", "options": ["No difficulty", "Little difficulty", "Moderate difficulty", "Extreme difficulty", "Cannot do"]},
+            "prom_oss":   {"type": "single_choice", "options": ["No difficulty", "Little difficulty", "Moderate difficulty", "Extreme difficulty", "Cannot do"]},
+            "prom_phq9":  {"type": "single_choice", "options": ["Not at all", "Several days", "More than half the days", "Nearly every day"]},
+            "prom_gad7":  {"type": "single_choice", "options": ["Not at all", "Several days", "More than half the days", "Nearly every day"]},
+            "prom_nps":   {"type": "scale",         "options": None},
+            "prom_rmdq":  {"type": "single_choice", "options": ["Yes", "No"]},
+            "prom_koos":  {"type": "single_choice", "options": ["None", "Mild", "Moderate", "Severe", "Extreme"]},
+            "prom_dash":  {"type": "single_choice", "options": ["No difficulty", "Mild difficulty", "Moderate difficulty", "Severe difficulty", "Unable"]},
+            "biz_feedback": {"type": "single_choice", "options": ["Yes, happy to help", "No, thank you"]},
+        }
+
+        # Hard overrides: DB value is wrong for these question IDs
+        _QUESTION_ID_META_OVERRIDES: dict = {
+            "biz_feedback_nps": {"type": "scale", "options": None},
+        }
+
+        def _infer_meta(qid: str, db_type: str, db_options) -> tuple:
+            """Return (type, options), inferring from question ID prefix when not in DB."""
+            if qid in _QUESTION_ID_META_OVERRIDES:
+                m = _QUESTION_ID_META_OVERRIDES[qid]
+                return m["type"], m["options"]
+            if db_type and db_type != "text" and db_options:
+                return db_type, db_options
+            for prefix, meta in _PROM_DEFAULT_METAS.items():
+                if qid.startswith(prefix):
+                    return meta["type"], meta["options"]
+            return db_type or "text", db_options
+
+        # Split questions into three buckets:
+        # 1. full_embedded: dict with text + type already present (new template format)
+        # 2. id_only: dict with only an ID → needs question-bank lookup
+        # 3. plain: raw strings or dicts with only text
+        full_embedded = []   # (qid, q_dict) — text/type/options already available
+        question_ids = []    # IDs that need question-bank lookup
+        plain_texts = []     # raw text strings
+
+        for q in raw_questions:
+            if isinstance(q, str):
+                plain_texts.append(q)
+            elif isinstance(q, dict):
+                qid = q.get("questionId") or q.get("id") or q.get("question_id")
+                has_text = bool(q.get("text"))
+                has_type = bool(q.get("type") and q.get("type") != "text")
+                if qid and has_text and has_type:
+                    # Embedded format: full question data already available
+                    full_embedded.append((qid, q))
+                elif qid:
+                    question_ids.append(qid)
+                elif has_text:
+                    plain_texts.append(q["text"])
+
+        # Resolve ID-only questions from question-bank
+        id_to_doc: dict = {}
+        if question_ids:
+            try:
+                qb = tagged_questions_collection.database["question-bank"]
+                bank_docs = qb.find({"id": {"$in": question_ids}}, {"id": 1, "text": 1, "type": 1, "options": 1, "_id": 0})
+                id_to_doc = {d["id"]: d for d in bank_docs if d.get("text")}
+            except Exception as e:
+                print(f"[tagged-questions] Error resolving question IDs: {e}")
+
+        # Build resolved list (preserve order: plain texts first, then all question dicts)
+        resolved = [{"text": t, "type": "text", "options": None, "question_id": None} for t in plain_texts]
+
+        # Embedded questions — use their own text/type/options directly
+        all_question_ids_for_template = []
+        for qid, q in full_embedded:
+            _type, _options = _infer_meta(qid, q.get("type", "text"), q.get("options"))
+            resolved.append({"text": q["text"], "type": _type, "options": _options, "question_id": qid})
+            all_question_ids_for_template.append(qid)
+
+        # ID-only questions — use question-bank data
+        for qid in question_ids:
+            all_question_ids_for_template.append(qid)
+            if qid in id_to_doc:
+                d = id_to_doc[qid]
+                _type, _options = _infer_meta(qid, d.get("type", "text"), d.get("options"))
+                resolved.append({"text": d["text"], "type": _type, "options": _options, "question_id": qid})
+            else:
+                print(f"[tagged-questions] Warning: '{qid}' not found in question-bank")
+
+        # Build prom_template from resolved questions using full question text as field labels.
+        # This ensures the MongoDB skeleton and saved answers both use the full question text
+        # as the key, giving a human-readable form_data structure.
+        prom_template: dict = {}
+        for _r in resolved:
+            if not isinstance(_r, dict):
+                continue
+            _r_qid  = _r.get("question_id") or ""
+            _r_text = _r.get("text", "").strip()
+            if not _r_text or not _r_qid:
+                continue
+            _r_scale = "Other Assessments"
+            for _r_pfx, _r_nm in _PROM_SCALE_MAP.items():
+                if _r_qid.startswith(_r_pfx + "_"):
+                    _r_scale = _r_nm
+                    break
+            if _r_scale not in prom_template:
+                prom_template[_r_scale] = {}
+            prom_template[_r_scale][_r_text] = ""
+
+        # Re-sort resolved so all questions within a scale are contiguous.
+        # batch_tagged_questions uses positional slicing keyed on prom_template field counts,
+        # so the order of resolved MUST match the order of scales in prom_template.
+        _scale_order = {s: i for i, s in enumerate(prom_template.keys())}
+        def _scale_rank(item):
+            if not isinstance(item, dict):
+                return len(_scale_order)
+            _qid = item.get("question_id") or ""
+            for _pfx, _nm in _PROM_SCALE_MAP.items():
+                if _qid.startswith(_pfx + "_"):
+                    return _scale_order.get(_nm, len(_scale_order))
+            return _scale_order.get("Other Assessments", len(_scale_order))
+        resolved.sort(key=_scale_rank)
+
+        _source_doc_id = str(doc.get("_id", "")) if _from_customer_info and doc else None
+        print(f"[tagged-questions] Resolved {len(resolved)} questions, {len(prom_template)} PROM scales for user={user_id} form={form_id}")
+        return resolved, prom_template, _source_doc_id
+    except Exception as e:
+        print(f"[tagged-questions] Error fetching: {e}")
+    return [], {}, None
+
+
+_SCALE_RESPONSE_OPTIONS: dict = {
+    "Oxford Hip Score": "(options: none / very mild / mild / moderate / severe)",
+    "OHS": "(options: none / very mild / mild / moderate / severe)",
+    "Oxford Shoulder Score": "(options: none / very mild / mild / moderate / severe)",
+    "OSS": "(options: none / very mild / mild / moderate / severe)",
+    "PHQ": "(options: not at all / several days / more than half the days / nearly every day)",
+    "GAD": "(options: not at all / several days / more than half the days / nearly every day)",
+    "NPS": "(0 = no pain, 10 = worst possible pain)",
+    "RMDQ": "(please answer yes or no)",
+    "Roland": "(please answer yes or no)",
+}
+
+_SCALE_INTROS: dict = {
+    "Oxford Hip Score": "Now let me ask about your hip over the past 4 weeks.",
+    "OHS": "Now let me ask about your hip over the past 4 weeks.",
+    "Oxford Shoulder Score": "Now let me ask about your shoulder over the past 4 weeks.",
+    "OSS": "Now let me ask about your shoulder over the past 4 weeks.",
+    "PHQ": "I'd like to ask a few questions about your mood and mental well-being.",
+    "GAD": "Let me ask a few questions about how you've been feeling emotionally.",
+    "NPS": "Quick pain check —",
+    "RMDQ": "Now let me ask about how your back pain has affected your daily activities.",
+    "Roland": "Now let me ask about how your back pain has affected your daily activities.",
+}
+
+
+def batch_tagged_questions(questions: list, llm_complete, form_template: dict = None) -> list:
+    """
+    Combine ALL PROM questions into a single multi_answer turn so the patient
+    sees the entire assessment at once.
+
+    Questions are ordered by PROM scale (using question_id prefix matching) and
+    the resulting turn includes a `question_scales` list so the frontend can
+    render section headers (e.g. "Oxford Hip Score", "PHQ-9").
+    """
+    if not questions:
+        return []
+
+    # --- Group by scale via question_id prefix ---
+    if form_template:
+        scale_order = list(form_template.keys())
+    else:
+        scale_order = []
+
+    buckets: dict = {}
+    for q in questions:
+        q_dict = q if isinstance(q, dict) else {"text": q, "type": "text", "options": None, "question_id": None}
+        qid = q_dict.get("question_id") or ""
+        assigned = "Other Assessments"
+        for pfx, name in _PROM_SCALE_MAP.items():
+            if qid.startswith(pfx + "_"):
+                assigned = name
+                break
+        buckets.setdefault(assigned, []).append(q_dict)
+
+    # Preserve scale ordering from form_template
+    seen: set = set()
+    scale_groups: list = []
+    for sname in scale_order:
+        if sname in buckets and sname not in seen:
+            scale_groups.append((sname, buckets[sname]))
+            seen.add(sname)
+    for sname, qs in buckets.items():
+        if sname not in seen:
+            scale_groups.append((sname, qs))
+
+    # Flatten all questions into a single ordered list with scale labels
+    all_ids, all_texts, all_opts, all_types, all_scales = [], [], [], [], []
+    for scale_name, qs in scale_groups:
+        for c in qs:
+            all_ids.append(c.get("question_id"))
+            all_texts.append(c.get("text", ""))
+            all_opts.append(c.get("options"))
+            all_types.append(c.get("type", "text"))
+            all_scales.append(scale_name)
+
+    combined_text = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(all_texts))
+    print(f"[tagged-questions] {len(questions)} questions → 1 combined turn")
+    return [{
+        "text": combined_text,
+        "type": "multi_answer",
+        "options": None,
+        "question_id": None,
+        "question_ids": all_ids,
+        "questions": all_texts,
+        "question_options": all_opts,
+        "question_types": all_types,
+        "question_scales": all_scales,
+    }]
+
+
+def personalize_questions(raw_questions: list, patient_context: dict, llm_complete) -> list:
+    """
+    Rewrite raw PROM question templates to match this patient's specific situation.
+
+    Uses FRM-01 intake data (onset, body part, severity, duration) to replace
+    generic template phrasing ("past 4 weeks", "your joint") with patient-accurate
+    language ("past 3 days", "your right knee").  If a question touches something
+    already well-documented in the patient's history, it is reframed as a follow-up
+    ("You mentioned X last time — has that changed?").
+
+    Falls back to raw templates on any error so the interview is never blocked.
+    """
+    if not raw_questions:
+        return raw_questions
+
+    import json as _json
+
+    # Build a compact clinical summary from FRM-01 (key facts only, skip empty / N/A values)
+    _na_markers = {"not applicable", "n/a", "na", "none", "general visit"}
+    facts = []
+    for section, fields in patient_context.items():
+        if isinstance(fields, dict):
+            for field, value in fields.items():
+                v = str(value).strip()
+                if v and not any(v.lower().startswith(m) for m in _na_markers):
+                    facts.append(f"{field}: {v}")
+        elif isinstance(fields, str) and fields.strip():
+            facts.append(f"{section}: {fields.strip()}")
+
+    if not facts:
+        print(f"[personalize-questions] No usable facts from patient context (sections={list(patient_context.keys())}), using raw templates")
+        return raw_questions
+
+    # Extract just the text fields for the LLM (questions may be dicts with type/options)
+    raw_texts = [q["text"] if isinstance(q, dict) else q for q in raw_questions]
+
+    patient_summary = "\n".join(facts[:30])  # Cap to keep prompt concise
+    questions_json = _json.dumps(raw_texts)
+
+    prompt = (
+        "You are a clinical assistant personalizing assessment questions for a specific patient.\n\n"
+        "PATIENT INTAKE HISTORY (FRM-01):\n"
+        f"{patient_summary}\n\n"
+        f"RAW QUESTION TEMPLATES ({len(raw_texts)} questions from PROM bank):\n"
+        f"{questions_json}\n\n"
+        "RULES:\n"
+        "1. Replace 'past 4 weeks' (or any generic time window) with the patient's actual "
+        "duration if documented (e.g. 'past 5 days', 'past 2 months'). If duration is unknown, "
+        "remove the time reference entirely.\n"
+        "2. Replace generic body-part language ('your joint', 'the affected area') with the "
+        "patient's specific condition (e.g. 'your right hip', 'your lower back').\n"
+        "3. If a question asks about something already well-captured in the intake history, "
+        "reframe it as a follow-up: 'You mentioned [X] — has that changed recently?'\n"
+        "4. Do NOT change the clinical meaning or intent of any question.\n"
+        "5. Keep exactly the same number of questions in the same order.\n"
+        "6. Keep each question concise — one sentence where possible.\n\n"
+        f"Return ONLY a valid JSON array of exactly {len(raw_texts)} strings. No other text."
+    )
+
+    try:
+        raw = llm_complete(prompt).strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        personalized_texts = _json.loads(raw.strip())
+        if isinstance(personalized_texts, list) and len(personalized_texts) == len(raw_questions):
+            print(f"[personalize-questions] Personalized {len(personalized_texts)} questions using patient history")
+            # Rebuild with personalized text but original type/options preserved
+            result = []
+            for i, q in enumerate(raw_questions):
+                if isinstance(q, dict):
+                    result.append({**q, "text": personalized_texts[i]})
+                else:
+                    result.append(personalized_texts[i])
+            return result
+        print(f"[personalize-questions] Length mismatch ({len(personalized_texts)} vs {len(raw_questions)}), using raw")
+    except Exception as e:
+        print(f"[personalize-questions] Failed ({e}), using raw templates")
+
+    return raw_questions
 
 
 def generate_form_title(form_data: dict) -> str:
@@ -929,6 +1356,62 @@ Generate only the title, nothing else. The title should be clear and based on th
 # Fixed form ID - same for all users. Uniqueness comes from (formId + userId) combination
 # DEFAULT_FORM_ID moved to app.config (imported above).
 
+def resolve_assessment_appointment_id(user_id: str):
+    """The booked assessment this intake belongs to.
+
+    Priority: the appointmentId propagated onto the patient's tagged-questions doc
+    (resolved at tag time in clinical-mcp) → else resolve the next BOOKED appointment
+    directly from the appointments collection. Returns an ObjectId or None.
+    """
+    from bson import ObjectId
+    from datetime import datetime, timezone
+
+    # 1) Propagated from tag time (clinical-mcp).
+    try:
+        if tagged_questions_collection is not None:
+            td = tagged_questions_collection.find_one(
+                {"$or": [{"userId": str(user_id)}, {"userId": normalize_user_id(user_id)}]},
+                {"appointmentId": 1},
+            )
+            if td and td.get("appointmentId"):
+                try:
+                    return ObjectId(str(td["appointmentId"]))
+                except Exception:
+                    return td["appointmentId"]
+    except Exception as e:
+        print(f"[appointment-tag] tagged-questions lookup failed: {e}")
+
+    # 2) Fallback: resolve the next booked appointment ourselves.
+    try:
+        if mongo_client is None:
+            return None
+        appts = mongo_client[MONGO_DB_NAME]["appointments"]
+        pid_variants = []
+        try:
+            pid_variants.append(ObjectId(str(user_id)))
+        except Exception:
+            pass
+        pid_variants.append(str(user_id))
+        now = datetime.now(timezone.utc)
+        for pid in pid_variants:
+            doc = appts.find_one(
+                {"patient": pid, "status": "BOOKED", "appointmentStartTime": {"$gte": now}},
+                sort=[("appointmentStartTime", 1)], projection={"_id": 1},
+            )
+            if doc:
+                return doc["_id"]
+        for pid in pid_variants:
+            doc = appts.find_one(
+                {"patient": pid, "status": "BOOKED"},
+                sort=[("appointmentStartTime", -1)], projection={"_id": 1},
+            )
+            if doc:
+                return doc["_id"]
+    except Exception as e:
+        print(f"[appointment-tag] appointments lookup failed: {e}")
+    return None
+
+
 def save_customer_info(
     user_id: str,
     form_data: dict,
@@ -936,6 +1419,7 @@ def save_customer_info(
     form_id: str = None,
     attachments: Optional[List[dict]] = None,
     chat_history: Optional[list] = None,
+    preferred_doc_id: Optional[str] = None,
 ):
     """
     Save or update customer interview information in MongoDB.
@@ -1001,34 +1485,50 @@ def save_customer_info(
             "current_section": current_section,
             "updatedAt": datetime.now(),
         }
-        
-        # Check if document exists for this (formId + userId) combination
-        # Uniqueness is based on BOTH formId AND userId (normalized)
-        existing = customer_info_collection.find_one({
-            "formId": form_id,
-            "userId": normalized_user_id
-        })
-        
-        # ── Atomic upsert — no duplicate documents possible ─────────────────
-        # Using update_one with upsert=True + $setOnInsert for createdAt means:
-        # • If document exists → only the mutable fields are updated (no duplicate)
-        # • If document is new → full document is created with createdAt set once
-        # This replaces the previous find→insert/update pattern which had a race
-        # condition where two concurrent saves could both insert a new document.
+
+        # Tag this intake to the patient's booked assessment so the recommender's
+        # customer icon can fetch the right assessment's data. Only set when
+        # resolved, so we never clobber an existing tag with null.
+        _appt_id = resolve_assessment_appointment_id(user_id)
+        if _appt_id is not None:
+            customer_doc["appointmentId"] = _appt_id
+
+        # Find existing doc — prefer preferred_doc_id (template doc _id) when provided,
+        # then try both ObjectId and plain-string userId so we don't create a second
+        # document when external systems stored userId as a string.
+        from bson import ObjectId as _ObjId2
+        existing = None
+        if preferred_doc_id:
+            try:
+                existing = customer_info_collection.find_one({"_id": _ObjId2(preferred_doc_id)})
+            except Exception:
+                pass
+        if not existing:
+            _uid_variants = [normalized_user_id]
+            try:
+                _uid_variants.append(str(user_id))
+            except Exception:
+                pass
+            for _uid in _uid_variants:
+                existing = customer_info_collection.find_one({"formId": form_id, "userId": _uid})
+                if existing:
+                    break
+
         attachments_to_store = (
             attachments if attachments is not None else
             (existing.get("attachments", []) if existing else [])
         )
         customer_doc["attachments"] = attachments_to_store
 
-        customer_info_collection.update_one(
-            {"formId": form_id, "userId": normalized_user_id},
-            {
-                "$set": customer_doc,
-                "$setOnInsert": {"createdAt": datetime.now()},
-            },
-            upsert=True,
-        )
+        if existing:
+            # Update the doc we found (regardless of how userId was stored)
+            customer_info_collection.update_one(
+                {"_id": existing["_id"]},
+                {"$set": customer_doc},
+            )
+        else:
+            customer_doc["createdAt"] = datetime.now()
+            customer_info_collection.insert_one(customer_doc)
         print(f"Saved customer info for user {user_id}, form {form_id} in MongoDB")
         
         return form_id
@@ -1151,16 +1651,21 @@ def fetch_form_by_id(form_id: str, user_id: str = None) -> dict:
         return None
     
     try:
-        # Find form by (formId + userId) combination
-        normalized_user_id = normalize_user_id(user_id)
-        form = customer_info_collection.find_one(
-            {
-                "formId": form_id,
-                "userId": normalized_user_id
-            },
-            {"_id": 0}
-        )
+        # Try ObjectId first, then plain string — external systems may store userId
+        # as a string while our backend normalises it to ObjectId.
+        from bson import ObjectId as _ObjId
+        _uid_variants = [user_id]
+        try:
+            _uid_variants.insert(0, _ObjId(user_id))
+        except Exception:
+            pass
+        form = None
+        for _uid in _uid_variants:
+            form = customer_info_collection.find_one({"formId": form_id, "userId": _uid})
+            if form:
+                break
         if form:
+            form["_id"] = str(form.get("_id", ""))
             form["timestamp"] = _serialize_datetime(form.get("timestamp"))
             form["createdAt"] = _serialize_datetime(form.get("createdAt"))
             form["updatedAt"] = _serialize_datetime(form.get("updatedAt"))
@@ -1258,22 +1763,70 @@ def build_interview_state(client_state: dict, progress_override: Optional[float]
         # No form_id yet, use health_agent.form (will be empty for new forms)
         form_data_for_progress = health_agent.form
     
+    _tagged_tmpl = client_state.get("tagged_form_template")
+    _prev_prom   = client_state.get("prom_existing_data") or {}
+    # It's a PROM session if either the template or previous data is set
+    _is_prom     = bool(_tagged_tmpl) or bool(_prev_prom)
+    # Full scale list: template keys (remaining) ∪ previous data keys (already answered)
+    _all_prom_scales = (
+        list({**_prev_prom, **(_tagged_tmpl or {})}.keys()) if _is_prom else []
+    )
+
     # Calculate overall progress
     if progress_override is not None:
         progress = progress_override
+    elif _is_prom:
+        _prom_fd = form_data_for_progress or {}
+        _prom_answered = sum(
+            1 for k in _all_prom_scales
+            if _prom_scale_is_answered(_prom_fd.get(k)) or _prom_scale_is_answered(_prev_prom.get(k))
+        )
+        progress = round(_prom_answered / len(_all_prom_scales) * 100) if _all_prom_scales else 0
     else:
         progress = calculate_form_progress(form_data_for_progress)
-    
-    # Calculate section completion status with ordering
-    section_progress = calculate_section_completion_status(form_data_for_progress)
-    
+
+    # Section completion status
+    if _is_prom:
+        _prom_fd = form_data_for_progress or {}
+        section_progress = [
+            {
+                "section": scale,
+                "is_complete": (
+                    _prom_scale_is_answered(_prom_fd.get(scale))
+                    or _prom_scale_is_answered(_prev_prom.get(scale))
+                ),
+                "filled_fields": 1 if (
+                    _prom_scale_is_answered(_prom_fd.get(scale))
+                    or _prom_scale_is_answered(_prev_prom.get(scale))
+                ) else 0,
+                "total_fields": 1,
+            }
+            for scale in _all_prom_scales
+        ]
+    else:
+        section_progress = calculate_section_completion_status(form_data_for_progress)
+
+    # Current section label
+    if _is_prom:
+        # Remaining scales from template, else fall back to last scale in full list
+        _remaining = list(_tagged_tmpl.keys()) if _tagged_tmpl else []
+        if _remaining:
+            _tidx = max(0, client_state.get("tagged_turn_index", 1) - 1)
+            _tidx = min(_tidx, len(_remaining) - 1)
+            _section = _remaining[_tidx]
+        else:
+            _section = _all_prom_scales[-1] if _all_prom_scales else "Outcome Assessment"
+    else:
+        _section = health_agent.current_section
+
     return {
-        "section": health_agent.current_section,
+        "section": _section,
         "progress": progress,
         "missing_fields": health_agent.missing_fields,
         "attachments": attachments,
         "formId": form_id,
-        "sectionProgress": section_progress,  # Added: section completion status with ordering
+        "sectionProgress": section_progress,
+        "promSteps": _all_prom_scales if _is_prom else None,
     }
 
 
@@ -1386,7 +1939,7 @@ def message_requires_attachment(
     # This is the follow-up prompt like:
     # "Great! Since you mentioned you have reports, would you like to upload them? ..."
     if message_text:
-        lower_msg = message_text.lower()
+        lower_msg = (message_text if isinstance(message_text, str) else str(message_text)).lower()
         if "would you like to upload" in lower_msg or ("upload them" in lower_msg and "reports" in lower_msg):
             print("[message_requires_attachment] Agent is explicitly asking to upload reports, showing upload card")
             return True
@@ -1425,6 +1978,7 @@ async def send_text_message(
     interview_state: Optional[dict] = None,
     user_response: Optional[str] = None,
     force_request_attachment: bool = False,
+    question_meta: Optional[dict] = None,
 ):
     """
     Send a text message to the client.
@@ -1458,6 +2012,8 @@ async def send_text_message(
         else build_interview_state(client_state),
         "request_attachment": requires_attachment,
     }
+    if question_meta and question_meta.get("type") and question_meta.get("type") != "text":
+        payload["question_meta"] = question_meta
     await websocket.send_text(json.dumps(payload))
 
 
@@ -1505,7 +2061,7 @@ async def health_check():
         "components": {
             "mongodb": "ok" if customer_info_collection is not None else "degraded",
             "graph": "ok" if _interview_graph is not None else "degraded",
-            "whisper": "ok"
+            "stt": "google-cloud-speech"
         }
     }
 
@@ -1993,6 +2549,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             # Receive message from client
             message = await websocket.receive()
 
+            # Client closed the connection. Starlette delivers a single
+            # {"type": "websocket.disconnect"} message and raises a RuntimeError
+            # ("Cannot call receive once a disconnect message has been received")
+            # if receive() is called again. Break cleanly instead of looping back
+            # into receive() and crashing the handler.
+            if message.get("type") == "websocket.disconnect":
+                break
+
             # Handle text messages (JSON control messages)
             if "text" in message:
                 try:
@@ -2035,17 +2599,185 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             continue
 
-                        # Business rule: Form ID is fixed (same for all users).
-                        # Uniqueness comes from the combination of (formId + userId).
-                        # Each user has exactly one form identified by (DEFAULT_FORM_ID + userId).
-
                         client_state["user_id"] = provided_user_id
-                        # Always use the fixed form ID
-                        provided_form_id = DEFAULT_FORM_ID
+                        # formId from URL (e.g. FRM-01, FRM-02); fall back to default
+                        provided_form_id = data.get("formId") or DEFAULT_FORM_ID
                         client_state["form_id"] = provided_form_id
                         # Initialize form_data early so it's always defined regardless of
                         # resume vs new-interview path (avoids UnboundLocalError).
                         form_data = {}
+
+                        # Fetch tagged questions + build PROM form template
+                        # Only for non-default forms (FRM-02+); FRM-01 always uses the standard intake flow
+                        if provided_form_id == DEFAULT_FORM_ID:
+                            _raw_tagged, _prom_template = [], {}
+                        else:
+                            _raw_tagged, _prom_template, _prom_source_doc_id = fetch_tagged_questions(provided_user_id, provided_form_id)
+                            # When questions came from an existing customer-info template doc,
+                            # store its _id so saves target that doc directly (prevents duplicates).
+                            client_state["prom_source_doc_id"] = _prom_source_doc_id
+
+                        _existing_prom_data = {}  # existing FRM-02 answers; populated below if _raw_tagged
+
+                        # Initial qid→text lookup (pre-personalization); overwritten below after
+                        # personalization so stored keys match what the patient was actually asked.
+                        client_state["tagged_question_texts"] = {
+                            q["question_id"]: q["text"]
+                            for q in _raw_tagged
+                            if isinstance(q, dict) and q.get("question_id") and q.get("text")
+                        }
+
+                        if _raw_tagged:
+                            # Personalize using patient's FRM-01 history
+                            try:
+                                _frm01 = fetch_form_by_id(DEFAULT_FORM_ID, provided_user_id)
+                                _patient_ctx = _frm01.get("form_data", {}) if _frm01 else {}
+                                _ctx_field_count = sum(
+                                    len(v) if isinstance(v, dict) else 1
+                                    for v in _patient_ctx.values()
+                                ) if _patient_ctx else 0
+                                print(f"[personalize-questions] FRM-01 found={_frm01 is not None}, ctx_fields={_ctx_field_count}")
+                                _personalized = await asyncio.to_thread(
+                                    personalize_questions,
+                                    _raw_tagged, _patient_ctx, health_agent.llm_complete
+                                )
+                            except Exception as _pe:
+                                print(f"[personalize-questions] Non-fatal: {_pe}")
+                                _personalized = _raw_tagged
+
+                            # Rebuild prom_template from personalized questions so the skeleton
+                            # keys and answer lookup reflect patient-specific text
+                            # (e.g. "past 3 days" instead of the generic "past 4 weeks").
+                            _pers_tmpl: dict = {}
+                            for _pq in _personalized:
+                                if not isinstance(_pq, dict):
+                                    continue
+                                _pq_id = _pq.get("question_id") or ""
+                                _pq_text = _pq.get("text", "").strip()
+                                if not _pq_text or not _pq_id:
+                                    continue
+                                _pq_scale = "Other Assessments"
+                                for _pfx3, _pname3 in _PROM_SCALE_MAP.items():
+                                    if _pq_id.startswith(_pfx3 + "_"):
+                                        _pq_scale = _pname3
+                                        break
+                                _pers_tmpl.setdefault(_pq_scale, {})[_pq_text] = ""
+                            # Preserve original scale order
+                            _ordered_tmpl: dict = {}
+                            for _os in _prom_template.keys():
+                                if _os in _pers_tmpl:
+                                    _ordered_tmpl[_os] = _pers_tmpl[_os]
+                            for _xs, _xf in _pers_tmpl.items():
+                                if _xs not in _ordered_tmpl:
+                                    _ordered_tmpl[_xs] = _xf
+                            if _ordered_tmpl:
+                                _prom_template = _ordered_tmpl
+                            # Update qid→text lookup with personalized text
+                            client_state["tagged_question_texts"] = {
+                                _pq["question_id"]: _pq["text"]
+                                for _pq in _personalized
+                                if isinstance(_pq, dict) and _pq.get("question_id") and _pq.get("text")
+                            }
+
+                            # Skip scales already answered in a previous session (do this BEFORE batching
+                            # so the positional grouping inside batch_tagged_questions stays correct)
+                            try:
+                                _existing_frm02 = fetch_form_by_id(provided_form_id, provided_user_id)
+                                _existing_prom_data = _existing_frm02.get("form_data", {}) if _existing_frm02 else {}
+                            except Exception:
+                                _existing_prom_data = {}
+
+                            if _existing_prom_data and _prom_template:
+                                # Group personalized questions by scale via question_id prefix
+                                # (same logic as batch_tagged_questions — no positional slicing)
+                                _scale_buckets: dict = {}
+                                for _pq in _personalized:
+                                    _pq_id = (_pq.get("question_id") or "") if isinstance(_pq, dict) else ""
+                                    _pq_scale = "Other Assessments"
+                                    for _pfx2, _pname2 in _PROM_SCALE_MAP.items():
+                                        if _pq_id.startswith(_pfx2 + "_"):
+                                            _pq_scale = _pname2
+                                            break
+                                    _scale_buckets.setdefault(_pq_scale, []).append(_pq)
+
+                                _filtered_personalized = []
+                                _filtered_template = {}
+                                _skipped_scales = []
+                                for _scale_name, _fields in _prom_template.items():
+                                    _scale_qs = _scale_buckets.get(_scale_name, [])
+                                    _sv = _existing_prom_data.get(_scale_name)
+                                    _scale_answered = (
+                                        (isinstance(_sv, str) and _sv.strip()) or
+                                        (isinstance(_sv, dict) and any(
+                                            str(v).strip() for v in _sv.values() if v
+                                        ))
+                                    )
+                                    if _scale_answered:
+                                        _skipped_scales.append(_scale_name)
+                                    else:
+                                        _filtered_personalized.extend(_scale_qs)
+                                        _filtered_template[_scale_name] = _fields
+                                if _skipped_scales:
+                                    print(f"[tagged-questions] Skipping {len(_skipped_scales)} already-answered scales: {_skipped_scales}")
+                                _personalized = _filtered_personalized
+                                _prom_template = _filtered_template
+
+                            try:
+                                _batched = await asyncio.to_thread(
+                                    batch_tagged_questions, _personalized, health_agent.llm_complete, _prom_template
+                                )
+                            except Exception as _be:
+                                print(f"[tagged-questions] batch error (non-fatal): {_be}")
+                                _batched = _personalized
+
+                            # Split dicts into parallel text + meta lists
+                            _tagged_turns = []
+                            _tagged_turn_metas = []
+                            for _item in _batched:
+                                if isinstance(_item, dict):
+                                    _tagged_turns.append(_item.get("text", ""))
+                                    _tagged_turn_metas.append({
+                                        "type": _item.get("type", "text"),
+                                        "options": _item.get("options"),
+                                        "question_id": _item.get("question_id"),
+                                        "question_ids": _item.get("question_ids"),
+                                        "questions": _item.get("questions"),
+                                        "question_options": _item.get("question_options"),
+                                        "question_types": _item.get("question_types"),
+                                        "question_scales": _item.get("question_scales"),
+                                    })
+                                else:
+                                    _tagged_turns.append(_item)
+                                    _tagged_turn_metas.append({"type": "text", "options": None, "question_id": None, "question_ids": None, "questions": None})
+                            client_state["tagged_turns"] = _tagged_turns
+                            client_state["tagged_turn_metas"] = _tagged_turn_metas
+                            client_state["tagged_turn_index"] = 0
+                            client_state["tagged_form_template"] = _prom_template or None
+                            print(f"[tagged-questions] Loaded {len(_tagged_turns)} turns, {len(_prom_template)} PROM scales")
+
+                            # Create skeleton form_data doc immediately so all expected
+                            # sections and question fields are visible in the DB from
+                            # the first question (answers will be "" until filled in).
+                            # Only when there is no existing form_data yet.
+                            if _prom_template and not _existing_prom_data:
+                                import copy as _cp_skel
+                                # _prom_template is already {scale: {field: ""}} — deep
+                                # copy it so the skeleton has all sections + question slots.
+                                _skeleton = _cp_skel.deepcopy(_prom_template)
+                                try:
+                                    save_customer_info(
+                                        provided_user_id, _skeleton, "PROM",
+                                        form_id=provided_form_id,
+                                        preferred_doc_id=client_state.get("prom_source_doc_id"),
+                                    )
+                                    print(f"[tagged-questions] Created skeleton with {len(_skeleton)} PROM scales")
+                                except Exception as _ske:
+                                    print(f"[tagged-questions] Skeleton creation failed (non-fatal): {_ske}")
+                        else:
+                            client_state["tagged_turns"] = None
+                            client_state["tagged_turn_metas"] = None
+                            client_state["tagged_turn_index"] = 0
+                            client_state["tagged_form_template"] = None
 
                         # Initialize LangGraph state for this connection
                         if _interview_graph is not None:
@@ -2062,9 +2794,33 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             except Exception as _ge:
                                 print(f"[graph] init_graph_state_in_client failed (non-fatal): {_ge}")
 
+                        # Restore existing PROM answers into graph_form so they survive
+                        # to the summary step and aren't overwritten with "Not mentioned by patient".
+                        # Also persist _existing_prom_data in client_state so the save path can
+                        # merge it back in (prevents previously-answered scales being overwritten
+                        # with "" when they were skipped in this session).
+                        if _existing_prom_data:
+                            import copy as _cp
+                            _restored_form = _cp.deepcopy(client_state.get("graph_form") or {})
+                            for _scale, _val in _existing_prom_data.items():
+                                if _prom_scale_is_answered(_val):  # only restore genuinely answered scales
+                                    _restored_form[_scale] = _val
+                            client_state["graph_form"] = _restored_form
+                            _answered_scales = [k for k, v in _existing_prom_data.items() if _prom_scale_is_answered(v)]
+                            if _answered_scales:
+                                print(f"[start_interview] Restored existing PROM answers for: {_answered_scales}")
+                        # Always store (even if empty) so the save path knows it's a PROM session
+                        client_state["prom_existing_data"] = _existing_prom_data
+
+                        # PROM/tagged-questions sessions always start fresh — FRM-02 is a
+                        # separate assessment, never a resume of FRM-01.
+                        if _raw_tagged:
+                            existing_form = None
+                            print(f"[start_interview] PROM mode — starting fresh for form {provided_form_id}")
+                        else:
+                            existing_form = fetch_latest_form_for_user(provided_user_id)
 
                         # Check if user already has a form (resume mode)
-                        existing_form = fetch_latest_form_for_user(provided_user_id)
                         if existing_form:
                             print(f"[start_interview] RESUME MODE: Found existing form for user {provided_user_id}.")
                             is_resuming = True
@@ -2072,6 +2828,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             # NEW INTERVIEW MODE: No existing form for this user, start fresh
                             print(f"[start_interview] NEW INTERVIEW MODE: No existing form for user {provided_user_id}. Resetting health_agent.")
                             reset_health_agent_for_new_interview(client_state, provided_user_id, agent=health_agent)
+                            # reset_health_agent_for_new_interview clears form_id; restore it
+                            client_state["form_id"] = provided_form_id
                             is_resuming = False
                         
                         # Handle form initialization based on mode (new vs resume)
@@ -2217,10 +2975,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 )
 
                                 # Send the next question immediately so the user sees what to answer.
-                                # If the form is mostly empty, use the comprehensive first question.
-                                # If partial data exists, use health_agent to generate a targeted question.
+                                # If tagged turns exist, use the first turn; otherwise use standard flow.
                                 from src.prompts import PREDEFINED_QUESTIONS
-                                if filled_field_count < 3:
+                                _tagged_turns = client_state.get("tagged_turns")
+                                if _tagged_turns:
+                                    next_q_text = _tagged_turns[0]
+                                    client_state["tagged_turn_index"] = 1
+                                elif filled_field_count < 3:
                                     # Too little data — ask the comprehensive opening question
                                     next_q_text = PREDEFINED_QUESTIONS[0][1]
                                 else:
@@ -2266,11 +3027,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 health_agent.history = []
                                 health_agent.history.append({"role": "agent", "message": health_agent.welcome_prompt})
 
-                            # Create a new placeholder form
-                            print(f"[start_interview] Creating new placeholder form for user: {client_state['user_id']}")
-                            form_id = create_placeholder_form(
-                                client_state["user_id"], client_state
-                            )
+                            # Create a new placeholder form (skipped for PROM — form_id already set)
+                            if not _raw_tagged:
+                                print(f"[start_interview] Creating new placeholder form for user: {client_state['user_id']}")
+                                form_id = create_placeholder_form(
+                                    client_state["user_id"], client_state
+                                )
+                            else:
+                                form_id = provided_form_id
+                                print(f"[start_interview] PROM mode — using provided form_id {form_id}, no placeholder")
                             # Verify the form was created with empty data
                             if form_id:
                                 form_check = fetch_form_by_id(form_id, client_state["user_id"])
@@ -2308,18 +3073,60 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # For new interviews: send a warm welcome, then immediately
                         # follow with the comprehensive first question.
                         from src.prompts import PREDEFINED_QUESTIONS, WELCOME_PROMPT
-                        first_question = PREDEFINED_QUESTIONS[0][1]
+                        _tagged_turns = client_state.get("tagged_turns")
+                        _tagged_turn_metas = client_state.get("tagged_turn_metas") or []
+                        # All PROM scales already answered → show completion, don't fall through to FRM-01
+                        _all_prom_done = bool(_raw_tagged) and (_tagged_turns is not None) and len(_tagged_turns) == 0
+                        if _all_prom_done:
+                            await send_text_message(
+                                websocket,
+                                client_state,
+                                "Welcome back! It looks like you've already completed all your outcome assessments. "
+                                "Your responses have been recorded — thank you!",
+                                build_interview_state(client_state, progress_override=100.0, use_db_form=True),
+                                user_response=None,
+                            )
+                            continue
+                        if _tagged_turns:
+                            # Use first tagged turn; graph will use index 1, 2, ... on subsequent turns
+                            first_question = _tagged_turns[0]
+                            _first_q_meta = _tagged_turn_metas[0] if _tagged_turn_metas else None
+                            client_state["tagged_turn_index"] = 1
+                        elif provided_form_id != DEFAULT_FORM_ID:
+                            # Non-FRM-01 form with no PROM questions left → already handled by
+                            # _all_prom_done guard above. This branch is a safety net: never
+                            # serve FRM-01 intake questions on an FRM-02+ URL.
+                            await send_text_message(
+                                websocket,
+                                client_state,
+                                "It looks like there are no outcome assessment questions assigned to this form yet. "
+                                "Please check with your clinician.",
+                                build_interview_state(client_state, progress_override=100.0, use_db_form=True),
+                                user_response=None,
+                            )
+                            continue
+                        else:
+                            first_question = PREDEFINED_QUESTIONS[0][1]
+                            _first_q_meta = None
                         if client_state.get("graph_phase") is not None:
                             client_state["graph_phase"] = "interviewing"
 
                         # Use empty form for progress on new interview (health_agent.form is global/shared)
                         progress = 0.0
 
-                        # Welcome message
+                        # Welcome message — shorter for PROM sessions (patient already went through FRM-01)
+                        if _tagged_turns:
+                            _welcome_text = (
+                                "Welcome back! I have a few standardised outcome questions to understand "
+                                "how your condition has been affecting your daily life. "
+                                "Please answer as honestly as you can — there are no right or wrong answers."
+                            )
+                        else:
+                            _welcome_text = WELCOME_PROMPT.strip()
                         await send_text_message(
                             websocket,
                             client_state,
-                            WELCOME_PROMPT.strip(),
+                            _welcome_text,
                             build_interview_state(
                                 client_state, progress_override=progress, use_db_form=True
                             ),
@@ -2334,7 +3141,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             build_interview_state(
                                 client_state, progress_override=progress, use_db_form=True
                             ),
-                            user_response=None
+                            user_response=None,
+                            question_meta=_first_q_meta,
                         )
 
                     elif msg_type == "start_new_form":
@@ -2736,7 +3544,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # 2. General medical/educational questions → answer from LLM knowledge
                         # In both cases the interview state is fully preserved and Sage
                         # guides the patient back to the form after answering.
+                        #
+                        # Guard: skip for long messages (>25 words) or on the first turn.
+                        # Long messages are detailed medical responses, not off-topic questions.
+                        # First turn (talk_mode START) is always the intake response.
                         _ti_lower = text_input.lower()
+                        _word_count = len(text_input.split())
+                        _off_topic_eligible = health_agent.talk_mode != "START" and _word_count <= 25
 
                         # "stance" alone always means Stance Health — catch it too
                         _is_just_stance = (
@@ -2777,9 +3591,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             "sounds like", "does it sound like", "is it serious",
                             "should i be worried", "how bad is it", "what should i do",
                         ]
-                        _is_assessment = any(s in _ti_lower for s in _assessment_signals)
-                        _is_brand = _is_just_stance or any(s in _ti_lower for s in _brand_signals)
-                        _is_edu = any(s in _ti_lower for s in _edu_signals)
+                        _is_assessment = _off_topic_eligible and any(s in _ti_lower for s in _assessment_signals)
+                        _is_brand = _off_topic_eligible and (_is_just_stance or any(s in _ti_lower for s in _brand_signals))
+                        _is_edu = _off_topic_eligible and any(s in _ti_lower for s in _edu_signals)
 
                         if _is_assessment:
                             try:
@@ -2877,6 +3691,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                         try:
                             # ── LANGGRAPH PATH ─────────────────────────────────
                             if _interview_graph is not None and client_state.get("graph_phase") is not None:
+                                _turn_t0 = time.perf_counter()
                                 print(f"[graph] Processing turn — phase: {client_state.get('graph_phase')}")
 
                                 # Send thought stages so the frontend shows the AgentThoughtStream card
@@ -2890,7 +3705,195 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     ]
                                 }))
 
+                                # For PROM sessions: directly record the user's answer into
+                                # graph_form before the graph runs.  The extraction LLM knows
+                                # nothing about PROM scales, so without this the field stays
+                                # empty and _fill_unanswered_fields stamps it
+                                # "Not mentioned by patient".
+                                _prom_injected_form = None  # set below when answers are injected
+                                if client_state.get("tagged_form_template"):
+                                    _pt_idx = client_state.get("tagged_turn_index", 1) - 1
+                                    _pt_metas = client_state.get("tagged_turn_metas") or []
+                                    if 0 <= _pt_idx < len(_pt_metas):
+                                        _pt_meta = _pt_metas[_pt_idx]
+                                        import copy as _cp2
+                                        _gf = _cp2.deepcopy(client_state.get("graph_form") or {})
+                                        _qt_map = client_state.get("tagged_question_texts") or {}
+
+                                        _pt_qids_multi = (_pt_meta or {}).get("question_ids") or []
+                                        _pt_qid_single = (_pt_meta or {}).get("question_id")
+
+                                        if _pt_qids_multi:
+                                            # Multi-answer turn: structured MCQ submit uses "|" separator.
+                                            # Voice/paragraph input has no "|" — extract answers via LLM.
+                                            if "|" in text_input:
+                                                _answers = [a.strip() for a in text_input.split("|")]
+                                            else:
+                                                # Natural speech: ask LLM to map the patient's words to
+                                                # the correct option for each question.
+                                                _voice_qs = [
+                                                    _qt_map.get(_qid, _qid) for _qid in _pt_qids_multi if _qid
+                                                ]
+                                                _voice_opts = [
+                                                    ((_pt_meta or {}).get("question_options") or [None]*len(_pt_qids_multi))[_mi2]
+                                                    for _mi2 in range(len(_pt_qids_multi))
+                                                ]
+                                                _voice_prompt = (
+                                                    "The patient said:\n" + text_input + "\n\n"
+                                                    "Extract one answer per question below. "
+                                                    "For questions with options, pick the CLOSEST matching option exactly as written. "
+                                                    "If the patient didn't mention the topic, write 'Not mentioned'.\n\n"
+                                                )
+                                                for _vi, (_vq, _vo) in enumerate(zip(_voice_qs, _voice_opts)):
+                                                    _voice_prompt += f"Q{_vi+1}: {_vq}\n"
+                                                    if _vo:
+                                                        _voice_prompt += f"Options: {', '.join(_vo)}\n"
+                                                    _voice_prompt += f"Answer {_vi+1}: "
+                                                try:
+                                                    _voice_resp = health_agent.llm_complete(
+                                                        _voice_prompt
+                                                    )
+                                                    # Parse "Answer N: <value>" lines
+                                                    import re as _re
+                                                    _parsed = _re.findall(r"Answer\s+\d+:\s*(.+)", _voice_resp)
+                                                    _answers = [p.strip() for p in _parsed]
+                                                    # Pad / trim to match number of questions
+                                                    while len(_answers) < len(_pt_qids_multi):
+                                                        _answers.append("")
+                                                    print(f"[prom] Voice extraction: {_answers}")
+                                                except Exception as _ve:
+                                                    print(f"[prom] Voice extraction failed: {_ve}")
+                                                    _answers = [""] * len(_pt_qids_multi)
+
+                                            for _mi, _mqid in enumerate(_pt_qids_multi):
+                                                if not _mqid:
+                                                    continue
+                                                _manswer = _answers[_mi] if _mi < len(_answers) else ""
+                                                if not _manswer or (isinstance(_manswer, str) and _manswer.strip().lower() == "not mentioned"):
+                                                    continue
+                                                _mscale = "Other Assessments"
+                                                for _pfx, _pname in _PROM_SCALE_MAP.items():
+                                                    if _mqid.startswith(_pfx + "_"):
+                                                        _mscale = _pname
+                                                        break
+                                                _mfield = _qt_map.get(_mqid) or _prom_field_label(
+                                                    _mqid.split("_", 2)[-1] if "_" in _mqid else _mqid
+                                                )
+                                                if _mscale not in _gf or not isinstance(_gf[_mscale], dict):
+                                                    _gf[_mscale] = {}
+                                                _gf[_mscale][_mfield] = _manswer
+                                                print(f"[prom] Multi-saved: {_mscale}.{_mfield[:40]} = {_manswer!r}")
+
+                                        elif _pt_qid_single:
+                                            # Single-question turn: save directly
+                                            _pt_scale = "Other Assessments"
+                                            for _pfx, _pname in _PROM_SCALE_MAP.items():
+                                                if _pt_qid_single.startswith(_pfx + "_"):
+                                                    _pt_scale = _pname
+                                                    break
+                                            _pt_field = (
+                                                _qt_map.get(_pt_qid_single)
+                                                or _prom_field_label(
+                                                    _pt_qid_single.split("_", 2)[-1] if "_" in _pt_qid_single else _pt_qid_single
+                                                )
+                                            )
+                                            if _pt_scale not in _gf or not isinstance(_gf[_pt_scale], dict):
+                                                _gf[_pt_scale] = {}
+                                            _gf[_pt_scale][_pt_field] = text_input
+                                            print(f"[prom] Saved answer: {_pt_scale}.{_pt_field[:40]} = {text_input!r}")
+
+                                        client_state["graph_form"] = _gf
+                                        # Immediately persist answers — don't depend on result_state["form"]
+                                        # after the graph runs, since graph nodes may not preserve the
+                                        # per-question PROM dict structure.
+                                        import copy as _cp_prom
+                                        _prom_injected_form = _cp_prom.deepcopy(_gf)
+                                        asyncio.create_task(asyncio.to_thread(
+                                            save_customer_info,
+                                            client_state.get("user_id", ""),
+                                            _prom_injected_form,
+                                            "PROM",
+                                            client_state.get("form_id", ""),
+                                            None, None,
+                                            client_state.get("prom_source_doc_id"),
+                                        ))
+
+                                # ── Re-ask unanswered PROM questions ──────────────────────────────
+                                # After injecting answers, check if any questions were left blank
+                                # (voice extraction returned "" or "Not mentioned").  Build a
+                                # follow-up tagged turn with only those questions so the patient
+                                # gets another chance to answer them.
+                                if client_state.get("tagged_form_template") and _pt_meta:
+                                    _reask_ids, _reask_qs, _reask_opts, _reask_types, _reask_scales = [], [], [], [], []
+                                    _all_qids   = _pt_meta.get("question_ids") or []
+                                    _all_qtexts = _pt_meta.get("questions") or []
+                                    _all_qopts  = _pt_meta.get("question_options") or []
+                                    _all_qtypes = _pt_meta.get("question_types") or []
+                                    _all_qscls  = _pt_meta.get("question_scales") or [""] * len(_all_qids)
+                                    _qt_map2    = client_state.get("tagged_question_texts") or {}
+                                    for _ri, _rqid in enumerate(_all_qids):
+                                        if not _rqid:
+                                            continue
+                                        # Find saved answer in _gf
+                                        _rscale = "Other Assessments"
+                                        for _rpfx, _rpname in _PROM_SCALE_MAP.items():
+                                            if _rqid.startswith(_rpfx + "_"):
+                                                _rscale = _rpname
+                                                break
+                                        _rfield = _qt_map2.get(_rqid) or (_all_qtexts[_ri] if _ri < len(_all_qtexts) else "")
+                                        _rval   = (_gf.get(_rscale) or {}).get(_rfield, "")
+                                        _rval_s = str(_rval).strip().lower()
+                                        if not _rval_s or _rval_s in ("not mentioned", ""):
+                                            _reask_ids.append(_rqid)
+                                            _reask_qs.append(_all_qtexts[_ri] if _ri < len(_all_qtexts) else _rqid)
+                                            _reask_opts.append(_all_qopts[_ri] if _ri < len(_all_qopts) else None)
+                                            _reask_types.append(_all_qtypes[_ri] if _ri < len(_all_qtypes) else "text")
+                                            _reask_scales.append(_all_qscls[_ri] if _ri < len(_all_qscls) else "")
+
+                                    if _reask_ids:
+                                        _reask_preamble = (
+                                            "I didn't catch clear answers to the questions below — "
+                                            "please tap to select your response for each one:"
+                                        )
+                                        _reask_combined = _reask_preamble + "\n\n" + "\n".join(
+                                            f"{_ri2 + 1}. {_q2}" for _ri2, _q2 in enumerate(_reask_qs)
+                                        )
+                                        _reask_turn = {
+                                            "text": _reask_combined,
+                                            "type": "multi_answer",
+                                            "question_ids": _reask_ids,
+                                            "questions": _reask_qs,
+                                            "question_options": _reask_opts,
+                                            "question_types": _reask_types,
+                                            "question_scales": _reask_scales,
+                                        }
+                                        _reask_meta = {
+                                            "type": "multi_answer",
+                                            "options": None,
+                                            "question_id": None,
+                                            "question_ids": _reask_ids,
+                                            "questions": _reask_qs,
+                                            "question_options": _reask_opts,
+                                            "question_types": _reask_types,
+                                            "question_scales": _reask_scales,
+                                        }
+                                        # Insert the re-ask turn immediately after current index
+                                        _cur_idx = client_state.get("tagged_turn_index", 0)
+                                        _tt2  = list(client_state.get("tagged_turns") or [])
+                                        _ttm2 = list(client_state.get("tagged_turn_metas") or [])
+                                        _tt2.insert(_cur_idx, _reask_combined)
+                                        _ttm2.insert(_cur_idx, _reask_meta)
+                                        client_state["tagged_turns"] = _tt2
+                                        client_state["tagged_turn_metas"] = _ttm2
+                                        print(f"[prom] Re-ask: {len(_reask_ids)} unanswered questions inserted at idx {_cur_idx}")
+
                                 client_state["_fetch_form_fn"] = fetch_form_by_id
+                                # Capture next PROM turn index BEFORE graph runs so we can
+                                # override the response regardless of what the graph generates.
+                                _prom_next_turn_idx = (
+                                    client_state.get("tagged_turn_index", 0)
+                                    if client_state.get("tagged_form_template") else None
+                                )
                                 graph_state = build_graph_state(client_state, text_input, _save_for_graph)
 
                                 # Attach Langfuse user/session context for this turn
@@ -2938,10 +3941,15 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                                                    "handle_summary_response", "apply_correction",
                                                                    "handle_upload_response"):
                                                 streamed_tokens.append(token)
-                                                await websocket.send_text(json.dumps({
-                                                    "type": "token",
-                                                    "content": token,
-                                                }))
+                                                # Don't stream tokens during PROM sessions —
+                                                # the graph may generate FRM-01 intake questions
+                                                # which we override below; streaming them would
+                                                # cause a visible flash of wrong content.
+                                                if not client_state.get("tagged_form_template"):
+                                                    await websocket.send_text(json.dumps({
+                                                        "type": "token",
+                                                        "content": token,
+                                                    }))
                                         elif chunk["type"] == "values":
                                             result_state = chunk["data"]  # accumulate final state
                                 except Exception as _stream_err:
@@ -2949,6 +3957,9 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     result_state = await asyncio.get_event_loop().run_in_executor(
                                         None, _interview_graph.invoke, graph_state
                                     )
+
+                                print(f"[timing] turn_total={(time.perf_counter() - _turn_t0) * 1000:.0f}ms "
+                                      f"phase={result_state.get('phase') if result_state else 'unknown'}")
 
                                 if _lf_ctx:
                                     try:
@@ -2963,13 +3974,45 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                 # concurrent WebSocket handlers causes cross-user data mixing.
                                 # All per-user state lives in client_state["graph_form"] instead.
 
-                                response_text = result_state.get("response_text", "") if result_state else "".join(streamed_tokens)
-                                _log.info("graph_turn_complete", phase=result_state['phase'], response_preview=response_text[:80])
+                                _raw_response = result_state.get("response_text", "") if result_state else "".join(streamed_tokens)
+                                # response_text may be a dict in PROM turns (tagged turn object);
+                                # normalise to string now so all downstream [:80] slices are safe.
+                                response_text = _raw_response if isinstance(_raw_response, str) else (
+                                    _raw_response.get("text", "") if isinstance(_raw_response, dict) else str(_raw_response)
+                                )
+                                _log.info("graph_turn_complete", phase=(result_state.get('phase') if result_state else 'unknown'), response_preview=response_text[:80])
+
+                                # PROM session override: the graph's generate_question node
+                                # may produce FRM-01 intake questions when the user speaks
+                                # naturally (e.g. "i have a severe hip pain!"). Ignore the
+                                # graph's response_text and serve the correct next tagged turn.
+                                _prom_override_meta = None
+                                if _prom_next_turn_idx is not None:
+                                    _tt_list = client_state.get("tagged_turns") or []
+                                    _tt_metas = client_state.get("tagged_turn_metas") or []
+                                    if _prom_next_turn_idx < len(_tt_list):
+                                        response_text = _tt_list[_prom_next_turn_idx]
+                                        _prom_override_meta = (
+                                            _tt_metas[_prom_next_turn_idx]
+                                            if _prom_next_turn_idx < len(_tt_metas) else None
+                                        )
+                                        client_state["tagged_turn_index"] = _prom_next_turn_idx + 1
+                                        print(f"[prom] override turn {_prom_next_turn_idx}, next_idx={_prom_next_turn_idx + 1}")
+                                    else:
+                                        response_text = "Thank you for completing the assessment! Your responses have been recorded."
+                                        client_state["tagged_turn_index"] = _prom_next_turn_idx
 
                                 # Opt 3: use cached form for progress — no blocking DB fetch per turn
                                 _cached_form = result_state.get("form", {})
                                 if result_state.get("phase") == "complete":
                                     progress = 100.0
+                                elif client_state.get("tagged_form_template"):
+                                    # PROM progress: answered / all scales (prev + remaining)
+                                    _pp = client_state.get("prom_existing_data") or {}
+                                    _pt = client_state["tagged_form_template"]
+                                    _all_s = list({**_pp, **_pt}.keys())
+                                    _ans_s = sum(1 for k in _all_s if _prom_scale_is_answered(_pp.get(k)) or _prom_scale_is_answered(_cached_form.get(k)))
+                                    progress = round(_ans_s / len(_all_s) * 100) if _all_s else 0
                                 else:
                                     progress = calculate_form_progress(_cached_form)
 
@@ -2989,17 +4032,25 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     ),
                                     user_response=text_input,
                                     force_request_attachment=bool(result_state.get("request_attachment")),
+                                    question_meta=_prom_override_meta if _prom_override_meta is not None else result_state.get("tagged_question_meta"),
                                 )
 
                                 # Opt 3: persist to MongoDB as background task — don't block response
                                 _save_user_id = client_state.get("user_id", "")
                                 _save_form_id = client_state.get("form_id", "")
-                                _save_section = result_state.get("current_section", "")
                                 _save_form = result_state.get("form", {})
-                                asyncio.create_task(asyncio.to_thread(
-                                    _save_for_graph,
-                                    _save_user_id, _save_form, _save_section, _save_form_id
-                                ))
+                                # For PROM forms: answers were already saved immediately after injection
+                                # above (in per-question format). Skip the post-graph collapse-save to
+                                # avoid overwriting the per-question dict structure with empty strings
+                                # if the graph didn't preserve the injected answers in result_state["form"].
+                                if client_state.get("tagged_form_template"):
+                                    _save_form = None  # skip post-graph save for PROM (already saved above)
+                                else:
+                                    _save_section = result_state.get("current_section", "")
+                                    asyncio.create_task(asyncio.to_thread(
+                                        _save_for_graph,
+                                        _save_user_id, _save_form, _save_section, _save_form_id
+                                    ))
 
                             # ── HEALTHAGENT FALLBACK PATH ───────────────────────
                             else:
@@ -3124,121 +4175,26 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                         # 'transcription' WS message; the debug .raw write was removed.
                         timestamp = int(time.time())
 
-                        # Process audio with Whisper
+                        # Transcribe via Google Cloud Speech-to-Text
                         try:
-                            t_decode_start = time.perf_counter()
+                            from app.audio.stt import transcribe_audio_bytes, is_hallucination, clean_transcript
 
-                            # Browsers' MediaRecorder almost always sends WebM/Opus;
-                            # try that first, then ogg as a fallback. Skipping the
-                            # 4-format exception loop saves ~50-200ms on a happy path.
-                            audio_segment = None
-                            try:
-                                audio_segment = AudioSegment.from_file(
-                                    io.BytesIO(audio_bytes), format="webm"
-                                )
-                            except Exception:
-                                try:
-                                    audio_segment = AudioSegment.from_file(
-                                        io.BytesIO(audio_bytes), format="ogg"
-                                    )
-                                except Exception as e:
-                                    raise Exception(
-                                        f"Could not decode audio (tried webm, ogg): {e}. "
-                                        "Ensure ffmpeg is installed."
-                                    )
-
-                            # Convert to mono, 16kHz, 16-bit (Whisper requirements)
-                            audio_segment = (
-                                audio_segment.set_channels(1)
-                                .set_frame_rate(RATE)
-                                .set_sample_width(2)
+                            t_stt_start = time.perf_counter()
+                            transcription = await asyncio.to_thread(
+                                transcribe_audio_bytes, audio_bytes
                             )
+                            t_stt_ms = (time.perf_counter() - t_stt_start) * 1000
+                            print(f"[audio] Google STT {t_stt_ms:.0f}ms → {transcription[:80]!r}")
 
-                            # Convert directly to numpy for Whisper.
-                            # NOTE: previous code also produced an unused WAV blob here
-                            # via audio_segment.export — removed (pure waste).
-                            np_audio = (
-                                np.array(
-                                    audio_segment.get_array_of_samples(),
-                                    dtype=np.float32,
-                                )
-                                / 32768.0
-                            )
-
-                            t_decode_ms = (time.perf_counter() - t_decode_start) * 1000
-
-                            # Skip if audio appears to be empty or corrupted
-                            if np_audio.size == 0 or np.max(np.abs(np_audio)) < 0.01:
-                                print(
-                                    "⚠️ Audio seems silent or corrupted, skipping transcription"
-                                )
-                                await websocket.send_text(
-                                    json.dumps(
-                                        {
-                                            "type": "error",
-                                            "text": "Audio too quiet or corrupted",
-                                        }
-                                    )
-                                )
-                                continue
-
-                            audio_secs = len(np_audio) / RATE
-                            print(
-                                f"[audio] decoded {len(audio_bytes)/1024:.1f}KB → "
-                                f"{audio_secs:.2f}s pcm in {t_decode_ms:.0f}ms"
-                            )
-
-                            # Transcribe via faster-whisper.
-                            # beam_size=1 = greedy decoding (fastest, ~same quality
-                            # for short utterances). vad_filter trims silent regions
-                            # before transcribing — extra speedup for chunks with
-                            # leading/trailing silence.
-                            t_whisper_start = time.perf_counter()
-                            segments, _info = model.transcribe(
-                                np_audio,
-                                language="en",
-                                temperature=0,
-                                beam_size=5,
-                                vad_filter=True,
-                                vad_parameters=dict(min_silence_duration_ms=500),
-                                condition_on_previous_text=False,
-                                no_speech_threshold=0.6,
-                                compression_ratio_threshold=2.4,
-                                log_prob_threshold=-1.0,
-                            )
-                            transcription = "".join(s.text for s in segments).strip()
-                            t_whisper_ms = (time.perf_counter() - t_whisper_start) * 1000
-                            rtf = (
-                                t_whisper_ms / 1000 / audio_secs if audio_secs > 0 else 0
-                            )
-                            print(
-                                f"[audio] whisper {t_whisper_ms:.0f}ms "
-                                f"(rtf={rtf:.2f}x) → {transcription[:80]!r}"
-                            )
-
-                            # ── Whisper hallucination detection ──────────────────────────────
-                            # Whisper often produces repetitive garbage on silence/noise.
-                            # Detect by measuring word-level uniqueness ratio.
-                            def _is_hallucination(text: str) -> bool:
-                                words = text.lower().split()
-                                if len(words) < 15:
-                                    return False
-                                unique_ratio = len(set(words)) / len(words)
-                                if unique_ratio < 0.12:  # < 12% unique words
-                                    return True
-                                # Check if a 4-word phrase repeats 5+ times
-                                phrase = " ".join(words[:4])
-                                if text.lower().count(phrase) >= 5:
-                                    return True
-                                return False
-
-                            if _is_hallucination(transcription):
-                                print(f"[audio] Whisper hallucination detected — discarding transcription")
+                            if is_hallucination(transcription):
+                                print("[audio] Hallucination detected — discarding transcription")
                                 await websocket.send_text(json.dumps({
                                     "type": "error",
                                     "text": "Audio unclear — please try speaking again.",
                                 }))
                                 continue
+
+                            transcription = clean_transcript(transcription)
 
                             # Send transcription immediately to frontend for real-time display
                             await websocket.send_text(

@@ -73,7 +73,15 @@ def build_graph_state(
     # Retrieve graph-specific fields; fall back to fresh-state defaults when absent.
     fresh = get_fresh_interview_state(user_id=user_id, form_id=form_id, session_id=session_id)
 
-    form = client_state.get("graph_form") or fresh["form"]
+    # For PROM forms (tagged questions), use the PROM template as the initial form
+    _prom_template = client_state.get("tagged_form_template")
+    _graph_form = client_state.get("graph_form")
+    if _prom_template and not _graph_form:
+        # First turn in a PROM session — start with the PROM template
+        import copy as _copy
+        form = _copy.deepcopy(_prom_template)
+    else:
+        form = _graph_form or fresh["form"]
     question_round = client_state.get("graph_question_round")
     if question_round is None:
         question_round = fresh["question_round"]
@@ -130,6 +138,13 @@ def build_graph_state(
         # Orchestrator
         orchestrator_question_id=client_state.get("current_question_id"),
         orchestrator_question_text=None,
+        # Tagged-questions turns (persist across turns)
+        tagged_turns=client_state.get("tagged_turns"),
+        tagged_turn_metas=client_state.get("tagged_turn_metas"),
+        tagged_turn_index=client_state.get("tagged_turn_index", 0),
+        tagged_cleanup_done=client_state.get("tagged_cleanup_done", False),
+        tagged_form_template=client_state.get("tagged_form_template"),
+        tagged_question_meta=None,  # always reset; populated by generate node
         # Output — always reset at turn start; populated by graph nodes
         response_text="",
         request_attachment=False,
@@ -177,6 +192,9 @@ def sync_client_state_from_graph(
     visit_context = result_state.get("visit_context", "unknown")
     if visit_context and visit_context != "unknown":
         client_state["graph_visit_context"] = visit_context
+    # Sync tagged turn index and cleanup flag so the next turn picks up where we left off
+    client_state["tagged_turn_index"] = result_state.get("tagged_turn_index", 0)
+    client_state["tagged_cleanup_done"] = result_state.get("tagged_cleanup_done", False)
 
 
 # ---------------------------------------------------------------------------
@@ -277,13 +295,42 @@ def build_interview_state_from_graph(
         except Exception as exc:
             print(f"[build_interview_state_from_graph] Warning: section status calculation failed: {exc}")
 
+    # PROM session detection: template (remaining) OR previously-answered data
+    _tagged_tmpl = client_state.get("tagged_form_template")
+    _prev_prom   = client_state.get("prom_existing_data") or {}
+    _is_prom     = bool(_tagged_tmpl) or bool(_prev_prom)
+    _all_prom_scales = list({**_prev_prom, **(_tagged_tmpl or {})}.keys()) if _is_prom else []
+
+    # Section label
+    if _is_prom:
+        _remaining = list(_tagged_tmpl.keys()) if _tagged_tmpl else []
+        if _remaining:
+            _pt_idx = max(0, client_state.get("tagged_turn_index", 1) - 1)
+            _pt_idx = min(_pt_idx, len(_remaining) - 1)
+            section = _remaining[_pt_idx]
+        else:
+            section = _all_prom_scales[-1] if _all_prom_scales else "Outcome Assessment"
+    else:
+        section = result_state["current_section"]
+
+    # For PROM, recompute progress from all scales (template has only the remaining ones)
+    if _is_prom and progress_override is None:
+        def _answered(v) -> bool:
+            if isinstance(v, dict):
+                return any(str(x).strip() for x in v.values() if x)
+            return bool(v and str(v).strip())
+        _prom_fd = form_data_for_progress or {}
+        _ans = sum(1 for k in _all_prom_scales if _answered(_prom_fd.get(k)) or _answered(_prev_prom.get(k)))
+        progress = round(_ans / len(_all_prom_scales) * 100) if _all_prom_scales else 0
+
     return {
-        "section": result_state["current_section"],
+        "section": section,
         "progress": progress,
         "missing_fields": result_state.get("missing_fields") or [],
         "attachments": attachments,
         "formId": form_id,
         "sectionProgress": section_progress,
+        "promSteps": _all_prom_scales if _is_prom else None,
     }
 
 
@@ -321,8 +368,14 @@ def init_graph_state_in_client(
     client_state["user_id"] = user_id
     client_state["form_id"] = form_id
 
-    # Form data — use supplied form or fresh template
-    client_state["graph_form"] = form if form is not None else fresh["form"]
+    # Form data: supplied form > PROM template (if tagged questions) > standard template
+    if form is not None:
+        client_state["graph_form"] = form
+    elif client_state.get("tagged_form_template"):
+        import copy as _copy
+        client_state["graph_form"] = _copy.deepcopy(client_state["tagged_form_template"])
+    else:
+        client_state["graph_form"] = fresh["form"]
 
     # Navigation
     client_state["graph_question_round"] = fresh["question_round"]
@@ -342,3 +395,13 @@ def init_graph_state_in_client(
     client_state["graph_attempts_on_current_section"] = 0
     client_state["graph_referral_asked"] = False
     client_state["graph_visit_context"] = "unknown"
+    # Tagged turns — set by server.py after fetching from MongoDB; preserve if already set
+    if "tagged_turns" not in client_state:
+        client_state["tagged_turns"] = None
+    if "tagged_turn_metas" not in client_state:
+        client_state["tagged_turn_metas"] = None
+    if "tagged_turn_index" not in client_state:
+        client_state["tagged_turn_index"] = 0
+    if "tagged_form_template" not in client_state:
+        client_state["tagged_form_template"] = None
+    client_state["tagged_cleanup_done"] = False

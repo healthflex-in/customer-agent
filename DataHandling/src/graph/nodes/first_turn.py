@@ -18,7 +18,7 @@ _CONFIRMATIONS = {
 }
 
 
-def make_handle_first_turn_node(llm_complete, predefined_questions, welcome_prompt, reasoning_llm=None):
+def make_handle_first_turn_node(llm_complete, welcome_prompt, reasoning_llm=None):
     def handle_first_turn_node(state: InterviewState) -> dict:
         user_input = state["user_input"]
         history = list(state["history"])

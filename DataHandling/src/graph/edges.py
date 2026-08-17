@@ -14,6 +14,10 @@ def route_by_phase(state: InterviewState) -> str:
 def after_classify_intent(state: InterviewState) -> str:
     if state.get("is_correction_turn"):
         return "detect_correction"
+    # In PROM/tagged-question sessions, skip reports upload flow entirely —
+    # "yes" answers are about clinical scores, not document uploads
+    if state.get("tagged_turns"):
+        return "validate_section"
     # Already in the upload flow — route the user's reply back to the upload node
     if state.get("awaiting_report_upload") and not state.get("reports_uploaded"):
         return "handle_upload_response"

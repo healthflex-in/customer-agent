@@ -9,58 +9,19 @@ Key behaviours:
 - The referral question ("How did you hear about us?") is asked exactly once, at
   the end, by code — not left to the LLM to forget or repeat.
 """
+import time as _time
 from langgraph.config import get_stream_writer
 from src.graph.state import InterviewState
 from src.graph.pure_functions.summary import generate_interview_summary
 from src.graph.pure_functions.form_validation import get_all_missing_fields, validate_section as _vs
 from src.prompts import INTELLIGENT_QUESTION_PROMPT
+from src.forms.loader import load_form as _load_form
 
-
-# ── Visit context descriptions injected into conductor prompt ─────────────────
-_VISIT_CONTEXT_DESCRIPTIONS = {
-    "specific_complaint": (
-        "SPECIFIC COMPLAINT — patient has a specific pain, injury, or condition to address. "
-        "Collect: complaint details, pain severity/location, duration, onset, aggravating/relieving "
-        "factors, previous consultations, health history, diagnostics, treatment goals."
-    ),
-    "general_assessment": (
-        "GENERAL ASSESSMENT / WELLNESS VISIT — patient has NO specific complaint. "
-        "They want a check-up, posture review, or to explore the clinic. "
-        "SKIP all questions about specific pain, injury mechanism, and previous treatment for a complaint. "
-        "Collect ONLY: general health conditions, lifestyle, treatment/wellness goals, referral source."
-    ),
-    "clinic_inquiry": (
-        "CLINIC INQUIRY — patient was asking about the clinic. They may or may not have a complaint. "
-        "Collect whatever health context they're willing to share: any conditions, lifestyle, goals."
-    ),
-    "unknown": (
-        "VISIT TYPE UNKNOWN — gather what you can. "
-        "Start with what brings them in today, then collect health context naturally."
-    ),
-}
-
-# Sections skipped entirely for general assessment visits
-_SKIP_FOR_GENERAL = {"Pain Assessment", "Previous Consultations", "Present Complaint"}
-
-# Human-readable field labels for the "needed" summary
-_FIELD_LABELS = {
-    "Primary Complaint": "What's bothering them (pain/issue, location, severity 0–10)",
-    "Duration of the Issue": "How long they've had this",
-    "Onset (Gradual or Sudden)": "Whether it started suddenly or gradually",
-    "Mechanism of Injury or Cause": "What caused it / how it started",
-    "Previous Diagnosis or Advice and Prescribed Treatment Taken": "Previous doctor/physio visits and what they said",
-    "Current Status of Issue (Improved, Same, Worse)": "Whether the condition has improved, stayed same, or worsened",
-    "Primary Location of Pain": "Exactly where the pain is",
-    "Severity (1-10)": "Pain severity on a scale of 0–10",
-    "Aggravating Factors": "What makes it worse",
-    "Relieving Factors": "What gives relief",
-    "Systemic Illness and Surgical History": "Other health conditions, past surgeries or fractures",
-    "Current Lifestyle": "Smoking/drinking habits, exercise, job type",
-    "Reports": "Any MRI, X-ray, CT scan, or blood reports",
-    "Short-Term Goals (within 3 months)": "What they want to achieve in the next 3 months",
-    "Long-Term Goals (after 3 months)": "Their long-term health/activity goal",
-    "Specific Expectations from Treatment": "What they expect from this treatment",
-}
+# Load visit-type rules and field labels once from FRM-01.md
+_FRM01 = _load_form("FRM-01")
+_VISIT_CONTEXT_DESCRIPTIONS = {k: v.description for k, v in _FRM01.visit_types.items()}
+_SKIP_FOR_GENERAL = _FRM01.visit_types["general_assessment"].skip_sections
+_FIELD_LABELS = _FRM01.field_labels
 
 
 def _get_relevant_missing(form: dict, form_sections: list, visit_context: str) -> list[tuple]:
@@ -115,6 +76,7 @@ def _generate_intelligent_question(
     visit_context: str,
     form: dict,
     llm_complete,
+    mcp_hints: list | None = None,
 ) -> str:
     """
     LLM conductor: reads the full conversation and decides the single most
@@ -127,13 +89,21 @@ def _generate_intelligent_question(
     # Pass only conversation + visit type — no form state.
     # The conductor reads the conversation directly to determine coverage,
     # which is more reliable than depending on extraction having worked.
+    _mcp_section = ""
+    if mcp_hints:
+        _top = mcp_hints[:5]
+        _lines = "\n".join(f"  - {r.get('text', r.get('category', ''))}" for r in _top)
+        _mcp_section = f"\n\nClinically recommended topics for this case (from intake question bank):\n{_lines}\nPrioritise these if not yet covered."
+
     prompt = INTELLIGENT_QUESTION_PROMPT.format(
         visit_context_description=_VISIT_CONTEXT_DESCRIPTIONS.get(
             visit_context, _VISIT_CONTEXT_DESCRIPTIONS["unknown"]
         ),
         history_text=_build_history_text(history),
-    )
+    ) + _mcp_section
+    _t0 = _time.perf_counter()
     raw = llm_complete(prompt).strip()
+    print(f"[timing] generate_question_llm={(_time.perf_counter() - _t0) * 1000:.0f}ms")
 
     # Parse THINKING: / QUESTION: format
     # QUESTION can be multi-line (bullets), so capture everything after "QUESTION:" to end
@@ -194,7 +164,7 @@ def _fill_unanswered_fields(form: dict) -> dict:
     return filled
 
 
-def make_generate_question_node(llm_complete, system_prompt, predefined_questions):
+def make_generate_question_node(llm_complete, system_prompt):
     def _make_summary(state, history):
         # Fill any remaining empty fields before generating the summary
         complete_form = _fill_unanswered_fields(state["form"])
@@ -219,11 +189,43 @@ def make_generate_question_node(llm_complete, system_prompt, predefined_question
         referral_asked = state.get("referral_asked", False)
         visit_context = state.get("visit_context", "unknown")
 
+        # ── Tagged turns: use pre-batched questions when available ────────────
+        tagged_turns = state.get("tagged_turns") or []
+        tagged_turn_metas = state.get("tagged_turn_metas") or []
+        tagged_turn_index = state.get("tagged_turn_index", 0)
+        if tagged_turns:
+            if tagged_turn_index < len(tagged_turns):
+                response = tagged_turns[tagged_turn_index]
+                meta = tagged_turn_metas[tagged_turn_index] if tagged_turn_index < len(tagged_turn_metas) else None
+                history.append({"role": "agent", "message": response})
+                writer({"stage": "Formulating next question", "detail": "Ready", "status": "done"})
+                return {
+                    "response_text": response,
+                    "history": history,
+                    "tagged_turn_index": tagged_turn_index + 1,
+                    "tagged_question_meta": meta,
+                }
+            else:
+                # All pre-batched turns done — go straight to summary
+                writer({"stage": "Formulating next question", "detail": "Generating summary", "status": "active"})
+                return _make_summary(state, history)
+
         # ── Collect relevant missing fields ───────────────────────────────────
         flat_missing = _get_relevant_missing(form, form_sections, visit_context)
 
         if flat_missing:
-            response = _generate_intelligent_question(flat_missing, history, visit_context, form, llm_complete)
+            # Use the pre-computed question from the extract node (ran concurrently)
+            # if available, otherwise fall back to a fresh LLM call.
+            pending_q = state.get("pending_question")
+            mcp_questions = state.get("mcp_questions") or []
+            if pending_q:
+                response = pending_q
+                print(f"[generate] using prefetched question (saved concurrent LLM call)")
+            else:
+                response = _generate_intelligent_question(
+                    flat_missing, history, visit_context, form, llm_complete,
+                    mcp_hints=mcp_questions,
+                )
 
             # LLM signals "DONE" when it thinks everything is collected
             if response.strip().upper() == "DONE":

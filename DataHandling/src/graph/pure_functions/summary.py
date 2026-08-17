@@ -3,6 +3,7 @@ LLM-powered summary generation and intent classification.
 Extracted from HealthAgent — no self.* references.
 """
 import json
+import time as _time
 from typing import Callable, Optional
 
 from src.graph.pure_functions.form_validation import extract_json_from_response
@@ -45,7 +46,9 @@ CRITICAL — handle empty/negative field values honestly:
 Return ONLY the summary text."""
 
     try:
+        _t0 = _time.perf_counter()
         summary = llm_complete(prompt).strip().replace("**", "")
+        print(f"[timing] generate_summary_llm={(_time.perf_counter() - _t0) * 1000:.0f}ms")
         forbidden = ["the form is complete", "no further questions are needed",
                      "all fields are filled", "the interview is finished"]
         if any(p in summary.lower() for p in forbidden):
@@ -107,7 +110,9 @@ Respond ONLY with compact JSON:
   "wants_upload": true | false | null
 }}"""
     try:
+        _t0 = _time.perf_counter()
         raw = llm_complete(prompt)
+        print(f"[timing] classify_summary_llm={(_time.perf_counter() - _t0) * 1000:.0f}ms")
         json_str = extract_json_from_response(raw)
         if not json_str:
             return {}
@@ -179,7 +184,8 @@ def classify_reports_intent(
     report_words = ["report", "mri", "x-ray", "xray", "ct scan", "scan", "ultrasound",
                     "blood test", "lab", "x ray", "imaging", "film", "result"]
     has_any_report_word = any(w in lowered for w in report_words)
-    asking_about_reports = any(w in context_question.lower() for w in report_words) if context_question else False
+    _cq_str = str(context_question) if not isinstance(context_question, str) else context_question
+    asking_about_reports = any(w in _cq_str.lower() for w in report_words) if _cq_str else False
 
     if not has_any_report_word and not asking_about_reports:
         # No report-related content in input or context → definitely null, skip LLM

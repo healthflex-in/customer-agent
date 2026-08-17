@@ -3,9 +3,8 @@ InterviewState — the single source of truth that flows through the LangGraph g
 Replaces the scattered self.* fields on HealthAgent.
 """
 from typing import TypedDict, Optional, Literal
-import copy
 
-from src.prompts import get_medical_form_template
+from src.forms.loader import load_form as _load_form
 
 FormData = dict  # section -> {field: value}
 
@@ -52,6 +51,20 @@ class InterviewState(TypedDict):
     orchestrator_question_id: Optional[str]
     orchestrator_question_text: Optional[str]
 
+    # ── Pre-computed next question (set by extract, consumed by generate) ──
+    pending_question: Optional[str]
+
+    # ── MCP question recommendations (dev only, set on first turn) ──────────
+    mcp_questions: Optional[list]
+
+    # ── Tagged-questions batched turns (set once at start_interview) ─────────
+    tagged_turns: Optional[list]        # list of pre-batched question strings
+    tagged_turn_metas: Optional[list]   # parallel list of {type, options, question_id} dicts
+    tagged_turn_index: int              # next turn to use (incremented by generate_question)
+    tagged_cleanup_done: bool           # True after the cleanup pass (now unused)
+    tagged_form_template: Optional[dict]  # scale → {question: ""}
+    tagged_question_meta: Optional[dict]  # scratch: meta for the current turn's question
+
     # ── Output ─────────────────────────────────────────────────
     response_text: str
     request_attachment: bool   # True when the frontend should show the upload button
@@ -59,7 +72,7 @@ class InterviewState(TypedDict):
 
 def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: str = "") -> InterviewState:
     """Return a blank InterviewState for a new interview. Replaces HealthAgent.init_form()."""
-    fresh_form = copy.deepcopy(get_medical_form_template())
+    fresh_form = _load_form("FRM-01").empty_form()
     form_sections = list(fresh_form.keys())
     from src.prompts import WELCOME_PROMPT
     return InterviewState(
@@ -86,6 +99,14 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         correction_data=None,
         orchestrator_question_id=None,
         orchestrator_question_text=None,
+        pending_question=None,
+        mcp_questions=None,
+        tagged_turns=None,
+        tagged_turn_metas=None,
+        tagged_turn_index=0,
+        tagged_cleanup_done=False,
+        tagged_form_template=None,
+        tagged_question_meta=None,
         response_text="",
         request_attachment=False,
     )

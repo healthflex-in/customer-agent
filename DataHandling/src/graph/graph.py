@@ -57,7 +57,7 @@ def create_checkpointer():
     return None
 
 
-def build_interview_graph(llm_complete, system_prompt, predefined_questions, save_customer_info_fn=None, checkpointer=None, reasoning_llm=None):
+def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=None, checkpointer=None, reasoning_llm=None):
     """
     Build and compile the LangGraph StateGraph for the medical interview.
 
@@ -68,7 +68,7 @@ def build_interview_graph(llm_complete, system_prompt, predefined_questions, sav
     graph = StateGraph(InterviewState)
 
     # ── Register nodes ────────────────────────────────────────────────────────
-    graph.add_node("handle_first_turn", make_handle_first_turn_node(llm_complete, predefined_questions, WELCOME_PROMPT, reasoning_llm=reasoning_llm))
+    graph.add_node("handle_first_turn", make_handle_first_turn_node(llm_complete, WELCOME_PROMPT, reasoning_llm=reasoning_llm))
     # Combined node: extraction + gap-fill + intent classification (concurrent)
     graph.add_node("extract_form_data", make_extract_form_data_node(llm_complete, reasoning_llm=reasoning_llm))
     # classify_intent is now a no-op stub (logic merged into extract_form_data)
@@ -77,7 +77,7 @@ def build_interview_graph(llm_complete, system_prompt, predefined_questions, sav
     graph.add_node("advance_section", make_advance_section_node())
     graph.add_node("detect_correction", make_detect_correction_node(llm_complete))
     graph.add_node("apply_correction", make_apply_correction_node(llm_complete))
-    graph.add_node("generate_question", make_generate_question_node(llm_complete, system_prompt, predefined_questions))
+    graph.add_node("generate_question", make_generate_question_node(llm_complete, system_prompt))
     graph.add_node("generate_summary", make_generate_summary_node(llm_complete))
     graph.add_node("classify_summary_intent", make_classify_summary_intent_node(llm_complete))
     graph.add_node("handle_summary_response", make_handle_summary_response_node(llm_complete))

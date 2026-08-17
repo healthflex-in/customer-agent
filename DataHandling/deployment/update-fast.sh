@@ -37,45 +37,36 @@ chmod 400 "$KEY_FILE"
 # Use rsync to sync only code files directly
 echo -e "${YELLOW}Syncing code files to EC2...${NC}"
 
-rsync -avz --progress \
-    -e "ssh -i $KEY_FILE" \
-    --exclude='venv' \
-    --exclude='__pycache__' \
-    --exclude='.git' \
-    --exclude='*.pyc' \
-    --exclude='.DS_Store' \
-    --exclude='audio_files' \
-    --exclude='transcripts' \
-    --exclude='tts_cache' \
-    --exclude='received_audio' \
-    --exclude='db' \
-    --exclude='output' \
-    --exclude='node_modules' \
-    --exclude='*.log' \
-    --exclude='.env' \
-    DataHandling/ "${EC2_USER}@${EC2_HOST}:${REMOTE_DIR}/DataHandling/"
+RSYNC_OPTS="-avz --progress -e \"ssh -i $KEY_FILE\" --exclude=venv --exclude=__pycache__ --exclude=.git --exclude='*.pyc' --exclude=.DS_Store --exclude=audio_files --exclude=transcripts --exclude=tts_cache --exclude=received_audio --exclude=db --exclude=output --exclude=node_modules --exclude='*.log' --exclude=.env"
 
-echo -e "${GREEN}✓ Code files synced${NC}"
+# Sync to prod path (DataHandling/)
+eval rsync $RSYNC_OPTS DataHandling/ "${EC2_USER}@${EC2_HOST}:${REMOTE_DIR}/DataHandling/"
+
+# Also sync to dev path (DataHandling_dev/) — dev container reads from here
+eval rsync $RSYNC_OPTS DataHandling/ "${EC2_USER}@${EC2_HOST}:${REMOTE_DIR}/DataHandling_dev/"
+
+echo -e "${GREEN}✓ Code files synced (prod + dev)${NC}"
 
 # Restart container to pick up changes (no rebuild needed)
 echo -e "${YELLOW}Restarting container...${NC}"
 
 ssh -i "$KEY_FILE" "${EC2_USER}@${EC2_HOST}" bash -s << 'ENDSSH'
     cd ~/healthflex-agent
-    
-    # Set permissions
-    sudo chown -R ubuntu:ubuntu DataHandling/ 2>/dev/null || true
-    chmod -R 755 DataHandling/ 2>/dev/null || true
 
-    # Clear Python bytecode cache — stale .pyc files cause old code to run
-    # even after source files are updated via rsync
+    # Set permissions
+    sudo chown -R ubuntu:ubuntu DataHandling/ DataHandling_dev/ 2>/dev/null || true
+    chmod -R 755 DataHandling/ DataHandling_dev/ 2>/dev/null || true
+
+    # Clear Python bytecode cache for both paths
     find DataHandling/src -name "*.pyc" -delete 2>/dev/null || true
     find DataHandling/src -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+    find DataHandling_dev/src -name "*.pyc" -delete 2>/dev/null || true
+    find DataHandling_dev/src -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
     echo "✓ .pyc cache cleared"
 
-    # Restart container (code is mounted as volume, so changes are immediate)
-    echo "Restarting container..."
-    sudo docker-compose restart
+    # Restart both containers
+    echo "Restarting containers..."
+    docker restart customer-agent-dev customer-agent-prod 2>/dev/null || sudo docker-compose restart
     
     # Wait a moment
     sleep 2

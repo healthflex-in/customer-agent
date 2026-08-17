@@ -22,14 +22,14 @@ llama-index-core==0.12.25
 llama-index-llms-gemini==0.4.14
 llama-index-llms-google-genai==0.1.12
 
-# Google Cloud Services (auth + generative AI only — speech/aiplatform removed)
+# Google Cloud Services
 google-generativeai==0.8.5
+google-cloud-speech==2.31.1
 google-auth==2.39.0
 google-api-core==2.24.2
 
 # Audio Processing
 pydub==0.25.1
-faster-whisper>=1.0.0
 edge-tts>=6.1.9
 
 # Networking and gRPC
@@ -68,14 +68,14 @@ asgi-correlation-id>=4.3.4
 pydantic-settings>=2.8.1
 
 # Removed (not used in production):
-# - torch / torchaudio        (~1.4 GB) — audio/utils.py is never imported; server uses faster-whisper
+# - torch / torchaudio        (~1.4 GB) — audio/utils.py is never imported; STT now uses Google Cloud Speech
 # - transformers              (~400 MB) — same, only in unused audio/utils.py
 # - sentence-transformers     (~100 MB) — not imported anywhere
 # - huggingface-hub           (pulled by above)
 # - llama-index-embeddings-huggingface — needs torch; VectorStore never queried in graph path
 # - llama-index-vector-stores-chroma / chromadb — initialized but never queried in active path
 # - llama-index-llms-vertex   (~20 MB)  — not imported anywhere
-# - google-cloud-speech       (~50 MB)  — not imported anywhere
+# - google-cloud-speech       — re-added (STT backend switched from faster-whisper to Google Cloud STT)
 # - google-cloud-aiplatform   (~200 MB) — not imported anywhere
 # - arize-phoenix-*           (~100 MB) — not imported in production code
 # - openinference-instrumentation-vertexai/openai — Vertex/OpenAI not used

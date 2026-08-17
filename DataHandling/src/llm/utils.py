@@ -6,6 +6,7 @@ from llama_index.core import Settings
 from src.enums import ENUMS
 import json
 import os
+import time as _time
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -76,8 +77,9 @@ def final_form_filling(llm, prompt, history, form):
             json.dumps(history, indent=2), json.dumps(form, indent=2)
         )
 
-        # Use the proper method for completion
+        _t0 = _time.perf_counter()
         response = llm.complete(prompt_text)
+        print(f"[timing] final_form_filling_llm={(_time.perf_counter() - _t0) * 1000:.0f}ms")
 
         # Extract JSON part
         start = response.find("{")

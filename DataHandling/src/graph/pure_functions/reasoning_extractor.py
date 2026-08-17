@@ -12,7 +12,7 @@ import copy
 import json
 from typing import Callable, Optional
 
-from src.prompts import REASONING_EXTRACTOR_PROMPT
+from src.prompts import REASONING_EXTRACTOR_PROMPT, PROM_EXTRACTOR_PROMPT
 
 
 def _build_conversation_text(history: list, user_input: str) -> str:
@@ -32,6 +32,7 @@ def reasoning_extract(
     history: list,
     form: dict,
     reasoning_llm: Callable[[str], str],
+    is_prom: bool = False,
 ) -> Optional[dict]:
     """
     Use the reasoning LLM to read the full conversation and fill the form.
@@ -44,13 +45,18 @@ def reasoning_extract(
         current_form = copy.deepcopy(form)
         form_structure = json.dumps(current_form, indent=2)
 
-        prompt = REASONING_EXTRACTOR_PROMPT.format(
+        template = PROM_EXTRACTOR_PROMPT if is_prom else REASONING_EXTRACTOR_PROMPT
+        prompt = template.format(
             conversation=conversation,
             current_form=form_structure,
             form_structure=form_structure,
         )
 
+        import time as _time
+        _t0 = _time.perf_counter()
         raw = reasoning_llm(prompt).strip()
+        print(f"[timing] reasoning_extract_llm={(_time.perf_counter() - _t0) * 1000:.0f}ms "
+              f"prompt_chars={len(prompt)}")
 
         # Extract JSON from response
         start, end = raw.find("{"), raw.rfind("}")

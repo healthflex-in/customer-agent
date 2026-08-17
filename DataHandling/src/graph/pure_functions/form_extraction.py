@@ -4,6 +4,7 @@ Each function takes explicit parameters (form, llm_fn, prompts) — no self.* re
 """
 import json
 import copy
+import time as _time
 from typing import Callable, Optional
 
 from src.graph.pure_functions.form_validation import extract_json_from_response
@@ -65,7 +66,10 @@ def extract_form_data_from_text(
     )
 
     try:
+        _t0 = _time.perf_counter()
         llm_response = llm_complete(enhanced_prompt)
+        _extract_ms = (_time.perf_counter() - _t0) * 1000
+        print(f"[timing] form_extraction_llm={_extract_ms:.0f}ms section={current_section!r}")
         print("LLM FORMATTING RESPONSE:\n", llm_response)
         json_str = extract_json_from_response(llm_response)
 
@@ -76,7 +80,9 @@ def extract_form_data_from_text(
                 f"FORM STRUCTURE: {json.dumps(updated_form, indent=2)}\n\n"
                 f"Respond ONLY with valid JSON."
             )
+            _t0 = _time.perf_counter()
             json_str = extract_json_from_response(llm_complete(fallback))
+            print(f"[timing] form_extraction_llm_fallback={(_time.perf_counter() - _t0) * 1000:.0f}ms")
             if not json_str:
                 return updated_form
 
@@ -306,7 +312,9 @@ Respond with a JSON object:
         else:
             prompt = CORRECTION_DETECTION_PROMPT.format(user_input, json.dumps(form, indent=2))
 
+        _t0 = _time.perf_counter()
         raw = llm_complete(prompt)
+        print(f"[timing] correction_detect_llm={(_time.perf_counter() - _t0) * 1000:.0f}ms")
         json_str = extract_json_from_response(raw)
         if not json_str:
             return None

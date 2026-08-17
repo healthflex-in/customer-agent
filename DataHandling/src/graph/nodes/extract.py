@@ -251,6 +251,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     "response_text": brand_answer,
                     "is_correction_turn": False,
                     "reports_intent": {},
+                    "pending_question": None,
                 }
 
         # ── Fast heuristic — if it's a correction, skip extraction LLM entirely ──
@@ -260,6 +261,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 "history": new_history,
                 "is_correction_turn": True,
                 "reports_intent": None,
+                "pending_question": None,
             }
 
         # ── Visit context classification (fallback only) ──────────────────────
@@ -267,6 +269,31 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         current_visit_context = state.get("visit_context", "unknown")
         if current_visit_context == "unknown" and len(user_input.strip()) > 10:
             _visit_context_update = {"visit_context": _classify_visit_context(user_input, llm_complete)}
+            # ── MCP: fetch recommended questions for this case (dev only) ────────
+            # Runs only on the first substantive turn when visit context is resolved.
+            # MCP_URL env is set in docker-compose.dev.yml but NOT in production.
+            try:
+                from app.mcp_client import is_available, recommend_questions as mcp_recommend
+                if is_available():
+                    _visit_ctx = _visit_context_update.get("visit_context", "unknown")
+                    _complaint = form.get("Present Complaint", {}).get("Primary Complaint", "")
+                    _pain_loc = form.get("Pain Assessment", {}).get("Primary Location of Pain", "")
+                    _severity = form.get("Pain Assessment", {}).get("Severity (1-10)", "")
+                    _duration = form.get("Present Complaint", {}).get("Duration of the Issue", "")
+                    _parts = [f"visit_type={_visit_ctx}"]
+                    if _complaint: _parts.append(f"complaint={_complaint}")
+                    if _pain_loc: _parts.append(f"location={_pain_loc}")
+                    if _severity: _parts.append(f"severity={_severity}/10")
+                    if _duration: _parts.append(f"duration={_duration}")
+                    if current_section: _parts.append(f"section={current_section}")
+                    _parts.append(f"patient_says={user_input[:200]}")
+                    _case_desc = " | ".join(_parts)
+                    _mcp_recs = mcp_recommend(_case_desc, limit=8)
+                    if _mcp_recs:
+                        _visit_context_update["mcp_questions"] = _mcp_recs
+                        print(f"[mcp] Loaded {len(_mcp_recs)} question recommendations from clinical-mcp")
+            except Exception as _mcp_err:
+                print(f"[mcp] Non-fatal: {_mcp_err}")
 
         # ── Detect complaint emerging in a general_assessment visit ──────────────
         # If the patient reveals a specific health complaint mid-general-visit,
@@ -345,12 +372,12 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         writer = get_stream_writer()
         writer({"stage": "Extracting medical details", "detail": current_section or "symptoms", "status": "active"})
 
+        _is_prom = bool(state.get("tagged_turns"))
+
         def _run_extraction():
             # No get_stream_writer() calls here — runs in a thread, context not available
             try:
                 # ── Reasoning extractor (primary path) ───────────────────────────────
-                # Uses gemini-2.5-flash to read the full conversation and fill the form
-                # with genuine understanding — not keyword rules.
                 if reasoning_llm is not None:
                     from src.graph.pure_functions.reasoning_extractor import reasoning_extract
                     reasoned = reasoning_extract(
@@ -358,6 +385,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                         history=history,
                         form=form,
                         reasoning_llm=reasoning_llm,
+                        is_prom=_is_prom,
                     )
                     if reasoned is not None:
                         return ("reasoning", reasoned)
@@ -385,13 +413,32 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 context_question=last_agent_q,
             )
 
-        # Intent classification has a fast-path for most turns (no LLM needed),
-        # so the overhead of a thread is only paid when the LLM is actually called.
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        def _run_question():
+            # Skip prefetch in PROM/tagged mode — generate_question uses pre-batched turns
+            if _is_prom:
+                return None
+            # Pre-compute the next question concurrently with extraction.
+            try:
+                from src.graph.nodes.generate import (
+                    _generate_intelligent_question,
+                    _VISIT_CONTEXT_DESCRIPTIONS,
+                )
+                _hist = history + [{"role": "user", "message": user_input}]
+                _visit_ctx = state.get("visit_context", "unknown")
+                return _generate_intelligent_question([], _hist, _visit_ctx, form, llm_complete)
+            except Exception as _e:
+                print(f"[question_prefetch] Non-fatal: {_e}")
+                return None
+
+        # All three run concurrently: extraction (slow), intent (fast), question (slow).
+        # Total wait = max of the three instead of sum of extraction + question.
+        with ThreadPoolExecutor(max_workers=3) as pool:
             fut_extract = pool.submit(_run_extraction)
             fut_intent = pool.submit(_run_intent)
+            fut_question = pool.submit(_run_question)
             _extract_result = fut_extract.result()
             reports_intent = fut_intent.result()
+            pending_q = fut_question.result()
 
         # Unpack the tagged extraction result and log it in the main thread
         _extract_method, updated_form = _extract_result if isinstance(_extract_result, tuple) else ("failed", form)
@@ -403,12 +450,14 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         # ── Inline gap-fill (replaces classify_unanswered_fields LLM call) ───────
         # Only triggers when there are still missing fields after extraction,
         # using a single focused LLM call limited to the current section.
+        # Skipped for reasoning extraction — the reasoning model already does
+        # a comprehensive fill, so running gap_fill on top is redundant.
         missing = [
             f for f in validate_section(updated_form, current_section)
             if "(If Any)" not in f and "(Optional)" not in f
         ]
 
-        if missing:
+        if _extract_method != "reasoning" and missing:
             last_agent_q = ""
             for entry in reversed(history):
                 if entry.get("role") == "agent":
@@ -584,11 +633,9 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                 result_extra = {}
 
         # ── Comprehensive fill for long/detailed responses ────────────────────────
-        # When the user gives a detailed answer (>100 chars) that likely covers many
-        # fields, run FINAL_FORM_FILL_PROMPT over the full conversation to extract
-        # everything — not just what the regular extractor caught.
-        # This handles cases like comprehensive first answers that cover all topics.
-        if len(user_input.strip()) > 100:
+        # Only runs on format_prompt extraction (not reasoning) because the reasoning
+        # model already extracts comprehensively from full conversation context.
+        if _extract_method != "reasoning" and len(user_input.strip()) > 100:
             _still_empty = sum(
                 1 for sec in updated_form.values()
                 if isinstance(sec, dict)
@@ -630,6 +677,7 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
             "history": new_history,
             "is_correction_turn": False,
             "reports_intent": reports_intent,
+            "pending_question": pending_q,
         }
         if _visit_context_update:
             result.update(_visit_context_update)

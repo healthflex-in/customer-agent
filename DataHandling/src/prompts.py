@@ -92,7 +92,7 @@ If not, you can exit for now, but please come back and complete this before your
 """
 
 INTERVIEW_DECLINED_PROMPT = """
-No problem. You can return to this interview whenever you're ready. 
+No problem. You can return to this interview whenever you're ready.
 Your health information is important, and I'm here to assist you when it's convenient for you.
 """
 
@@ -100,19 +100,29 @@ DEFAULT_ANSWER = """
 I understand. Let's continue with the next question to gather more information about your health.
 """
 
-SYSTEM_PROMPT = """
-You are an intelligent medical assistant tasked with gathering comprehensive information about a patient's medical history, pain assessment, and treatment goals.
+# ── Form definition — loaded from data/forms/FRM-01.md ───────────────────────
+# Edit questions, sections, and visit rules in that file; no Python changes needed.
+
+from src.forms.loader import load_form as _load_form
+
+# Backward-compat exports (imported by functionalities.py, server.py, state.py)
+PREDEFINED_QUESTIONS = _load_form("FRM-01").predefined_as_tuples()
+MEDICAL_FORM_TEMPLATE = _load_form("FRM-01").empty_form()
+GENERAL_VISIT_Q1 = _load_form("FRM-01").general_visit_q1
+
+
+def get_medical_form_template() -> dict:
+    """Return a fresh blank form dict. Always call this — never mutate the module-level constant."""
+    return _load_form("FRM-01").empty_form()
+
+SYSTEM_PROMPT = """You are an intelligent medical assistant tasked with gathering comprehensive information about a patient's medical history, pain assessment, and treatment goals.
 Your goal is to ask relevant questions, record responses accurately, and ensure all critical details are collected in a structured format.
 Be empathetic and professional at all times. Keep your responses focused on the medical interview.
 If the user says something wildly irrelevant or uses profanity, politely guide them back to the interview process.
 Always be extremely professional and considerate.
 
 IMPORTANT: You must also detect when users want to correct previously provided information. Listen for phrases like:
-- "I made a mistake"
-- "Actually, it was..."
-- "No, I meant..."
-- "Let me correct that"
-- "Sorry, I said X but it's actually Y"
+- "I made a mistake" / "Actually, it was..." / "No, I meant..." / "Sorry, I said X but it's actually Y"
 When you detect a correction, identify what needs to be changed and update the form accordingly.
 """
 
@@ -132,103 +142,6 @@ Extract the information from the user's response and structure it according to t
 Example output format:
 {}
 """
-
-# ──────────────────────────────────────────────────────────────
-# GENERAL VISIT — no specific complaint, skip pain/complaint questions
-# ──────────────────────────────────────────────────────────────
-GENERAL_VISIT_Q1 = (
-    "Welcome! Happy to learn more about you so we can make the most of your visit.\n\n"
-    "• Do you have any existing health conditions (e.g. diabetes, BP, thyroid) or past surgeries/fractures?\n"
-    "• What's your lifestyle like — do you exercise regularly or have a physically active job? Do you smoke or drink?\n"
-    "• What are you hoping to get out of your visit today — any wellness goals, posture concerns, or things you'd like to explore?\n"
-    "• How did you come to know about Stance Health? (Friend/family, Google, Instagram, etc.)"
-)
-
-# ──────────────────────────────────────────────────────────────
-# HIGH-YIELD 3 QUESTIONS → FILLS 95%+ OF FORM ACCURATELY
-# ──────────────────────────────────────────────────────────────
-PREDEFINED_QUESTIONS = [
-    (
-        "Initial Comprehensive Interview",
-        "To help me understand your situation, I'd like to ask you a few questions. Please share as much detail as you can:\n\n"
-        "• What exactly is bothering you right now (pain, stiffness, weakness, swelling, etc.), where do you feel it, and how severe is it on a scale of 0 to 10?\n"
-        "• How long have you been experiencing this, and how did it start (suddenly after an injury or gradually)?\n"
-        "• What makes it worse or better (any movement, position, time of day, rest, etc.)?\n"
-        "• Have you consulted any doctor, physiotherapist, or hospital for this before? If yes, what did they say and what treatment was prescribed?\n"
-        "• Do you have any other health conditions, past surgeries, or do you smoke or drink? Also, do you have any MRI, X-ray, CT scan, or blood reports related to this issue?\n"
-        "• What are your goals with treatment - what would you like to be able to do in the next 3 months and long-term? Also, how did you come to know about us?",
-    ),
-    (
-        "Past Treatment & History/Diagnostics",
-        "Have you consulted any doctor, physiotherapist, or hospital for this same problem before?\n"
-        "If yes:\n"
-        "• What did they diagnose or say was the issue?\n"
-        "• What treatment, medicines, injections, or exercises were prescribed?\n"
-        "• Did it help at all, and what is the current status of your issue (improved, same, or worse)?\n\n"
-        "Now about your overall health, lifestyle, and any reports:\n"
-        "• Do you have any other health conditions like diabetes, high blood pressure, thyroid, heart issues, or any past surgeries or fractures?\n"
-        "• Do you smoke or drink alcohol regularly?\n"
-        "• Do you exercise or have a physically active/demanding job?\n"
-        "• Do you have any MRI, X-ray, CT scan, or blood reports related to this issue?",
-    ),
-    (
-        "Goals & Referral",
-        "What are your goals with treatment?\n"
-        "• In the next 3 months, what would you like to be able to do?\n"
-        "• Long-term, what is your ultimate goal (e.g., walk without pain, play sports, climb stairs easily, etc.)?\n"
-        "• What are your specific expectations from this treatment?\n\n"
-        "How did you come to know about us? (Friend/family referral, Google, Instagram, Facebook, YouTube, etc.)",
-    ),
-]
-
-# ──────────────────────────────────────────────────────────────
-# EXACT SAME TEMPLATE STRUCTURE (unchanged keys)
-# ──────────────────────────────────────────────────────────────
-def get_medical_form_template():
-    """
-    Return a fresh copy of the medical form template.
-    This function ensures we always get a clean template that hasn't been mutated.
-    CRITICAL: Always use this function instead of accessing MEDICAL_FORM_TEMPLATE directly
-    to prevent data leakage between users.
-    """
-    import copy
-    return copy.deepcopy(_MEDICAL_FORM_TEMPLATE_BASE)
-
-# Base template (private - should not be accessed directly)
-_MEDICAL_FORM_TEMPLATE_BASE = {
-    "Present Complaint": {
-        "Primary Complaint": "",
-        "Duration of the Issue": "",
-        "Onset (Gradual or Sudden)": "",
-        "Mechanism of Injury or Cause": "",
-    },
-    "Previous Consultations": {
-        "Previous Diagnosis or Advice and Prescribed Treatment Taken": "",
-        "Current Status of Issue (Improved, Same, Worse)": "",
-    },
-    "Pain Assessment": {
-        "Primary Location of Pain": "",
-        "Severity (1-10)": "",
-        "Aggravating Factors": "",
-        "Relieving Factors": "",
-    },
-    "History & Diagnostics": {
-        "Systemic Illness and Surgical History": "",
-        "Current Lifestyle": "",
-        "Reports": "",
-    },
-    "Treatment Goals": {
-        "Short-Term Goals (within 3 months)": "",
-        "Long-Term Goals (after 3 months)": "",
-        "Specific Expectations from Treatment": "",
-    },
-    "Referral": {
-        "Source": "",
-    },
-}
-
-# Public constant for backward compatibility (but use get_medical_form_template() instead)
-MEDICAL_FORM_TEMPLATE = _MEDICAL_FORM_TEMPLATE_BASE
 
 # ──────────────────────────────────────────────────────────────
 # REASONING EXTRACTOR — replaces FORMAT_PROMPT multi-pass stack
@@ -293,6 +206,40 @@ Referral:
 - Interpret goals, desires, and aspirations broadly: anything the patient wants to achieve, feel, or be able to do is a treatment goal.
 - For general_assessment visits, pre-fill complaint and pain sections with "Not applicable — general visit"
 - Leave truly unknown fields as empty string ""
+- Return ONLY valid JSON matching the exact structure below. No explanation, no markdown.
+
+Fill this structure:
+{form_structure}"""
+
+# ──────────────────────────────────────────────────────────────
+# PROM EXTRACTOR — used for FRM-02 / tagged-questions sessions
+# Extracts patient-reported outcome measure responses from conversation
+# ──────────────────────────────────────────────────────────────
+PROM_EXTRACTOR_PROMPT = """You are a clinical data analyst extracting patient-reported outcome measure (PROM) responses from a conversation.
+
+Read the entire conversation below and fill each PROM field with the patient's answer.
+
+## Full Conversation
+{conversation}
+
+## Current PROM Form (partially filled)
+{current_form}
+
+## Instructions
+
+Each section is a validated clinical outcome scale:
+- **Oxford Hip Score (OHS)** / **Oxford Shoulder Score (OSS)**: Joint function over the past 4 weeks. Typical responses: none / very mild / mild / moderate / severe — or — never / rarely / sometimes / very often / always.
+- **PHQ-9 (Depression)**: Frequency of symptoms over the past 2 weeks: not at all / several days / more than half the days / nearly every day.
+- **GAD-7 (Anxiety)**: Same frequency scale as PHQ-9.
+- **Numeric Pain Scale (NPS)**: Patient rates pain 0–10.
+- **RMDQ (Back Disability)**: Yes/No — whether back pain limits each activity.
+- **Other scales**: Extract the patient's response as stated.
+
+Rules:
+- Store the patient's actual response verbatim or as a concise paraphrase (e.g. "Moderate", "Sometimes", "7/10", "Yes — I avoid stairs").
+- If the patient answered a question conversationally, map it to the right field.
+- Leave as empty string "" if genuinely not answered yet.
+- Never fabricate answers. Never copy from already-filled fields.
 - Return ONLY valid JSON matching the exact structure below. No explanation, no markdown.
 
 Fill this structure:
