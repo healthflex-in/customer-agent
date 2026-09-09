@@ -47,13 +47,14 @@ def check_health() -> None:
 
 
 def check_users_endpoint() -> None:
-    step("GET /api/users")
+    step("GET /api/users — unauthenticated access boundary")
     r = requests.get(f"{BASE_URL}/api/users", timeout=TIMEOUT)
-    # Either 200 with list shape, or 503 if Mongo unconfigured. Both are
-    # "the route is wired" — what we don't want is 404 / 500.
-    if r.status_code not in (200, 503):
-        fail(f"unexpected {r.status_code}: {r.text[:200]}")
-    ok(f"{r.status_code} — {r.text[:120]}")
+    # The endpoint contains patient data and must fail closed before attempting
+    # a database operation. Authenticated integration tests use a deliberately
+    # provisioned non-production identity and dataset instead of this smoke test.
+    if r.status_code != 401:
+        fail(f"expected 401, got {r.status_code}: {r.text[:200]}")
+    ok("401 Unauthorized — protected patient route fails closed")
 
 
 async def ws_protocol_check() -> None:

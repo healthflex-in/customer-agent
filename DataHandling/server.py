@@ -1,437 +1,3 @@
-# from fastapi import FastAPI, WebSocket
-# import uvicorn
-# import asyncio
-# import numpy as np
-# import whisper
-# import torch
-# import wave
-# import time
-# import os
-# import base64
-# import io
-# import json
-# from pathlib import Path
-# import gtts  # Google Text-to-Speech
-# from pydub import AudioSegment  # For audio conversion
-
-# # Import HealthAgent and related functionalities
-# from src.llm.functionalities import HealthAgent
-
-# app = FastAPI()
-
-# # Create directories for saving audio and transcripts
-# os.makedirs("audio_files", exist_ok=True)
-# os.makedirs("tts_cache", exist_ok=True)
-# os.makedirs("transcripts", exist_ok=True)
-
-# # Load Whisper model
-# print("Loading Whisper model...")
-# cuda_device = "cuda" if torch.cuda.is_available() else "cpu"
-# model = whisper.load_model("base", device=cuda_device)
-# print(f"Model loaded on {cuda_device}")
-
-# # Initialize HealthAgent
-# print("Initializing HealthAgent...")
-# health_agent = HealthAgent()
-# print("HealthAgent initialized")
-
-# # Audio parameters
-# RATE = 16000  # 16kHz
-# SAMPLE_WIDTH = 2  # 16-bit PCM = 2 bytes per sample
-# MAX_CHUNK_SIZE = 65536  # 64KB per message - well below WebSocket limits
-
-
-# def save_audio(file_name, audio_data):
-#     """Save audio data to WAV file for debugging"""
-#     with wave.open(file_name, "wb") as wf:
-#         wf.setnchannels(1)  # Mono
-#         wf.setsampwidth(SAMPLE_WIDTH)
-#         wf.setframerate(RATE)
-#         wf.writeframes(audio_data)
-
-
-# def text_to_speech(text, cache_dir="tts_cache", max_length=500, speed_factor=1.7):
-#     """
-#     Convert text to speech using Google TTS and return as WAV bytes
-#     Uses caching to avoid regenerating the same messages
-
-#     Args:
-#         text: Text to convert to speech
-#         cache_dir: Directory to cache audio files
-#         max_length: Maximum text length to process at once (to avoid large files)
-#         speed_factor: Speed up the audio by this factor (higher = faster)
-#     """
-#     # Limit text length to avoid huge audio files
-#     if len(text) > max_length:
-#         print(
-#             f"Warning: Text length ({len(text)}) exceeds maximum ({max_length}). Truncating..."
-#         )
-#         # Truncate at a sentence boundary if possible
-#         truncation_point = text[:max_length].rfind(".")
-#         if truncation_point == -1:
-#             # If no sentence boundary, truncate at a space
-#             truncation_point = text[:max_length].rfind(" ")
-
-#         if (
-#             truncation_point > max_length // 2
-#         ):  # Only use truncation if we can keep at least half
-#             text = text[: truncation_point + 1]
-#         else:
-#             text = text[:max_length]
-
-#     # Create a hash of the text for caching
-#     import hashlib
-
-#     text_hash = hashlib.md5((text + f"_speed{speed_factor}").encode()).hexdigest()
-#     cache_file = Path(cache_dir) / f"{text_hash}.wav"
-
-#     # Check if we already have this audio cached
-#     if cache_file.exists():
-#         print(f"Using cached audio for: {text[:30]}...")
-#         with open(cache_file, "rb") as f:
-#             return f.read()
-
-#     # Generate new TTS audio
-#     print(f"Generating TTS for: {text[:30]}...")
-#     tts = gtts.gTTS(text=text, lang="en", slow=False)
-
-#     # Save as MP3 first (gtts only outputs MP3)
-#     mp3_io = io.BytesIO()
-#     tts.write_to_fp(mp3_io)
-#     mp3_io.seek(0)
-
-#     # Convert to WAV with parameters matching our audio system
-#     # Apply speed factor to make speech faster
-#     mp3_audio = AudioSegment.from_mp3(mp3_io)
-#     wav_audio = (
-#         mp3_audio.set_frame_rate(RATE).set_channels(1).set_sample_width(SAMPLE_WIDTH)
-#     )
-
-#     # Apply speedup
-#     if speed_factor > 1.0:
-#         wav_audio = wav_audio.speedup(playback_speed=speed_factor)
-
-#     # Save WAV to cache
-#     wav_io = io.BytesIO()
-#     wav_audio.export(wav_io, format="wav")
-#     wav_data = wav_io.getvalue()
-
-#     # Save to cache file
-#     with open(cache_file, "wb") as f:
-#         f.write(wav_data)
-
-#     return wav_data
-
-
-# async def stream_audio_to_client(websocket, audio_data, message_id):
-#     """Stream audio data to client in small chunks to avoid WebSocket size limits"""
-#     chunk_size = MAX_CHUNK_SIZE  # Much smaller than the WebSocket limit
-#     total_size = len(audio_data)
-#     num_chunks = (total_size + chunk_size - 1) // chunk_size  # Ceiling division
-
-#     print(f"Streaming {total_size} bytes of audio in {num_chunks} chunks")
-
-#     # Signal the start of audio streaming
-#     await websocket.send_text(
-#         json.dumps(
-#             {"type": "audio_start", "message_id": message_id, "total_size": total_size}
-#         )
-#     )
-
-#     # Send the audio in chunks
-#     for i in range(0, total_size, chunk_size):
-#         end = min(i + chunk_size, total_size)
-#         chunk = audio_data[i:end]
-
-#         # Encode chunk as base64 to send as JSON
-#         chunk_b64 = base64.b64encode(chunk).decode("utf-8")
-
-#         await websocket.send_text(
-#             json.dumps(
-#                 {
-#                     "type": "audio_chunk",
-#                     "message_id": message_id,
-#                     "data": chunk_b64,
-#                     "is_last": end == total_size,
-#                 }
-#             )
-#         )
-
-#         # Short delay to avoid flooding
-#         await asyncio.sleep(0.01)
-
-#     print(f"Finished streaming audio for message {message_id}")
-
-
-# @app.websocket("/ws")
-# async def websocket_endpoint(websocket: WebSocket):
-#     await websocket.accept()
-#     print("Client connected")
-
-#     # Store client-specific state
-#     client_state = {
-#         "session_id": f"session_{int(time.time())}",
-#         "first_interaction": True,
-#         "is_recording": False,
-#         "received_audio_buffer": bytearray(),
-#         "recording_start_time": None,
-#     }
-
-#     # Initialize conversation history
-#     if not hasattr(health_agent, "history"):
-#         health_agent.history = []
-
-#     # Send welcome message as soon as client connects - using prompt from prompts.py
-#     from src.prompts import WELCOME_PROMPT, READY_TO_START_PROMPT
-
-#     # Get the initial message from HealthAgent
-#     if health_agent.talk_mode == "START":
-#         welcome_text = WELCOME_PROMPT.strip()
-#         # Add the "ready to start" question
-#         welcome_text += "\n\n" + READY_TO_START_PROMPT.strip()
-#     else:
-#         # If agent was already in a conversation, get the next question
-#         welcome_text = health_agent.main_processor("")
-
-#     # Calculate progress for interview state
-#     progress = 0
-#     if health_agent.predefined_questions:
-#         progress = min(
-#             100, (health_agent.idx / len(health_agent.predefined_questions) * 100)
-#         )
-
-#     # Send welcome text first
-#     await websocket.send_text(
-#         json.dumps(
-#             {
-#                 "type": "text_message",
-#                 "text": welcome_text,
-#                 "session_id": client_state["session_id"],
-#                 "interview_state": {
-#                     "section": health_agent.current_section,
-#                     "progress": progress,
-#                     "missing_fields": health_agent.missing_fields,
-#                 },
-#             }
-#         )
-#     )
-
-#     # Generate welcome audio
-#     welcome_audio = text_to_speech(welcome_text)
-
-#     # Then stream welcome audio
-#     await stream_audio_to_client(websocket, welcome_audio, "welcome_message")
-
-#     # Main WebSocket loop
-#     try:
-#         while True:
-#             # Receive message from client
-#             message = await websocket.receive()
-
-#             # Handle text messages (JSON control messages)
-#             if "text" in message:
-#                 try:
-#                     data = json.loads(message["text"])
-#                     msg_type = data.get("type", "")
-
-#                     if msg_type == "audio_start":
-#                         # Client is starting to send audio
-#                         client_state["is_recording"] = True
-#                         client_state["received_audio_buffer"] = bytearray()
-#                         client_state["recording_start_time"] = data.get(
-#                             "timestamp", time.time()
-#                         )
-#                         print("Client started sending audio")
-
-#                     elif msg_type == "audio_end":
-#                         # Client has finished sending audio
-#                         client_state["is_recording"] = False
-
-#                         # Process the accumulated audio
-#                         audio_bytes = client_state["received_audio_buffer"]
-#                         audio_duration = data.get("duration", 0)
-#                         print(
-#                             f"Received complete audio: {len(audio_bytes)} bytes, duration: {audio_duration:.2f}s"
-#                         )
-
-#                         # Skip processing if not enough audio data received
-#                         if (
-#                             len(audio_bytes) < RATE * SAMPLE_WIDTH * 0.5
-#                         ):  # At least 0.5 seconds
-#                             print(
-#                                 f"Audio too short ({len(audio_bytes)} bytes), skipping"
-#                             )
-#                             await websocket.send_text(
-#                                 json.dumps(
-#                                     {
-#                                         "type": "error",
-#                                         "text": "Audio too short to process",
-#                                     }
-#                                 )
-#                             )
-#                             continue
-
-#                         # Save received audio for debugging
-#                         timestamp = int(time.time())
-#                         file_path = f"audio_files/server_received_{timestamp}.wav"
-#                         save_audio(file_path, audio_bytes)
-#                         print(f"Saved audio to {file_path}")
-
-#                         # Process audio with Whisper
-#                         try:
-#                             np_audio = (
-#                                 np.frombuffer(audio_bytes, dtype=np.int16).astype(
-#                                     np.float32
-#                                 )
-#                                 / 32768.0
-#                             )
-
-#                             # Skip if audio appears to be empty or corrupted
-#                             if np_audio.size == 0 or np.max(np.abs(np_audio)) < 0.01:
-#                                 print(
-#                                     "⚠️ Audio seems silent or corrupted, skipping transcription"
-#                                 )
-#                                 await websocket.send_text(
-#                                     json.dumps(
-#                                         {
-#                                             "type": "error",
-#                                             "text": "Audio too quiet or corrupted",
-#                                         }
-#                                     )
-#                                 )
-#                                 continue
-
-#                             # Process with Whisper
-#                             audio = whisper.pad_or_trim(np_audio)
-#                             mel = whisper.log_mel_spectrogram(audio).to(model.device)
-
-#                             # Detect language
-#                             _, probs = model.detect_language(mel)
-#                             detected_lang = max(probs, key=probs.get)
-#                             print(
-#                                 f"Detected language: {detected_lang} (confidence: {probs[detected_lang]:.2f})"
-#                             )
-
-#                             # Decode audio
-#                             options = whisper.DecodingOptions(
-#                                 fp16=torch.cuda.is_available()
-#                                 and cuda_device == "cuda",
-#                                 language="en",  # Use detected_lang for multi-language support
-#                             )
-#                             result = whisper.decode(model, mel, options)
-
-#                             # Extract transcription
-#                             transcription = result.text.strip()
-#                             print(f"✅ Transcription: {transcription}")
-
-#                             # Save transcript for reference
-#                             transcript_path = f"transcripts/transcript_{timestamp}.txt"
-#                             with open(transcript_path, "w") as f:
-#                                 f.write(transcription)
-
-#                             # Process the transcription with HealthAgent
-#                             response_text = health_agent.main_processor(transcription)
-
-#                             # Check if we should save the form state (e.g., after completing a section)
-#                             if health_agent.talk_mode != "START":
-#                                 health_agent.save_progress()
-
-#                             # Log the current state of the interview
-#                             current_section = health_agent.current_section
-#                             progress = 0
-#                             if health_agent.form_sections:
-#                                 current_index = health_agent.form_sections.index(
-#                                     current_section
-#                                 )
-#                                 total_sections = len(health_agent.form_sections)
-#                                 progress = (current_index / total_sections) * 100
-
-#                             print(
-#                                 f"Current section: {current_section}, Progress: {progress:.1f}%"
-#                             )
-
-#                             # Log missing fields if any
-#                             if health_agent.missing_fields:
-#                                 print(f"Missing fields: {health_agent.missing_fields}")
-
-#                             # Calculate progress for the interview state
-#                             progress = 0
-#                             if health_agent.predefined_questions:
-#                                 progress = min(
-#                                     100,
-#                                     (
-#                                         health_agent.idx
-#                                         / len(health_agent.predefined_questions)
-#                                         * 100
-#                                     ),
-#                                 )
-
-#                             # Send response text first
-#                             await websocket.send_text(
-#                                 json.dumps(
-#                                     {
-#                                         "type": "text_message",
-#                                         "text": response_text,
-#                                         "session_id": client_state["session_id"],
-#                                         "interview_state": {
-#                                             "section": health_agent.current_section,
-#                                             "progress": progress,
-#                                             "missing_fields": health_agent.missing_fields,
-#                                         },
-#                                     }
-#                                 )
-#                             )
-
-#                             # Convert response to audio with faster speed
-#                             response_audio = text_to_speech(
-#                                 response_text, speed_factor=1.3
-#                             )
-
-#                             # Then stream response audio
-#                             message_id = f"response_{timestamp}"
-#                             await stream_audio_to_client(
-#                                 websocket, response_audio, message_id
-#                             )
-
-#                         except Exception as e:
-#                             print(f"Error processing audio: {e}")
-#                             await websocket.send_text(
-#                                 json.dumps(
-#                                     {"type": "error", "text": f"Error: {str(e)}"}
-#                                 )
-#                             )
-
-#                 except json.JSONDecodeError:
-#                     print(f"Error decoding JSON: {message['text'][:100]}...")
-#                 except Exception as e:
-#                     print(f"Error handling text message: {e}")
-
-#             # Handle binary messages (audio data)
-#             elif "bytes" in message:
-#                 if client_state["is_recording"]:
-#                     # Accumulate audio chunks
-#                     audio_chunk = message["bytes"]
-#                     client_state["received_audio_buffer"].extend(audio_chunk)
-
-#                     # Log progress
-#                     total_kb = len(client_state["received_audio_buffer"]) / 1024
-#                     chunk_kb = len(audio_chunk) / 1024
-#                     print(
-#                         f"Received audio chunk: {chunk_kb:.1f} KB, total: {total_kb:.1f} KB"
-#                     )
-#                 else:
-#                     print("Received unexpected binary data when not recording")
-
-#     except Exception as e:
-#         print(f"WebSocket error: {e}")
-#     finally:
-#         print("Client disconnected")
-
-
-# if __name__ == "__main__":
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
 from fastapi import (
     FastAPI,
     WebSocket,
@@ -440,37 +6,30 @@ from fastapi import (
     UploadFile,
     File,
     Form,
+    Header,
 )
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncio
-import numpy as np
 # faster_whisper removed — STT now uses Google Cloud Speech-to-Text (see app/audio/stt.py)
-import wave
 import time
 import os
-import base64
-import io
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import List, Optional
 import uuid
 from dotenv import load_dotenv
 load_dotenv()
-# Legacy imports (kept for compatibility even if audio streaming disabled)
-# import gtts  # Google Text-to-Speech — not in docker requirements, not used in active path
-from pydub import AudioSegment  # For audio conversion
-from pymongo import MongoClient
 from pymongo.collection import Collection
 from bson import ObjectId
 
 from upload.s3_client import (
+    download_bytes_from_s3,
     generate_object_key,
     is_s3_configured,
     upload_bytes_to_s3,
 )
-from docscanner.service import summarize_report_from_bytes
+from docscanner.service import inspect_report_upload
 
 # Import HealthAgent and related functionalities
 from src.llm.functionalities import HealthAgent
@@ -483,21 +42,101 @@ from app.config import (
     MONGO_DB_NAME,
     MONGO_USERS_COLLECTION,
     MONGO_CUSTOMER_INFO_COLLECTION,
+    MONGO_REPORT_JOBS_COLLECTION,
+    MONGO_CLINICAL_ESCALATIONS_COLLECTION,
+    MONGO_TLS_CA_FILE,
+    AUTH_SIGNING_SECRET,
+    AUTH_ISSUER,
+    AUTH_AUDIENCE,
+    AUTH_MAX_TOKEN_SECONDS,
+    AUTH_CLOCK_SKEW_SECONDS,
     CORS_ALLOWED_ORIGINS,
     AUDIO_RATE as RATE,
     AUDIO_SAMPLE_WIDTH as SAMPLE_WIDTH,
-    MAX_WS_CHUNK_SIZE as MAX_CHUNK_SIZE,
+    MAX_AUDIO_SESSION_BYTES,
+    MAX_AUDIO_SESSION_SECONDS,
     DEFAULT_FORM_ID,
     ALLOWED_ATTACHMENT_TYPES,
     MAX_ATTACHMENT_SIZE_MB,
+    MAX_ATTACHMENT_FILES,
+    MAX_ATTACHMENT_TOTAL_MB,
+    MAX_REPORT_TOTAL_PAGES,
+    REPORT_JOB_POLL_SECONDS,
+    REPORT_JOB_LEASE_SECONDS,
+    REPORT_JOB_MAX_ATTEMPTS,
+    REPORT_JOB_MAX_BACKLOG,
+    REPORT_JOB_RETRY_BASE_SECONDS,
+    REPORT_JOB_RETRY_MAX_SECONDS,
     UPLOAD_TRIGGER_PHRASE,
-    TTS_CACHE_DIR,
+)
+from app.db.connection import create_verified_mongo_client
+from app.ai.models import MODEL_REGISTRY
+from app.observability.ai_usage import PRICING_VERSION, gemini_usage, tracked_ai_call
+from app.audio.limits import audio_limit_error
+from app.runtime.blocking import run_blocking
+from app.uploads.policy import validate_upload_quotas
+from app.uploads.reading import read_upload_bounded
+from app.jobs.reports import (
+    FAILED as REPORT_JOB_FAILED,
+    build_report_job,
+    claim_report_job,
+    ensure_report_job_indexes,
+    mark_report_job_completed,
+    mark_report_job_failed,
+    renew_report_job_lease,
+    render_report_summary,
+)
+from app.forms.titles import build_form_title
+from app.forms.progress import (
+    calculate_form_progress,
+    calculate_section_completion_status,
+)
+from app.forms.lifecycle import (
+    COMPLETED as FORM_COMPLETED,
+    build_lifecycle_update_filter,
+    ensure_form_lifecycle_ttl_index,
+    resolve_form_lifecycle,
+)
+from app.forms.attempts import (
+    add_attempt_write_scope,
+    ensure_form_attempt_index,
+    resolve_form_attempt_id,
+)
+from app.forms.prom import advance_tagged_turn, parse_structured_prom_answers
+from app.forms.instruments import (
+    apply_prom_answers,
+    build_prom_snapshot,
+    is_immutable_prom_question,
+    questions_from_prom_snapshot,
+)
+from app.clinical.escalation import (
+    assess_urgent_risk,
+    ensure_escalation_indexes,
+    record_escalation,
+)
+from app.ws.idempotency import RecentRequestWindow, RequestDecision
+from app.observability.privacy import env_flag, error_type, pseudonymous_id
+from app.security.access_tokens import (
+    AuthConfigurationError,
+    AuthContext,
+    AuthorizationError,
+    TokenValidationError,
+    authorize_directory,
+    authorize_patient,
+    decode_access_token,
+    extract_bearer_token,
 )
 # Pure stateless helpers. Aliased to legacy names used throughout this file.
 from app.db.serializers import (
     normalize_user_id,
     serialize_datetime as _serialize_datetime,
     serialize_user,
+)
+from app.db.ownership import build_owned_form_filter
+from app.db.queries import (
+    build_user_form_queries,
+    collection_namespace,
+    empty_tagged_questions_result,
 )
 
 # Import MongoDB database connector
@@ -530,13 +169,9 @@ except ImportError:
 
 # ── Prometheus metrics ───────────────────────────────────────────────────────
 try:
-    from prometheus_client import Counter, Histogram, Gauge, make_asgi_app as _make_metrics_app
+    from prometheus_client import Gauge, make_asgi_app as _make_metrics_app
     from starlette_prometheus import PrometheusMiddleware
-    LLM_CALLS      = Counter('llm_calls_total', 'LLM calls', ['model', 'status'])
-    LLM_LATENCY    = Histogram('llm_latency_seconds', 'LLM latency', ['model'])
     WS_CONNECTIONS = Gauge('ws_active_connections', 'Active WebSocket sessions')
-    MODEL_FALLBACKS = Counter('model_fallbacks_total', 'Model rotation events', ['from_model', 'to_model'])
-    INTERVIEW_TURNS = Counter('interview_turns_total', 'Turns processed', ['phase'])
     _HAS_PROMETHEUS = True
 except ImportError:
     _HAS_PROMETHEUS = False
@@ -545,7 +180,7 @@ except ImportError:
         def dec(self, *a, **k): pass
         def observe(self, *a, **k): pass
         def labels(self, *a, **k): return self
-    LLM_CALLS = LLM_LATENCY = WS_CONNECTIONS = MODEL_FALLBACKS = INTERVIEW_TURNS = _Noop()
+    WS_CONNECTIONS = _Noop()
 
 # ── FastAPI-native rate limiter (no external library needed) ─────────────────
 from collections import defaultdict
@@ -562,10 +197,58 @@ class _RateLimiter:
         return len(calls) <= self._max
 
 _rate_limiter = _RateLimiter(max_per_minute=30)
+_request_window = RecentRequestWindow(capacity=4096)
+
+
+def _decode_configured_access_token(token: str) -> AuthContext:
+    return decode_access_token(
+        token,
+        secret=AUTH_SIGNING_SECRET,
+        issuer=AUTH_ISSUER,
+        audience=AUTH_AUDIENCE,
+        max_lifetime_seconds=AUTH_MAX_TOKEN_SECONDS,
+        clock_skew_seconds=AUTH_CLOCK_SKEW_SECONDS,
+    )
+
+
+def _http_auth_context(authorization: Optional[str]) -> AuthContext:
+    try:
+        return _decode_configured_access_token(extract_bearer_token(authorization))
+    except AuthConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is not configured.",
+        ) from exc
+    except TokenValidationError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="A valid bearer token is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+
+def _authorize_patient_http(
+    context: AuthContext,
+    patient_id: str,
+    scope: str,
+) -> None:
+    try:
+        authorize_patient(context, patient_id, scope)
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="Access denied.") from exc
+
+
+def _authorize_directory_http(context: AuthContext) -> None:
+    try:
+        authorize_directory(context)
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="Access denied.") from exc
 
 # ── Active connections tracker for graceful shutdown ─────────────────────────
 _active_ws_connections: set = set()
 _shutting_down = False
+_report_worker_task: asyncio.Task | None = None
+_report_worker_stop: asyncio.Event | None = None
 
 # ── Input sanitization ───────────────────────────────────────────────────────
 import re as _re
@@ -589,11 +272,17 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app_instance):
-    global _shutting_down
+    global _shutting_down, _report_worker_task, _report_worker_stop
     _log.info("server_startup", service="healthflex-agent")
+    _shutting_down = False
+    _report_worker_stop = asyncio.Event()
+    if report_jobs_collection is not None:
+        _report_worker_task = asyncio.create_task(_report_worker_loop())
     yield
     # ── Graceful shutdown ───────────────────────────────────────────────────
     _shutting_down = True
+    if _report_worker_stop is not None:
+        _report_worker_stop.set()
     _log.info("server_shutdown_initiated", active_sessions=len(_active_ws_connections))
     # Notify active WebSocket sessions
     for ws in list(_active_ws_connections):
@@ -609,6 +298,13 @@ async def lifespan(app_instance):
         if not _active_ws_connections:
             break
         await asyncio.sleep(1)
+    if _report_worker_task is not None:
+        try:
+            await asyncio.wait_for(_report_worker_task, timeout=15)
+        except asyncio.TimeoutError:
+            _report_worker_task.cancel()
+            await asyncio.gather(_report_worker_task, return_exceptions=True)
+        _report_worker_task = None
     _log.info("server_shutdown_complete")
 
 app = FastAPI(lifespan=lifespan, title="Healthflex Customer Agent", version="2.0.0")
@@ -627,10 +323,6 @@ NODE_THOUGHTS: dict[str, dict[str, str]] = {
     "extract_form_data": {
         "stage": "Extracting Information",
         "detail": "Reading your responses and organizing patient data...",
-    },
-    "classify_intent": {
-        "stage": "Understanding Intent",
-        "detail": "Analyzing the purpose and context of your response...",
     },
     "validate_section": {
         "stage": "Validating Completeness",
@@ -702,21 +394,26 @@ async def _send_thought_update(
 
 
 # ── Langfuse LLM observability ───────────────────────────────────────────────
-_langfuse_enabled = bool(
+_langfuse_credentials_present = bool(
     os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")
 )
+_langfuse_content_approved = env_flag("LANGFUSE_CAPTURE_CONTENT", default=False)
+_langfuse_enabled = _langfuse_credentials_present and _langfuse_content_approved
 if _langfuse_enabled:
     try:
         from langfuse import get_client as _lf_get_client
         from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
         _langfuse = _lf_get_client()
         LlamaIndexInstrumentor().instrument()
-        print("[langfuse] Instrumentation active — tracing all LlamaIndex LLM calls")
+        print("[langfuse] Content tracing explicitly enabled")
     except Exception as _lf_err:
-        print(f"[langfuse] Failed to initialize (non-fatal): {_lf_err}")
+        print(f"[langfuse] Initialization failed: {error_type(_lf_err)}")
         _langfuse_enabled = False
 else:
-    print("[langfuse] Skipping — LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set")
+    if _langfuse_credentials_present:
+        print("[langfuse] Content tracing disabled by privacy default")
+    else:
+        print("[langfuse] Skipping — credentials not configured")
     _langfuse = None
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -728,10 +425,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# TTS cache directory (audio_files and transcripts debug dirs removed —
-# writes are no longer performed; see PUBLIC_API.md §5).
-os.makedirs(TTS_CACHE_DIR, exist_ok=True)
 
 # STT now uses Google Cloud Speech-to-Text — no local model to load at startup.
 
@@ -755,7 +448,8 @@ try:
     # save_customer_info is defined later in this file; wrap in a lambda to
     # capture it lazily so the graph is built before the function is defined.
     def _save_for_graph(user_id, form, section, form_id, chat_history=None,
-                        preferred_doc_id=None):
+                        preferred_doc_id=None, lifecycle_status=None,
+                        attempt_id=None):
         # NOTE: preferred_doc_id must be passed in by the caller — this function
         # runs at module scope (and inside background threads) where the per-
         # connection `client_state` is NOT in scope. Referencing it here raised
@@ -763,7 +457,9 @@ try:
         return save_customer_info(user_id=user_id, form_data=form,
                                   current_section=section, form_id=form_id,
                                   chat_history=chat_history,
-                                  preferred_doc_id=preferred_doc_id)
+                                  preferred_doc_id=preferred_doc_id,
+                                  lifecycle_status=lifecycle_status,
+                                  attempt_id=attempt_id)
 
     # In-memory checkpointer — MongoDB is the persistent source of truth.
     from src.graph.graph import create_checkpointer as _create_checkpointer
@@ -796,36 +492,43 @@ try:
                 from google import genai as _genai_r
                 from google.genai import types as _genai_r_types
                 _r_client = _genai_r.Client(api_key=_api_key)
-                from src.enums import ENUMS as _ENUMS_r
-                _r_model_name = _ENUMS_r().reasoning_model_name
-                if _r_model_name.startswith("models/"):
-                    _r_model_name = _r_model_name[len("models/"):]
+                _r_model_name = MODEL_REGISTRY.reasoning
                 _r_gen_config = _genai_r_types.GenerateContentConfig(
                     temperature=0.1,
                     thinking_config=_genai_r_types.ThinkingConfig(thinking_budget=0),
                 )
                 def _reasoning_llm_complete(prompt: str) -> str:
-                    resp = _r_client.models.generate_content(
+                    resp = tracked_ai_call(
+                        provider="google_genai",
                         model=_r_model_name,
-                        contents=prompt,
-                        config=_r_gen_config,
+                        operation="form_extraction",
+                        call=lambda: _r_client.models.generate_content(
+                            model=_r_model_name,
+                            contents=prompt,
+                            config=_r_gen_config,
+                        ),
+                        usage_extractor=gemini_usage,
                     )
                     return (resp.text or "").strip()
-                print("[graph] Reasoning LLM (gemini-2.5-flash, thinking=off) initialized for form extraction")
+                print(f"[graph] Reasoning LLM ({_r_model_name}, thinking=off) initialized for form extraction")
             except Exception as _r_sdk_err:
-                print(f"[graph] Direct SDK init failed ({_r_sdk_err}), falling back to LlamaIndex")
+                print(f"[graph] Direct SDK init failed with {error_type(_r_sdk_err)}; using fallback")
                 _r_llm = init_reasoning_llm(_api_key)
                 def _reasoning_llm_complete(prompt: str) -> str:
-                    resp = _r_llm.complete(prompt)
+                    resp = tracked_ai_call(
+                        provider="google_genai",
+                        model=_r_model_name,
+                        operation="form_extraction",
+                        call=lambda: _r_llm.complete(prompt),
+                        usage_extractor=gemini_usage,
+                    )
                     text = getattr(resp, 'text', None) or str(resp)
                     return text.strip()
-                print("[graph] Reasoning LLM (gemini-2.5-flash) initialized for form extraction")
+                print(f"[graph] Reasoning LLM ({_r_model_name}) initialized for form extraction")
         else:
             print("[graph] WARNING: No API key — reasoning LLM disabled, using flash-lite fallback")
     except Exception as _r_err:
-        import traceback as _rtb
-        print(f"[graph] Reasoning LLM init failed: {_r_err}")
-        _rtb.print_exc()
+        print(f"[graph] Reasoning LLM initialization failed: {error_type(_r_err)}")
 
     _interview_graph = build_interview_graph(
         llm_complete=health_agent.llm_complete,
@@ -836,9 +539,7 @@ try:
     )
     print("[graph] LangGraph interview graph initialized")
 except Exception as _graph_err:
-    import traceback as _tb
-    print(f"[graph] Failed to initialize LangGraph graph (non-fatal, using HealthAgent fallback): {_graph_err}")
-    _tb.print_exc()
+    print(f"[graph] LangGraph initialization failed with {error_type(_graph_err)}; using fallback")
     _interview_graph = None
 
 # MongoDB connection handles (populated by init_mongo()).
@@ -846,6 +547,8 @@ mongo_client = None
 users_collection: Optional[Collection] = None
 customer_info_collection: Optional[Collection] = None
 tagged_questions_collection: Optional[Collection] = None
+report_jobs_collection: Optional[Collection] = None
+clinical_escalations_collection: Optional[Collection] = None
 
 
 # normalize_user_id moved to app.db.serializers (imported above).
@@ -853,41 +556,34 @@ tagged_questions_collection: Optional[Collection] = None
 
 def init_mongo():
     """Initialize MongoDB client for user directory lookups and customer info."""
-    global mongo_client, users_collection, customer_info_collection, tagged_questions_collection
+    global mongo_client, users_collection, customer_info_collection, tagged_questions_collection, report_jobs_collection, clinical_escalations_collection
 
     if not MONGO_URI:
         print("MONGO_URI not set. User suggestions and customer info endpoints will be disabled.")
         return
 
     try:
-        mongo_client = MongoClient(
+        mongo_client = create_verified_mongo_client(
             MONGO_URI,
-            serverSelectionTimeoutMS=5000,
-            tlsAllowInvalidCertificates=True,
+            ca_file=MONGO_TLS_CA_FILE,
         )
         mongo_client.admin.command("ping")
         db = mongo_client[MONGO_DB_NAME]
         users_collection = db[MONGO_USERS_COLLECTION]
         customer_info_collection = db[MONGO_CUSTOMER_INFO_COLLECTION]
         tagged_questions_collection = db["tagged-questions"]
+        report_jobs_collection = db[MONGO_REPORT_JOBS_COLLECTION]
+        clinical_escalations_collection = db[MONGO_CLINICAL_ESCALATIONS_COLLECTION]
 
-        # Unique index: prevents duplicate documents for the same (userId, formId)
-        customer_info_collection.create_index(
-            [("userId", 1), ("formId", 1)],
-            unique=True,
-            name="unique_user_form",
-        )
+        # A formId identifies a questionnaire; attemptId identifies one intake.
+        # This migration preserves legacy records while allowing repeat intakes.
+        ensure_form_attempt_index(customer_info_collection)
 
-        # TTL index: auto-delete empty/abandoned forms after 7 days.
-        # Only applies to docs where title is still "New Form" (never filled).
-        # Completed forms have a real title so this won't touch them.
-        # MongoDB checks the expireAfterSeconds on the createdAt field.
-        customer_info_collection.create_index(
-            [("createdAt", 1)],
-            expireAfterSeconds=7 * 24 * 3600,  # 7 days
-            partialFilterExpression={"title": "New Form"},
-            name="ttl_abandoned_forms",
-        )
+        # Drafts alone receive expiresAt. Answered/completed records omit it,
+        # and the partial filter provides defense if stale data is present.
+        ensure_form_lifecycle_ttl_index(customer_info_collection)
+        ensure_report_job_indexes(report_jobs_collection)
+        ensure_escalation_indexes(clinical_escalations_collection)
 
         print(
             f"Connected to MongoDB collections: {MONGO_DB_NAME}.{MONGO_USERS_COLLECTION}, {MONGO_DB_NAME}.{MONGO_CUSTOMER_INFO_COLLECTION}"
@@ -897,7 +593,133 @@ def init_mongo():
         users_collection = None
         customer_info_collection = None
         tagged_questions_collection = None
-        print(f"Failed to connect to MongoDB. User suggestions and customer info disabled: {e}")
+        report_jobs_collection = None
+        clinical_escalations_collection = None
+        print(f"MongoDB connection failed: {error_type(e)}")
+
+
+async def _process_report_job(job: dict, worker_id: str) -> None:
+    """Process one leased report job and atomically publish only the latest result."""
+
+    from docscanner.service import summarize_multiple_reports
+
+    try:
+        max_total_bytes = MAX_ATTACHMENT_TOTAL_MB * 1024 * 1024
+        file_data_list = []
+        downloaded_bytes = 0
+        for item in job.get("objects", []):
+            remaining = max_total_bytes - downloaded_bytes
+            if remaining <= 0:
+                raise ValueError("Report job exceeds the aggregate download limit")
+            content = await run_blocking(
+                download_bytes_from_s3,
+                item["key"],
+                remaining,
+            )
+            downloaded_bytes += len(content)
+            file_data_list.append((content, item["filename"]))
+        if not file_data_list:
+            raise ValueError("Report job contains no objects")
+
+        summary = await run_blocking(summarize_multiple_reports, file_data_list)
+        if not summary or summary.get("error"):
+            raise RuntimeError("Report summarizer returned no usable result")
+        lease_is_current = await run_blocking(
+            renew_report_job_lease,
+            report_jobs_collection,
+            job["_id"],
+            worker_id=worker_id,
+            lease_seconds=REPORT_JOB_LEASE_SECONDS,
+        )
+        if not lease_is_current:
+            _log.info("report_job_lease_lost", job_id=job["_id"])
+            return
+        reports_text = render_report_summary(summary, len(file_data_list))
+        now = datetime.now(timezone.utc)
+        result = await run_blocking(
+            customer_info_collection.update_one,
+            {
+                "formId": job["formId"],
+                "userId": job["userId"],
+                "reportProcessing.jobId": job["_id"],
+            },
+            {
+                "$set": {
+                    "form_data.History & Diagnostics.Reports": reports_text,
+                    "reportProcessing.status": "completed",
+                    "reportProcessing.completedAt": now,
+                    "updatedAt": now,
+                }
+            },
+        )
+        if result.matched_count == 0:
+            _log.info("report_job_result_superseded", job_id=job["_id"])
+        await run_blocking(
+            mark_report_job_completed,
+            report_jobs_collection,
+            job["_id"],
+            worker_id=worker_id,
+        )
+        _log.info("report_job_completed", job_id=job["_id"])
+    except Exception as exc:
+        status = await run_blocking(
+            mark_report_job_failed,
+            report_jobs_collection,
+            job,
+            worker_id=worker_id,
+            error_name=error_type(exc),
+            max_attempts=REPORT_JOB_MAX_ATTEMPTS,
+            retry_base_seconds=REPORT_JOB_RETRY_BASE_SECONDS,
+            retry_max_seconds=REPORT_JOB_RETRY_MAX_SECONDS,
+        )
+        _log.warning(
+            "report_job_attempt_failed",
+            job_id=job.get("_id"),
+            status=status,
+            error_type=error_type(exc),
+        )
+        if status == REPORT_JOB_FAILED and customer_info_collection is not None:
+            await run_blocking(
+                customer_info_collection.update_one,
+                {
+                    "formId": job["formId"],
+                    "userId": job["userId"],
+                    "reportProcessing.jobId": job["_id"],
+                },
+                {
+                    "$set": {
+                        "reportProcessing.status": "failed",
+                        "reportProcessing.failedAt": datetime.now(timezone.utc),
+                    }
+                },
+            )
+
+
+async def _report_worker_loop() -> None:
+    """Claim durable jobs one at a time; leases recover work after a crash."""
+
+    worker_id = f"{os.getpid()}-{uuid.uuid4().hex}"
+    while _report_worker_stop is not None and not _report_worker_stop.is_set():
+        try:
+            job = await run_blocking(
+                claim_report_job,
+                report_jobs_collection,
+                worker_id=worker_id,
+                lease_seconds=REPORT_JOB_LEASE_SECONDS,
+                max_attempts=REPORT_JOB_MAX_ATTEMPTS,
+            )
+            if job:
+                await _process_report_job(job, worker_id)
+                continue
+        except Exception as exc:
+            _log.warning("report_worker_poll_failed", error_type=error_type(exc))
+        try:
+            await asyncio.wait_for(
+                _report_worker_stop.wait(),
+                timeout=REPORT_JOB_POLL_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            pass
 
 
 # _serialize_datetime and serialize_user moved to app.db.serializers (imported above).
@@ -968,20 +790,13 @@ def _collapse_prom_form(form: dict) -> dict:
 
 def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
     """
-    Return (resolved_texts, prom_form_template) for (user_id, form_id).
-    Returns ([], {}) if nothing found.
+    Return (resolved_texts, prom_form_template, source_document_id) for the
+    exact (user_id, form_id). Returns ([], {}, None) if nothing is found.
     """
     if tagged_questions_collection is None:
-        return [], {}
+        return empty_tagged_questions_result()
     try:
-        from bson import ObjectId
-        queries = []
-        try:
-            oid = ObjectId(user_id)
-            queries += [{"userId": oid, "formId": form_id}, {"userId": oid}]
-        except Exception:
-            pass
-        queries += [{"userId": user_id, "formId": form_id}, {"userId": user_id}]
+        queries = build_user_form_queries(user_id, form_id)
 
         doc = None
         _from_customer_info = False
@@ -997,28 +812,22 @@ def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
                 doc = customer_info_collection.find_one(q)
                 if doc and doc.get("questions"):
                     _from_customer_info = True
-                    print(f"[tagged-questions] Found embedded questions in customer-info for user={user_id}")
+                    print("[tagged-questions] Found embedded questions in customer-info")
                     break
                 doc = None
 
         if not doc:
-            print(f"[tagged-questions] No doc found for user={user_id} form={form_id}")
-            return [], {}
+            print("[tagged-questions] No matching document found")
+            return empty_tagged_questions_result()
 
         raw_questions = doc.get("questions", [])
         if not isinstance(raw_questions, list):
-            return [], {}
+            return empty_tagged_questions_result()
 
-        # Standard response options for PROM scales (inferred when not in question-bank)
+        # Defaults are limited to non-clinical/custom questions. Published PROM
+        # options cannot be safely inferred from an ID prefix: individual items
+        # can have different anchors and directionality.
         _PROM_DEFAULT_METAS: dict = {
-            "prom_ohs":   {"type": "single_choice", "options": ["No difficulty", "Little difficulty", "Moderate difficulty", "Extreme difficulty", "Cannot do"]},
-            "prom_oss":   {"type": "single_choice", "options": ["No difficulty", "Little difficulty", "Moderate difficulty", "Extreme difficulty", "Cannot do"]},
-            "prom_phq9":  {"type": "single_choice", "options": ["Not at all", "Several days", "More than half the days", "Nearly every day"]},
-            "prom_gad7":  {"type": "single_choice", "options": ["Not at all", "Several days", "More than half the days", "Nearly every day"]},
-            "prom_nps":   {"type": "scale",         "options": None},
-            "prom_rmdq":  {"type": "single_choice", "options": ["Yes", "No"]},
-            "prom_koos":  {"type": "single_choice", "options": ["None", "Mild", "Moderate", "Severe", "Extreme"]},
-            "prom_dash":  {"type": "single_choice", "options": ["No difficulty", "Mild difficulty", "Moderate difficulty", "Severe difficulty", "Unable"]},
             "biz_feedback": {"type": "single_choice", "options": ["Yes, happy to help", "No, thank you"]},
         }
 
@@ -1067,10 +876,21 @@ def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
         if question_ids:
             try:
                 qb = tagged_questions_collection.database["question-bank"]
-                bank_docs = qb.find({"id": {"$in": question_ids}}, {"id": 1, "text": 1, "type": 1, "options": 1, "_id": 0})
+                bank_docs = qb.find(
+                    {"id": {"$in": question_ids}},
+                    {
+                        "id": 1,
+                        "text": 1,
+                        "type": 1,
+                        "options": 1,
+                        "instrumentVersion": 1,
+                        "instrument_version": 1,
+                        "_id": 0,
+                    },
+                )
                 id_to_doc = {d["id"]: d for d in bank_docs if d.get("text")}
             except Exception as e:
-                print(f"[tagged-questions] Error resolving question IDs: {e}")
+                print(f"[tagged-questions] Question-ID resolution failed: {error_type(e)}")
 
         # Build resolved list (preserve order: plain texts first, then all question dicts)
         resolved = [{"text": t, "type": "text", "options": None, "question_id": None} for t in plain_texts]
@@ -1079,7 +899,13 @@ def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
         all_question_ids_for_template = []
         for qid, q in full_embedded:
             _type, _options = _infer_meta(qid, q.get("type", "text"), q.get("options"))
-            resolved.append({"text": q["text"], "type": _type, "options": _options, "question_id": qid})
+            resolved.append({
+                "text": q["text"],
+                "type": _type,
+                "options": _options,
+                "question_id": qid,
+                "instrument_version": q.get("instrumentVersion") or q.get("instrument_version"),
+            })
             all_question_ids_for_template.append(qid)
 
         # ID-only questions — use question-bank data
@@ -1088,7 +914,13 @@ def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
             if qid in id_to_doc:
                 d = id_to_doc[qid]
                 _type, _options = _infer_meta(qid, d.get("type", "text"), d.get("options"))
-                resolved.append({"text": d["text"], "type": _type, "options": _options, "question_id": qid})
+                resolved.append({
+                    "text": d["text"],
+                    "type": _type,
+                    "options": _options,
+                    "question_id": qid,
+                    "instrument_version": d.get("instrumentVersion") or d.get("instrument_version"),
+                })
             else:
                 print(f"[tagged-questions] Warning: '{qid}' not found in question-bank")
 
@@ -1127,11 +959,11 @@ def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
         resolved.sort(key=_scale_rank)
 
         _source_doc_id = str(doc.get("_id", "")) if _from_customer_info and doc else None
-        print(f"[tagged-questions] Resolved {len(resolved)} questions, {len(prom_template)} PROM scales for user={user_id} form={form_id}")
+        print(f"[tagged-questions] Resolved {len(resolved)} questions and {len(prom_template)} PROM scales")
         return resolved, prom_template, _source_doc_id
     except Exception as e:
-        print(f"[tagged-questions] Error fetching: {e}")
-    return [], {}, None
+        print(f"[tagged-questions] Fetch failed: {error_type(e)}")
+    return empty_tagged_questions_result()
 
 
 _SCALE_RESPONSE_OPTIONS: dict = {
@@ -1226,7 +1058,7 @@ def batch_tagged_questions(questions: list, llm_complete, form_template: dict = 
 
 def personalize_questions(raw_questions: list, patient_context: dict, llm_complete) -> list:
     """
-    Rewrite raw PROM question templates to match this patient's specific situation.
+    Rewrite only non-PROM custom questions for this patient's situation.
 
     Uses FRM-01 intake data (onset, body part, severity, duration) to replace
     generic template phrasing ("past 4 weeks", "your joint") with patient-accurate
@@ -1254,11 +1086,28 @@ def personalize_questions(raw_questions: list, patient_context: dict, llm_comple
             facts.append(f"{section}: {fields.strip()}")
 
     if not facts:
-        print(f"[personalize-questions] No usable facts from patient context (sections={list(patient_context.keys())}), using raw templates")
+        print("[personalize-questions] No usable patient facts; using raw templates")
         return raw_questions
 
-    # Extract just the text fields for the LLM (questions may be dicts with type/options)
-    raw_texts = [q["text"] if isinstance(q, dict) else q for q in raw_questions]
+    # Published/clinical PROM wording and time windows are part of the instrument
+    # definition. They are never sent to an LLM for rewriting. A stored snapshot
+    # is also frozen so a resume cannot silently adopt later question-bank edits.
+    editable_indexes = [
+        index
+        for index, question in enumerate(raw_questions)
+        if not is_immutable_prom_question(question)
+        and not (isinstance(question, dict) and question.get("definition_frozen"))
+    ]
+    if not editable_indexes:
+        print("[personalize-questions] Clinical definitions are immutable; skipping personalization")
+        return raw_questions
+
+    raw_texts = [
+        raw_questions[index]["text"]
+        if isinstance(raw_questions[index], dict)
+        else raw_questions[index]
+        for index in editable_indexes
+    ]
 
     patient_summary = "\n".join(facts[:30])  # Cap to keep prompt concise
     questions_json = _json.dumps(raw_texts)
@@ -1267,7 +1116,7 @@ def personalize_questions(raw_questions: list, patient_context: dict, llm_comple
         "You are a clinical assistant personalizing assessment questions for a specific patient.\n\n"
         "PATIENT INTAKE HISTORY (FRM-01):\n"
         f"{patient_summary}\n\n"
-        f"RAW QUESTION TEMPLATES ({len(raw_texts)} questions from PROM bank):\n"
+        f"CUSTOM QUESTION TEMPLATES ({len(raw_texts)} questions):\n"
         f"{questions_json}\n\n"
         "RULES:\n"
         "1. Replace 'past 4 weeks' (or any generic time window) with the patient's actual "
@@ -1290,70 +1139,25 @@ def personalize_questions(raw_questions: list, patient_context: dict, llm_comple
             if raw.startswith("json"):
                 raw = raw[4:]
         personalized_texts = _json.loads(raw.strip())
-        if isinstance(personalized_texts, list) and len(personalized_texts) == len(raw_questions):
+        if isinstance(personalized_texts, list) and len(personalized_texts) == len(editable_indexes):
             print(f"[personalize-questions] Personalized {len(personalized_texts)} questions using patient history")
-            # Rebuild with personalized text but original type/options preserved
-            result = []
-            for i, q in enumerate(raw_questions):
-                if isinstance(q, dict):
-                    result.append({**q, "text": personalized_texts[i]})
-                else:
-                    result.append(personalized_texts[i])
+            result = list(raw_questions)
+            for output_index, source_index in enumerate(editable_indexes):
+                question = raw_questions[source_index]
+                result[source_index] = (
+                    {**question, "text": personalized_texts[output_index]}
+                    if isinstance(question, dict)
+                    else personalized_texts[output_index]
+                )
             return result
-        print(f"[personalize-questions] Length mismatch ({len(personalized_texts)} vs {len(raw_questions)}), using raw")
+        print(f"[personalize-questions] Length mismatch ({len(personalized_texts)} vs {len(editable_indexes)}), using raw")
     except Exception as e:
-        print(f"[personalize-questions] Failed ({e}), using raw templates")
+        print(f"[personalize-questions] Failed with {error_type(e)}; using raw templates")
 
     return raw_questions
 
 
-def generate_form_title(form_data: dict) -> str:
-    """
-    Generate a title for the form based on primary complaint using LLM.
-    
-    Args:
-        form_data: The form data dictionary
-        
-    Returns:
-        A title string based on the primary complaint
-    """
-    try:
-        # Extract primary complaint from form data
-        primary_complaint = form_data.get("Present Complaint", {}).get("Primary Complaint", "")
-        
-        if not primary_complaint:
-            # Fallback to a generic title
-            return "Medical Interview Form"
-        
-        # Use LLM to generate a concise title based on primary complaint
-        prompt = f"""Based on the following primary complaint, generate a concise, descriptive title (maximum 50 characters) for this medical interview form.
-
-Primary Complaint: {primary_complaint}
-
-Generate only the title, nothing else. The title should be clear and based on the primary complaint."""
-        
-        if health_agent and health_agent.llm:
-            response = health_agent.llm_complete(prompt)
-            title = response.strip()
-            # Clean up the title - remove quotes if present
-            title = title.strip('"').strip("'").strip()
-            # Limit length
-            if len(title) > 50:
-                title = title[:47] + "..."
-            return title if title else f"Medical Interview: {primary_complaint[:30]}"
-        else:
-            # Fallback title
-            return f"Medical Interview: {primary_complaint[:30]}"
-    except Exception as e:
-        print(f"Error generating form title: {e}")
-        # Fallback to primary complaint or generic title
-        primary_complaint = form_data.get("Present Complaint", {}).get("Primary Complaint", "")
-        if primary_complaint:
-            return f"Medical Interview: {primary_complaint[:30]}"
-        return "Medical Interview Form"
-
-
-# Fixed form ID - same for all users. Uniqueness comes from (formId + userId) combination
+# Fixed questionnaire ID; attemptId distinguishes repeat intakes per user.
 # DEFAULT_FORM_ID moved to app.config (imported above).
 
 def resolve_assessment_appointment_id(user_id: str):
@@ -1379,7 +1183,7 @@ def resolve_assessment_appointment_id(user_id: str):
                 except Exception:
                     return td["appointmentId"]
     except Exception as e:
-        print(f"[appointment-tag] tagged-questions lookup failed: {e}")
+        print(f"[appointment-tag] Tagged-question lookup failed: {error_type(e)}")
 
     # 2) Fallback: resolve the next booked appointment ourselves.
     try:
@@ -1408,7 +1212,7 @@ def resolve_assessment_appointment_id(user_id: str):
             if doc:
                 return doc["_id"]
     except Exception as e:
-        print(f"[appointment-tag] appointments lookup failed: {e}")
+        print(f"[appointment-tag] Appointment lookup failed: {error_type(e)}")
     return None
 
 
@@ -1420,17 +1224,25 @@ def save_customer_info(
     attachments: Optional[List[dict]] = None,
     chat_history: Optional[list] = None,
     preferred_doc_id: Optional[str] = None,
+    lifecycle_status: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    prom_snapshot: Optional[dict] = None,
 ):
     """
     Save or update customer interview information in MongoDB.
-    Forms are unique by the combination of (formId + userId).
-    The formId is fixed (same for all users), uniqueness comes from userId.
+    Forms are unique by ``(userId, formId, attemptId)`` for new records.
+    Legacy records without ``attemptId`` remain updateable for compatibility.
     
     Args:
         user_id: The user ID from the selected user (required for uniqueness)
         form_data: The form data dictionary
         current_section: Current section of the interview
         form_id: Optional form ID. If None, uses DEFAULT_FORM_ID.
+        lifecycle_status: Explicit lifecycle transition, currently ``completed``
+            for terminal interview/PROM events. Ordinary saves infer draft or
+            in-progress from the form data.
+        attempt_id: Intake-instance identity. When omitted, the legacy
+            ``(userId, formId)`` record is selected.
     
     Returns:
         The form_id of the saved form (always DEFAULT_FORM_ID)
@@ -1459,32 +1271,37 @@ def save_customer_info(
         # Use fixed form ID (same for all users)
         if not form_id:
             form_id = DEFAULT_FORM_ID
-            print(f"[save_customer_info] Using default form_id: {form_id} for user: {user_id}")
+            print("[save_customer_info] Using default form type")
         else:
             # If form_id is provided, use it (but typically should be DEFAULT_FORM_ID)
-            print(f"[save_customer_info] Using provided form_id: {form_id} for user: {user_id}")
+            print("[save_customer_info] Using requested form type")
         
         # CRITICAL: Deep copy form_data to prevent shared references
         # This ensures each form has its own independent copy of the data
         form_data_copy = copy.deepcopy(form_data)
         
-        # Generate title based on primary complaint (use "New Form" if form is empty)
-        primary_complaint = form_data_copy.get("Present Complaint", {}).get("Primary Complaint", "")
-        if not primary_complaint or not primary_complaint.strip():
-            form_title = "New Form"
-        else:
-            form_title = generate_form_title(form_data_copy)
+        # Deterministic title generation avoids an external model request on
+        # every save while preserving the existing empty-form lifecycle marker.
+        form_title = build_form_title(form_data_copy, empty_title="New Form")
         
         # Prepare the document matching the medical_interview_history.json structure
+        save_time = datetime.now(timezone.utc)
         customer_doc = {
             "userId": normalized_user_id,
             "formId": form_id,
             "title": form_title,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": save_time.isoformat(),
             "form_data": form_data_copy,  # Use the deep copy
             "current_section": current_section,
-            "updatedAt": datetime.now(),
+            "updatedAt": save_time,
         }
+        if attempt_id is not None:
+            normalized_attempt_id = str(attempt_id).strip()
+            if not normalized_attempt_id:
+                raise ValueError("attempt_id cannot be empty")
+            customer_doc["attemptId"] = normalized_attempt_id
+        if prom_snapshot is not None:
+            customer_doc["promSnapshot"] = copy.deepcopy(prom_snapshot)
 
         # Tag this intake to the patient's booked assessment so the recommender's
         # customer icon can fetch the right assessment's data. Only set when
@@ -1510,9 +1327,26 @@ def save_customer_info(
             except Exception:
                 pass
             for _uid in _uid_variants:
-                existing = customer_info_collection.find_one({"formId": form_id, "userId": _uid})
+                _existing_query = add_attempt_write_scope(
+                    {"formId": form_id, "userId": _uid},
+                    attempt_id,
+                )
+                existing = customer_info_collection.find_one(_existing_query)
                 if existing:
                     break
+
+        lifecycle = resolve_form_lifecycle(
+            form_data_copy,
+            requested_status=lifecycle_status,
+            existing_status=existing.get("status") if existing else None,
+            existing_completed_at=existing.get("completedAt") if existing else None,
+            now=save_time,
+        )
+        customer_doc["status"] = lifecycle.status
+        if lifecycle.expires_at is not None:
+            customer_doc["expiresAt"] = lifecycle.expires_at
+        if lifecycle.completed_at is not None:
+            customer_doc["completedAt"] = lifecycle.completed_at
 
         attachments_to_store = (
             attachments if attachments is not None else
@@ -1522,19 +1356,23 @@ def save_customer_info(
 
         if existing:
             # Update the doc we found (regardless of how userId was stored)
-            customer_info_collection.update_one(
-                {"_id": existing["_id"]},
-                {"$set": customer_doc},
+            update = {"$set": customer_doc}
+            if lifecycle.expires_at is None:
+                update["$unset"] = {"expiresAt": ""}
+            update_filter = build_lifecycle_update_filter(
+                existing["_id"],
+                requested_status=lifecycle_status,
             )
+            customer_info_collection.update_one(update_filter, update)
         else:
-            customer_doc["createdAt"] = datetime.now()
+            customer_doc["createdAt"] = save_time
             customer_info_collection.insert_one(customer_doc)
-        print(f"Saved customer info for user {user_id}, form {form_id} in MongoDB")
+        print("[save_customer_info] Customer form persisted")
         
         return form_id
             
     except Exception as e:
-        print(f"Error saving customer info to MongoDB: {e}")
+        print(f"[save_customer_info] Persistence failed: {error_type(e)}")
         return None
 
 
@@ -1558,16 +1396,11 @@ def fetch_user_forms(user_id: str) -> list:
         return []
     
     try:
-        # Since formId is fixed, find by (formId + userId) combination
-        # Normalize user_id to ObjectId where possible
-        normalized_user_id = normalize_user_id(user_id)
-        # Each user should have at most one form
+        queries = build_user_form_queries(user_id, DEFAULT_FORM_ID)
+        identity_query = queries[0] if len(queries) == 1 else {"$or": queries}
         forms = list(
             customer_info_collection.find(
-                {
-                    "userId": normalized_user_id,
-                    "formId": DEFAULT_FORM_ID
-                },
+                identity_query,
                 {"_id": 0}
             ).sort("createdAt", -1)
         )
@@ -1576,6 +1409,7 @@ def fetch_user_forms(user_id: str) -> list:
         for form in forms:
             formatted_forms.append({
                 "formId": form.get("formId", ""),
+                "attemptId": form.get("attemptId"),
                 "title": form.get("title", "Untitled Form"),
                 "timestamp": _serialize_datetime(form.get("timestamp")),
                 "createdAt": _serialize_datetime(form.get("createdAt")),
@@ -1586,14 +1420,13 @@ def fetch_user_forms(user_id: str) -> list:
         
         return formatted_forms
     except Exception as e:
-        print(f"Error retrieving user forms: {e}")
+        print(f"[fetch_user_forms] Retrieval failed: {error_type(e)}")
         return []
 
 
 def fetch_latest_form_for_user(user_id: str) -> dict:
     """
-    Retrieve the form for a specific user.
-    Since formId is fixed, each user has exactly one form (identified by formId + userId).
+    Retrieve the latest default-form attempt for a specific user.
     """
     global customer_info_collection
 
@@ -1605,15 +1438,12 @@ def fetch_latest_form_for_user(user_id: str) -> dict:
         return None
 
     try:
-        # Find form by (formId + userId) combination
-        normalized_user_id = normalize_user_id(user_id)
+        queries = build_user_form_queries(user_id, DEFAULT_FORM_ID)
+        identity_query = queries[0] if len(queries) == 1 else {"$or": queries}
         form = customer_info_collection.find_one(
-            {
-                "userId": normalized_user_id,
-                "formId": DEFAULT_FORM_ID
-            },
+            identity_query,
             {"_id": 0},
-            sort=[("createdAt", -1)],
+            sort=[("updatedAt", -1), ("createdAt", -1)],
         )
         if form:
             form["timestamp"] = _serialize_datetime(form.get("timestamp"))
@@ -1621,18 +1451,23 @@ def fetch_latest_form_for_user(user_id: str) -> dict:
             form["updatedAt"] = _serialize_datetime(form.get("updatedAt"))
         return form
     except Exception as e:
-        print(f"Error retrieving form for user {user_id}: {e}")
+        print(f"[fetch_latest_form] Retrieval failed: {error_type(e)}")
         return None
 
 
-def fetch_form_by_id(form_id: str, user_id: str = None) -> dict:
+def fetch_form_by_id(
+    form_id: str,
+    user_id: str = None,
+    attempt_id: Optional[str] = None,
+) -> dict:
     """
-    Retrieve a specific form by form_id and user_id.
-    Since forms are unique by (formId + userId) combination, user_id is required.
+    Retrieve an exact attempt, or the latest matching legacy-compatible form.
     
     Args:
         form_id: The form ID to retrieve
         user_id: The user ID (required for uniqueness)
+        attempt_id: Optional intake-instance ID. Older clients may omit it and
+            receive the latest matching attempt.
         
     Returns:
         Form document or None if not found
@@ -1659,11 +1494,20 @@ def fetch_form_by_id(form_id: str, user_id: str = None) -> dict:
             _uid_variants.insert(0, _ObjId(user_id))
         except Exception:
             pass
-        form = None
+        _queries = []
         for _uid in _uid_variants:
-            form = customer_info_collection.find_one({"formId": form_id, "userId": _uid})
-            if form:
-                break
+            _query = {"formId": form_id, "userId": _uid}
+            if attempt_id is not None:
+                _normalized_attempt = str(attempt_id).strip()
+                if not _normalized_attempt:
+                    raise ValueError("attempt_id cannot be empty")
+                _query["attemptId"] = _normalized_attempt
+            _queries.append(_query)
+        _identity_query = _queries[0] if len(_queries) == 1 else {"$or": _queries}
+        form = customer_info_collection.find_one(
+            _identity_query,
+            sort=[("updatedAt", -1), ("createdAt", -1)],
+        )
         if form:
             form["_id"] = str(form.get("_id", ""))
             form["timestamp"] = _serialize_datetime(form.get("timestamp"))
@@ -1671,14 +1515,18 @@ def fetch_form_by_id(form_id: str, user_id: str = None) -> dict:
             form["updatedAt"] = _serialize_datetime(form.get("updatedAt"))
         return form
     except Exception as e:
-        print(f"Error retrieving form: {e}")
+        print(f"[fetch_form] Retrieval failed: {error_type(e)}")
         return None
 
 
-def fetch_form_attachments(form_id: str, user_id: str = None) -> List[dict]:
+def fetch_form_attachments(
+    form_id: str,
+    user_id: str = None,
+    attempt_id: Optional[str] = None,
+) -> List[dict]:
     """
     Retrieve attachments for a form.
-    Since forms are unique by (formId + userId), user_id is required.
+    The user and optional attempt identity scope the requested form.
     """
     global customer_info_collection
 
@@ -1693,41 +1541,55 @@ def fetch_form_attachments(form_id: str, user_id: str = None) -> List[dict]:
         return []
 
     try:
-        normalized_user_id = normalize_user_id(user_id)
+        queries = build_user_form_queries(
+            user_id,
+            form_id,
+            attempt_id=attempt_id,
+        )
+        identity_query = queries[0] if len(queries) == 1 else {"$or": queries}
         doc = customer_info_collection.find_one(
-            {
-                "formId": form_id,
-                "userId": normalized_user_id
-            },
+            identity_query,
             {"_id": 0, "attachments": 1},
+            sort=[("updatedAt", -1), ("createdAt", -1)],
         )
         return doc.get("attachments", []) if doc else []
     except Exception as e:
-        print(f"Error retrieving attachments for form {form_id}: {e}")
+        print(f"[fetch_attachments] Retrieval failed: {error_type(e)}")
         return []
 
 
-def create_placeholder_form(user_id: str, client_state: dict) -> Optional[str]:
+def create_placeholder_form(
+    user_id: str,
+    client_state: dict,
+    force_new: bool = False,
+) -> Optional[str]:
     """Return the form_id for this user WITHOUT creating a MongoDB document.
 
     We no longer eagerly insert empty 'New Form' documents — that was creating
     one empty doc per connected user, polluting the collection. Instead we just
     assign the well-known DEFAULT_FORM_ID to client_state. The actual MongoDB
     document is created (via upsert) only when the first real data is saved.
-    If the user already has a form in MongoDB, we find it and reuse its id.
+    On ordinary connection, the latest attempt is resumed. ``force_new=True``
+    assigns a fresh attempt without writing an empty MongoDB document.
     """
-    # Check if a form already exists — if so, reuse it
-    existing = fetch_latest_form_for_user(user_id)
+    # Check if a form already exists — if so, reuse its exact attempt.
+    existing = None if force_new else fetch_latest_form_for_user(user_id)
     if existing:
         existing_id = existing.get("formId", DEFAULT_FORM_ID)
         client_state["form_id"] = existing_id
-        print(f"[create_placeholder_form] Reusing existing form {existing_id} for user {user_id}")
+        client_state["attempt_id"] = resolve_form_attempt_id(existing)
+        print("[create_placeholder_form] Reusing existing form")
         return existing_id
 
-    # No existing form — assign DEFAULT_FORM_ID without writing to MongoDB.
+    # No existing form, or an explicit new intake: allocate an attempt ID
+    # without writing a placeholder document.
     # The document will be created when the first interview answer is saved.
     client_state["form_id"] = DEFAULT_FORM_ID
-    print(f"[create_placeholder_form] Assigned form_id {DEFAULT_FORM_ID} for new user {user_id} (no DB write until first answer)")
+    client_state["attempt_id"] = resolve_form_attempt_id(
+        existing,
+        force_new=force_new,
+    )
+    print("[create_placeholder_form] Assigned default form type; no database write")
     return DEFAULT_FORM_ID
 
 
@@ -1737,7 +1599,7 @@ def build_interview_state(client_state: dict, progress_override: Optional[float]
     Build interview state for the client.
     
     CRITICAL: Always prefer database form data over health_agent.form to ensure
-    each form is unique by (formId + userId) combination.
+    each persisted attempt is scoped by user, form, and attempt identity.
     
     Args:
         client_state: Current client state dictionary (must contain user_id and form_id)
@@ -1746,14 +1608,19 @@ def build_interview_state(client_state: dict, progress_override: Optional[float]
     """
     form_id = client_state.get("form_id")
     user_id = client_state.get("user_id")
-    attachments = fetch_form_attachments(form_id, user_id) if form_id and user_id else []
+    attempt_id = client_state.get("attempt_id")
+    attachments = (
+        fetch_form_attachments(form_id, user_id, attempt_id)
+        if form_id and user_id
+        else []
+    )
     
     # CRITICAL: Always prefer database form for progress calculation to ensure independence
     # Calculate progress - prefer database form if available (more accurate after uploads)
     form_data_for_progress = None
     if form_id and user_id:
         # Always fetch from database when form_id exists to ensure independence
-        form = fetch_form_by_id(form_id, user_id)
+        form = fetch_form_by_id(form_id, user_id, attempt_id)
         if form and form.get("form_data"):
             form_data_for_progress = form["form_data"]
         else:
@@ -1825,9 +1692,25 @@ def build_interview_state(client_state: dict, progress_override: Optional[float]
         "missing_fields": health_agent.missing_fields,
         "attachments": attachments,
         "formId": form_id,
+        "attemptId": attempt_id,
         "sectionProgress": section_progress,
         "promSteps": _all_prom_scales if _is_prom else None,
     }
+
+
+async def build_interview_state_async(
+    client_state: dict,
+    progress_override: Optional[float] = None,
+    use_db_form: bool = False,
+):
+    """Build legacy interview state without blocking the async event loop."""
+
+    return await run_blocking(
+        build_interview_state,
+        client_state,
+        progress_override,
+        use_db_form,
+    )
 
 
 def user_has_reports(user_response: str) -> bool:
@@ -1908,7 +1791,8 @@ def message_requires_attachment(
     message_text: Optional[str] = None, 
     form_id: Optional[str] = None,
     user_response: Optional[str] = None,
-    user_id: Optional[str] = None
+    user_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
 ) -> bool:
     """
     Show upload card ONLY if:
@@ -1925,7 +1809,7 @@ def message_requires_attachment(
     try:
         # If we already have reports attachments for this form, don't ask again
         if form_id and user_id:
-            form = fetch_form_by_id(form_id, user_id)
+            form = fetch_form_by_id(form_id, user_id, attempt_id)
             if form:
                 attachments = form.get("attachments", [])
                 has_attachments = bool(attachments)
@@ -1933,7 +1817,7 @@ def message_requires_attachment(
                     print(f"[message_requires_attachment] Attachments already present, not showing upload")
                     return False
     except Exception as e:
-        print(f"[message_requires_attachment] Warning: failed to check form attachments/reports: {e}")
+        print(f"[message_requires_attachment] Attachment check failed: {error_type(e)}")
 
     # If the agent is explicitly asking the user to upload reports, always request attachment
     # This is the follow-up prompt like:
@@ -1995,21 +1879,27 @@ async def send_text_message(
         requires_attachment = True
     else:
         current_section = interview_state.get("section") if interview_state else health_agent.current_section
-        requires_attachment = message_requires_attachment(
+        requires_attachment = await run_blocking(
+            message_requires_attachment,
             current_section,
             text,
             client_state.get("form_id"),
             user_response=user_response,
-            user_id=client_state.get("user_id")
+            user_id=client_state.get("user_id"),
+            attempt_id=client_state.get("attempt_id"),
         )
+
+    resolved_interview_state = (
+        interview_state
+        if interview_state is not None
+        else await build_interview_state_async(client_state)
+    )
 
     payload = {
         "type": "text_message",
         "text": text,
         "session_id": client_state["session_id"],
-        "interview_state": interview_state
-        if interview_state is not None
-        else build_interview_state(client_state),
+        "interview_state": resolved_interview_state,
         "request_attachment": requires_attachment,
     }
     if question_meta and question_meta.get("type") and question_meta.get("type") != "text":
@@ -2027,11 +1917,11 @@ def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, a
 
     previous_user_id = client_state.get("user_id")
     if previous_user_id and previous_user_id != new_user_id:
-        print(f"[reset_health_agent] User switched from {previous_user_id} to {new_user_id}. Resetting health_agent.")
+        print("[reset_health_agent] Subject changed; resetting agent state")
     elif previous_user_id == new_user_id:
-        print(f"[reset_health_agent] Same user {new_user_id} starting new interview. Resetting health_agent.")
+        print("[reset_health_agent] Existing subject started a new interview")
     else:
-        print(f"[reset_health_agent] New user {new_user_id} starting interview. Resetting health_agent.")
+        print("[reset_health_agent] New interview subject; resetting agent state")
 
     agent.init_form()
     agent.talk_mode = "START"
@@ -2040,6 +1930,9 @@ def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, a
 
     client_state["user_id"] = new_user_id
     client_state["form_id"] = None
+    client_state["attempt_id"] = None
+    client_state["prom_snapshot"] = None
+    client_state["prom_source_doc_id"] = None
 
     print(f"[reset_health_agent] HealthAgent reset complete. Form is now empty: {len(agent.form)} sections")
 
@@ -2061,401 +1954,20 @@ async def health_check():
         "components": {
             "mongodb": "ok" if customer_info_collection is not None else "degraded",
             "graph": "ok" if _interview_graph is not None else "degraded",
-            "stt": "google-cloud-speech"
-        }
+            "stt": "gemini-primary-google-cloud-speech-fallback",
+            "authentication": (
+                "ok"
+                if len(AUTH_SIGNING_SECRET.encode("utf-8")) >= 32
+                and AUTH_ISSUER
+                and AUTH_AUDIENCE
+                else "degraded"
+            ),
+        },
+        "ai_telemetry": {
+            "metrics_endpoint": "/metrics" if _HAS_PROMETHEUS else None,
+            "pricing_version": PRICING_VERSION,
+        },
     }
-
-
-# Audio parameters
-# Audio constants moved to app.config (imported as RATE, SAMPLE_WIDTH, MAX_CHUNK_SIZE).
-
-
-def save_audio(file_name, audio_data):
-    """Save audio data to WAV file for debugging"""
-    with wave.open(file_name, "wb") as wf:
-        wf.setnchannels(1)  # Mono
-        wf.setsampwidth(SAMPLE_WIDTH)
-        wf.setframerate(RATE)
-        wf.writeframes(audio_data)
-
-
-def text_to_speech(text, cache_dir="tts_cache", max_length=500, speed_factor=1.7):
-    """
-    Convert text to speech using Google TTS and return as WAV bytes
-    Uses caching to avoid regenerating the same messages
-
-    Args:
-        text: Text to convert to speech
-        cache_dir: Directory to cache audio files
-        max_length: Maximum text length to process at once (to avoid large files)
-        speed_factor: Speed up the audio by this factor (higher = faster)
-    """
-    # Limit text length to avoid huge audio files
-    if len(text) > max_length:
-        print(
-            f"Warning: Text length ({len(text)}) exceeds maximum ({max_length}). Truncating..."
-        )
-        # Truncate at a sentence boundary if possible
-        truncation_point = text[:max_length].rfind(".")
-        if truncation_point == -1:
-            # If no sentence boundary, truncate at a space
-            truncation_point = text[:max_length].rfind(" ")
-
-        if (
-            truncation_point > max_length // 2
-        ):  # Only use truncation if we can keep at least half
-            text = text[: truncation_point + 1]
-        else:
-            text = text[:max_length]
-
-    # Create a hash of the text for caching
-    import hashlib
-
-    text_hash = hashlib.md5((text + f"_speed{speed_factor}").encode()).hexdigest()
-    cache_file = Path(cache_dir) / f"{text_hash}.wav"
-
-    # Check if we already have this audio cached
-    if cache_file.exists():
-        print(f"Using cached audio for: {text[:30]}...")
-        with open(cache_file, "rb") as f:
-            return f.read()
-
-    # Generate new TTS audio
-    print(f"Generating TTS for: {text[:30]}...")
-    tts = gtts.gTTS(text=text, lang="en", slow=False)
-
-    # Save as MP3 first (gtts only outputs MP3)
-    mp3_io = io.BytesIO()
-    tts.write_to_fp(mp3_io)
-    mp3_io.seek(0)
-
-    # Convert to WAV with parameters matching our audio system
-    # Apply speed factor to make speech faster
-    mp3_audio = AudioSegment.from_mp3(mp3_io)
-    wav_audio = (
-        mp3_audio.set_frame_rate(RATE).set_channels(1).set_sample_width(SAMPLE_WIDTH)
-    )
-
-    # Apply speedup
-    if speed_factor > 1.0:
-        wav_audio = wav_audio.speedup(playback_speed=speed_factor)
-
-    # Save WAV to cache
-    wav_io = io.BytesIO()
-    wav_audio.export(wav_io, format="wav")
-    wav_data = wav_io.getvalue()
-
-    # Save to cache file
-    with open(cache_file, "wb") as f:
-        f.write(wav_data)
-
-    return wav_data
-
-
-def calculate_form_progress(form_data):
-    """
-    Calculate progress based on individual field completion (not just sections).
-    Progress is calculated as: (filled_fields / total_fields) * 100
-    
-    Args:
-        form_data: Dictionary containing form sections and their fields
-        
-    Returns:
-        Progress percentage (0-100)
-    """
-    if not form_data:
-        return 0
-    
-    # Define expected sections (must match section_order in calculate_section_completion_status)
-    expected_sections = [
-        "Present Complaint",
-        "Previous Consultations",
-        "Pain Assessment",
-        "History & Diagnostics",
-        "Treatment Goals",
-        "Referral"
-    ]
-    
-    total_fields = 0
-    filled_fields = 0
-    
-    for section_name in expected_sections:
-        if section_name not in form_data:
-            continue
-            
-        section_data = form_data[section_name]
-        if not isinstance(section_data, dict):
-            continue
-        
-        # Special handling for "Previous Consultations" section
-        if section_name == "Previous Consultations":
-            previous_consultations_field = "Previous Diagnosis or Advice and Prescribed Treatment Taken"
-            status_field = "Current Status of Issue (Improved, Same, Worse)"
-            
-            previous_value = section_data.get(previous_consultations_field, "")
-            if previous_value and str(previous_value).strip():
-                previous_value_lower = str(previous_value).strip().lower()
-                no_consultation_indicators = [
-                    "no previous", "didn't visit", "did not visit", "haven't consulted",
-                    "have not consulted", "no consultations", "no doctor", "no hospital",
-                    "never consulted", "not consulted", "none", "nothing"
-                ]
-                has_no_consultations = any(indicator in previous_value_lower for indicator in no_consultation_indicators)
-                
-                # If no previous consultations, only count 1 field (the previous consultations field itself)
-                if has_no_consultations:
-                    total_fields += 1
-                    filled_fields += 1  # The "no consultations" answer counts as filled
-                else:
-                    # Normal case - both fields need to be filled
-                    total_fields += 2
-                    if previous_value and str(previous_value).strip():
-                        filled_fields += 1
-                    if section_data.get(status_field) and str(section_data.get(status_field, "")).strip():
-                        filled_fields += 1
-            else:
-                # No value yet, both fields are required
-                total_fields += 2
-                if previous_value and str(previous_value).strip():
-                    filled_fields += 1
-                if section_data.get(status_field) and str(section_data.get(status_field, "")).strip():
-                    filled_fields += 1
-        else:
-            # For all other sections, count all fields
-            for field_name, field_value in section_data.items():
-                total_fields += 1
-                if field_value and str(field_value).strip():
-                    field_lower = str(field_value).strip().lower()
-                    # For History & Diagnostics and Referral, "none", "no", "nothing" are valid answers,
-                    # but generic values like "yes" for Referral.Source are NOT (they don't tell us the source).
-                    if section_name == "History & Diagnostics":
-                        filled_fields += 1
-                    elif section_name == "Referral" and field_name == "Source":
-                        if field_lower not in ["yes", "no", "none", "n/a", "na", ""]:
-                            filled_fields += 1
-                    else:
-                        # For other sections, don't count "none", "no", "nothing", "n/a" as filled
-                        if field_lower not in ["none", "no", "nothing", "n/a", "na", ""]:
-                            filled_fields += 1
-    
-    if total_fields == 0:
-        return 0
-    
-    progress = (filled_fields / total_fields) * 100
-    return min(100, max(0, round(progress, 1)))
-
-
-def calculate_section_completion_status(form_data):
-    """
-    Calculate completion status for each section with ordering.
-    Completed sections come first, incomplete sections at the bottom.
-    
-    Args:
-        form_data: Dictionary containing form sections and their fields
-        
-    Returns:
-        Dictionary with:
-        - totalSteps: Total number of sections
-        - currentStep: Number of completed sections + 1 (current section being worked on)
-        - progress: Overall progress percentage
-        - steps: List of sections with completion status, ordered (completed first, incomplete at bottom)
-    """
-    if not form_data:
-        return {
-            "totalSteps": 0,
-            "currentStep": 0,
-            "progress": 0,
-            "steps": []
-        }
-    
-    # Define section order (as they appear in the form template)
-    # NOTE: This must match the actual form structure in prompts.py
-    section_order = [
-        "Present Complaint",
-        "Previous Consultations",
-        "Pain Assessment",
-        "History & Diagnostics",  # Combined section (not separate Medical History, Lifestyle Factors, Diagnostic Reports)
-        "Treatment Goals",
-        "Referral"
-    ]
-    
-    completed_sections = []
-    incomplete_sections = []
-    
-    for section_name in section_order:
-        if section_name not in form_data:
-            continue
-            
-        section_data = form_data[section_name]
-        if not isinstance(section_data, dict):
-            continue
-        
-        # Calculate completion for this section
-        filled_fields = 0
-        # Special handling for "Previous Consultations" section
-        if section_name == "Previous Consultations":
-            previous_consultations_field = "Previous Diagnosis or Advice and Prescribed Treatment Taken"
-            status_field = "Current Status of Issue (Improved, Same, Worse)"
-            
-            # Check if user indicated no previous consultations
-            previous_value = section_data.get(previous_consultations_field, "")
-            status_value = section_data.get(status_field, "")
-            
-            # CRITICAL: Check if data was incorrectly extracted
-            # If status is filled but no consultations mentioned, it's likely incorrect extraction
-            consultation_keywords = [
-                "doctor", "physiotherapist", "hospital", "consulted", "visited",
-                "diagnosis", "diagnosed", "prescribed", "treatment", "medicine",
-                "injection", "exercise", "physio", "clinic"
-            ]
-            has_consultation_mention = False
-            if previous_value and str(previous_value).strip():
-                has_consultation_mention = any(
-                    keyword in str(previous_value).strip().lower() 
-                    for keyword in consultation_keywords
-                )
-            
-            # If status is filled but no consultations mentioned, don't count it as complete
-            if status_value and str(status_value).strip() and not previous_value and not has_consultation_mention:
-                # This is likely incorrect extraction - status shouldn't be filled without consultations
-                print(f"[calculate_section_completion_status] Previous Consultations: Status field filled but no consultations mentioned - treating as incomplete")
-                total_fields = 2
-                filled_fields = 0  # Don't count incorrectly extracted data
-            elif previous_value and str(previous_value).strip():
-                previous_value_lower = str(previous_value).strip().lower()
-                no_consultation_indicators = [
-                    "no previous", "didn't visit", "did not visit", "haven't consulted",
-                    "have not consulted", "no consultations", "no doctor", "no hospital",
-                    "never consulted", "not consulted", "none", "nothing"
-                ]
-                has_no_consultations = any(indicator in previous_value_lower for indicator in no_consultation_indicators)
-                
-                # If no previous consultations, only the previous consultations field needs to be filled
-                if has_no_consultations:
-                    total_fields = 1  # Only count the previous consultations field
-                    filled_fields = 1
-                else:
-                    # Normal case - both fields need to be filled
-                    total_fields = 2
-                    if previous_value and str(previous_value).strip():
-                        filled_fields += 1
-                    if status_value and str(status_value).strip():
-                        filled_fields += 1
-            else:
-                # No value yet, both fields are required
-                total_fields = 2
-                filled_fields = 0
-        else:
-            # For all other sections, check all fields normally
-            total_fields = len(section_data)
-            if total_fields == 0:
-                # Empty section, consider incomplete
-                incomplete_sections.append({
-                    "name": section_name,
-                    "isComplete": False,
-                    "completionPercentage": 0,
-                    "filledFields": 0,
-                    "totalFields": 0
-                })
-                continue
-            
-            for field_name, field_value in section_data.items():
-                # Check if field has meaningful data
-                if field_value and str(field_value).strip():
-                    field_lower = str(field_value).strip().lower()
-                    # "nothing", "none", "no" ARE valid patient answers for symptom fields
-                    # (e.g. "nothing makes it better", "none", "nothing as such").
-                    # Only exclude clearly placeholder/empty tokens.
-                    placeholder_only = {"n/a", "na", "nil", "tbd", "unknown"}
-                    if field_lower not in placeholder_only:
-                        filled_fields += 1
-        
-        completion_percentage = (filled_fields / total_fields) * 100 if total_fields > 0 else 0
-        # Mark a section as complete (ticked) only when ALL fields are filled
-        is_complete = filled_fields == total_fields and total_fields > 0
-        
-        # Debug logging for History & Diagnostics and Referral
-        if section_name == "History & Diagnostics":
-            print(f"[calculate_section_completion_status] History & Diagnostics - filled_fields: {filled_fields}, total_fields: {total_fields}, is_complete: {is_complete}, section_data: {section_data}")
-        elif section_name == "Referral":
-            print(f"[calculate_section_completion_status] Referral - filled_fields: {filled_fields}, total_fields: {total_fields}, is_complete: {is_complete}, section_data: {section_data}")
-        
-        section_info = {
-            "name": section_name,
-            "isComplete": is_complete,
-            "completionPercentage": round(completion_percentage, 1),
-            "filledFields": filled_fields,
-            "totalFields": total_fields,
-        }
-        
-        if is_complete:
-            completed_sections.append(section_info)
-        else:
-            incomplete_sections.append(section_info)
-    
-    # Keep canonical section order — do NOT reorder by completion status.
-    # The frontend maps stepStatus by index against a fixed steps array,
-    # so reordering causes the active glow to land on the wrong segment.
-    all_sections = completed_sections + incomplete_sections
-    # Re-sort to canonical order defined by section_order
-    order_map = {name: i for i, name in enumerate(section_order)}
-    all_sections = sorted(all_sections, key=lambda s: order_map.get(s["name"], 99))
-    
-    # Calculate overall progress based on fully completed sections (all fields filled)
-    total_sections = len(all_sections)
-    completed_count = len(completed_sections)
-    progress = (completed_count / total_sections) * 100 if total_sections > 0 else 0
-    
-    # Current step is the first incomplete section (or total if all complete)
-    current_step = completed_count + 1 if incomplete_sections else total_sections
-    
-    return {
-        "totalSteps": total_sections,
-        "currentStep": current_step,
-        "completedSteps": completed_count,  # Explicitly include completed count for frontend
-        "progress": round(progress, 1),
-        "steps": all_sections
-    }
-
-
-async def stream_audio_to_client(websocket, audio_data, message_id):
-    """Stream audio data to client in small chunks to avoid WebSocket size limits"""
-    chunk_size = MAX_CHUNK_SIZE  # Much smaller than the WebSocket limit
-    total_size = len(audio_data)
-    num_chunks = (total_size + chunk_size - 1) // chunk_size  # Ceiling division
-
-    print(f"Streaming {total_size} bytes of audio in {num_chunks} chunks")
-
-    # Signal the start of audio streaming
-    await websocket.send_text(
-        json.dumps(
-            {"type": "audio_start", "message_id": message_id, "total_size": total_size}
-        )
-    )
-
-    # Send the audio in chunks
-    for i in range(0, total_size, chunk_size):
-        end = min(i + chunk_size, total_size)
-        chunk = audio_data[i:end]
-
-        # Encode chunk as base64 to send as JSON
-        chunk_b64 = base64.b64encode(chunk).decode("utf-8")
-
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "type": "audio_chunk",
-                    "message_id": message_id,
-                    "data": chunk_b64,
-                    "is_last": end == total_size,
-                }
-            )
-        )
-
-        # Short delay to avoid flooding
-        await asyncio.sleep(0.01)
-
-    print(f"Finished streaming audio for message {message_id}")
 
 
 # def modify_system_prompt():
@@ -2482,8 +1994,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
     _active_ws_connections.add(websocket)
     WS_CONNECTIONS.inc()
-    _log.info("ws_connected", client_id=client_id)
-    print(f"Client {client_id} connected")
+    _log.info("ws_connected", subject=pseudonymous_id(client_id))
+    print("WebSocket client connected")
 
     # Per-session processing lock — prevents text+audio race condition.
     # Only one message is processed at a time per session.
@@ -2494,7 +2006,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     # The global health_agent singleton caused data contamination between
     # concurrent users — one user's form data would overwrite another's.
     # HealthAgent init is lightweight (just LLM + prompts, no ChromaDB).
-    health_agent = HealthAgent()
+    health_agent = await run_blocking(HealthAgent)
 
     # Store client-specific state
     client_state = {
@@ -2506,6 +2018,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         "user_id": None,
         "interview_id": None,
         "form_id": None,
+        "attempt_id": None,
+        "prom_snapshot": None,
+        "prom_source_doc_id": None,
+        "auth_context": None,
         "first_interaction": True,
         "is_recording": False,
         "received_audio_buffer": bytearray(),
@@ -2563,6 +2079,18 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     data = json.loads(message["text"])
                     msg_type = data.get("type", "")
 
+                    if msg_type != "start_interview" and client_state.get("auth_context") is None:
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "message": "Authentication is required before using this session.",
+                                }
+                            )
+                        )
+                        await websocket.close(code=1008, reason="Authentication required")
+                        break
+
                     if msg_type == "start_interview":
                         # Client is ready to start the interview (after login or page reload)
                         from src.prompts import WELCOME_PROMPT, READY_TO_START_PROMPT
@@ -2582,11 +2110,46 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             continue
 
+                        try:
+                            auth_context = _decode_configured_access_token(
+                                data.get("accessToken", "")
+                            )
+                            authorize_patient(
+                                auth_context,
+                                provided_user_id,
+                                "interview:write",
+                            )
+                        except AuthConfigurationError:
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "message": "Authentication is not configured.",
+                                    }
+                                )
+                            )
+                            await websocket.close(code=1011, reason="Authentication unavailable")
+                            break
+                        except (TokenValidationError, AuthorizationError):
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "message": "The consultation link is invalid or has expired.",
+                                    }
+                                )
+                            )
+                            await websocket.close(code=1008, reason="Access denied")
+                            break
+
+                        client_state["auth_context"] = auth_context
+
                         # Validate that the user exists in the database
-                        if not validate_user_exists(provided_user_id):
+                        if not await run_blocking(validate_user_exists, provided_user_id):
                             # Get database info for error message
-                            db_name = users_collection.database.name if users_collection else "unknown"
-                            collection_name = users_collection.name if users_collection else "users"
+                            db_name, collection_name = collection_namespace(
+                                users_collection, "users"
+                            )
                             error_msg = f"User {provided_user_id} does not exist in {db_name}.{collection_name}. Please use a valid user ID from your user management system."
                             print(f"[start_interview] ERROR: {error_msg}")
                             await websocket.send_text(
@@ -2603,6 +2166,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # formId from URL (e.g. FRM-01, FRM-02); fall back to default
                         provided_form_id = data.get("formId") or DEFAULT_FORM_ID
                         client_state["form_id"] = provided_form_id
+                        provided_attempt_id = data.get("attemptId")
+                        client_state["attempt_id"] = provided_attempt_id
+                        client_state["prom_snapshot"] = None
+                        client_state["prom_source_doc_id"] = None
                         # Initialize form_data early so it's always defined regardless of
                         # resume vs new-interview path (avoids UnboundLocalError).
                         form_data = {}
@@ -2612,12 +2179,49 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         if provided_form_id == DEFAULT_FORM_ID:
                             _raw_tagged, _prom_template = [], {}
                         else:
-                            _raw_tagged, _prom_template, _prom_source_doc_id = fetch_tagged_questions(provided_user_id, provided_form_id)
+                            _raw_tagged, _prom_template, _prom_source_doc_id = await run_blocking(
+                                fetch_tagged_questions,
+                                provided_user_id,
+                                provided_form_id,
+                            )
                             # When questions came from an existing customer-info template doc,
                             # store its _id so saves target that doc directly (prevents duplicates).
                             client_state["prom_source_doc_id"] = _prom_source_doc_id
 
-                        _existing_prom_data = {}  # existing FRM-02 answers; populated below if _raw_tagged
+                        _existing_prom_data = {}
+                        _existing_prom_snapshot = None
+                        if provided_form_id != DEFAULT_FORM_ID:
+                            try:
+                                _existing_frm02 = await run_blocking(
+                                    fetch_form_by_id,
+                                    provided_form_id,
+                                    provided_user_id,
+                                    client_state.get("attempt_id"),
+                                )
+                                if _existing_frm02:
+                                    _existing_prom_data = _existing_frm02.get("form_data", {})
+                                    _existing_prom_snapshot = _existing_frm02.get("promSnapshot")
+                                if _existing_prom_snapshot:
+                                    # Resume the definition actually administered, not a mutable
+                                    # question-bank version fetched later in time.
+                                    _raw_tagged = questions_from_prom_snapshot(
+                                        _existing_prom_snapshot
+                                    )
+                            except ValueError as _snapshot_error:
+                                _log.error(
+                                    "prom_snapshot_invalid",
+                                    error_type=error_type(_snapshot_error),
+                                )
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": "This assessment definition cannot be safely resumed. Please contact the clinic.",
+                                }))
+                                continue
+                            except Exception as _prom_load_error:
+                                _log.warning(
+                                    "prom_resume_lookup_failed",
+                                    error_type=error_type(_prom_load_error),
+                                )
 
                         # Initial qid→text lookup (pre-personalization); overwritten below after
                         # personalization so stored keys match what the patient was actually asked.
@@ -2630,14 +2234,18 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         if _raw_tagged:
                             # Personalize using patient's FRM-01 history
                             try:
-                                _frm01 = fetch_form_by_id(DEFAULT_FORM_ID, provided_user_id)
+                                _frm01 = await run_blocking(
+                                    fetch_form_by_id,
+                                    DEFAULT_FORM_ID,
+                                    provided_user_id,
+                                )
                                 _patient_ctx = _frm01.get("form_data", {}) if _frm01 else {}
                                 _ctx_field_count = sum(
                                     len(v) if isinstance(v, dict) else 1
                                     for v in _patient_ctx.values()
                                 ) if _patient_ctx else 0
                                 print(f"[personalize-questions] FRM-01 found={_frm01 is not None}, ctx_fields={_ctx_field_count}")
-                                _personalized = await asyncio.to_thread(
+                                _personalized = await run_blocking(
                                     personalize_questions,
                                     _raw_tagged, _patient_ctx, health_agent.llm_complete
                                 )
@@ -2645,9 +2253,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 print(f"[personalize-questions] Non-fatal: {_pe}")
                                 _personalized = _raw_tagged
 
-                            # Rebuild prom_template from personalized questions so the skeleton
-                            # keys and answer lookup reflect patient-specific text
-                            # (e.g. "past 3 days" instead of the generic "past 4 weeks").
+                            # Rebuild the legacy human-readable form_data view. Stable identity,
+                            # exact administered wording and responses are stored separately in
+                            # promSnapshot below.
                             _pers_tmpl: dict = {}
                             for _pq in _personalized:
                                 if not isinstance(_pq, dict):
@@ -2679,14 +2287,29 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 if isinstance(_pq, dict) and _pq.get("question_id") and _pq.get("text")
                             }
 
+                            try:
+                                client_state["prom_snapshot"] = (
+                                    _existing_prom_snapshot
+                                    if _existing_prom_snapshot is not None
+                                    else build_prom_snapshot(
+                                        _personalized,
+                                        source_form_id=provided_form_id,
+                                        legacy_form_data=_existing_prom_data,
+                                    )
+                                )
+                            except ValueError as _definition_error:
+                                _log.error(
+                                    "prom_definition_invalid",
+                                    error_type=error_type(_definition_error),
+                                )
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": "This assessment has an invalid question definition. Please contact the clinic.",
+                                }))
+                                continue
+
                             # Skip scales already answered in a previous session (do this BEFORE batching
                             # so the positional grouping inside batch_tagged_questions stays correct)
-                            try:
-                                _existing_frm02 = fetch_form_by_id(provided_form_id, provided_user_id)
-                                _existing_prom_data = _existing_frm02.get("form_data", {}) if _existing_frm02 else {}
-                            except Exception:
-                                _existing_prom_data = {}
-
                             if _existing_prom_data and _prom_template:
                                 # Group personalized questions by scale via question_id prefix
                                 # (same logic as batch_tagged_questions — no positional slicing)
@@ -2718,12 +2341,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         _filtered_personalized.extend(_scale_qs)
                                         _filtered_template[_scale_name] = _fields
                                 if _skipped_scales:
-                                    print(f"[tagged-questions] Skipping {len(_skipped_scales)} already-answered scales: {_skipped_scales}")
+                                    print(f"[tagged-questions] Skipping {len(_skipped_scales)} already-answered scales")
                                 _personalized = _filtered_personalized
                                 _prom_template = _filtered_template
 
                             try:
-                                _batched = await asyncio.to_thread(
+                                _batched = await run_blocking(
                                     batch_tagged_questions, _personalized, health_agent.llm_complete, _prom_template
                                 )
                             except Exception as _be:
@@ -2765,10 +2388,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 # copy it so the skeleton has all sections + question slots.
                                 _skeleton = _cp_skel.deepcopy(_prom_template)
                                 try:
-                                    save_customer_info(
+                                    await run_blocking(
+                                        save_customer_info,
                                         provided_user_id, _skeleton, "PROM",
                                         form_id=provided_form_id,
                                         preferred_doc_id=client_state.get("prom_source_doc_id"),
+                                        attempt_id=client_state.get("attempt_id"),
+                                        prom_snapshot=client_state.get("prom_snapshot"),
                                     )
                                     print(f"[tagged-questions] Created skeleton with {len(_skeleton)} PROM scales")
                                 except Exception as _ske:
@@ -2778,6 +2404,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             client_state["tagged_turn_metas"] = None
                             client_state["tagged_turn_index"] = 0
                             client_state["tagged_form_template"] = None
+                            client_state["prom_snapshot"] = None
 
                         # Initialize LangGraph state for this connection
                         if _interview_graph is not None:
@@ -2790,7 +2417,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 # Set phase to match whether we're resuming or starting fresh
                                 # (will be overwritten when existing form is loaded below)
                                 client_state["graph_phase"] = "welcome"
-                                print(f"[graph] Graph state initialized for user: {provided_user_id}")
+                                print("[graph] Graph state initialized")
                             except Exception as _ge:
                                 print(f"[graph] init_graph_state_in_client failed (non-fatal): {_ge}")
 
@@ -2808,7 +2435,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             client_state["graph_form"] = _restored_form
                             _answered_scales = [k for k, v in _existing_prom_data.items() if _prom_scale_is_answered(v)]
                             if _answered_scales:
-                                print(f"[start_interview] Restored existing PROM answers for: {_answered_scales}")
+                                print(f"[start_interview] Restored {len(_answered_scales)} answered PROM scales")
                         # Always store (even if empty) so the save path knows it's a PROM session
                         client_state["prom_existing_data"] = _existing_prom_data
 
@@ -2816,17 +2443,41 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # separate assessment, never a resume of FRM-01.
                         if _raw_tagged:
                             existing_form = None
-                            print(f"[start_interview] PROM mode — starting fresh for form {provided_form_id}")
+                            print("[start_interview] PROM mode starting fresh")
                         else:
-                            existing_form = fetch_latest_form_for_user(provided_user_id)
+                            existing_form = (
+                                await run_blocking(
+                                    fetch_form_by_id,
+                                    provided_form_id,
+                                    provided_user_id,
+                                    provided_attempt_id,
+                                )
+                                if provided_attempt_id
+                                else await run_blocking(
+                                    fetch_latest_form_for_user,
+                                    provided_user_id,
+                                )
+                            )
+
+                        if provided_attempt_id and not existing_form:
+                            await websocket.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "message": "The requested form attempt was not found.",
+                                    }
+                                )
+                            )
+                            continue
 
                         # Check if user already has a form (resume mode)
                         if existing_form:
-                            print(f"[start_interview] RESUME MODE: Found existing form for user {provided_user_id}.")
+                            print("[start_interview] Resume mode found an existing form")
+                            client_state["attempt_id"] = existing_form.get("attemptId")
                             is_resuming = True
                         else:
                             # NEW INTERVIEW MODE: No existing form for this user, start fresh
-                            print(f"[start_interview] NEW INTERVIEW MODE: No existing form for user {provided_user_id}. Resetting health_agent.")
+                            print("[start_interview] New interview mode; resetting agent state")
                             reset_health_agent_for_new_interview(client_state, provided_user_id, agent=health_agent)
                             # reset_health_agent_for_new_interview clears form_id; restore it
                             client_state["form_id"] = provided_form_id
@@ -2835,17 +2486,22 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # Handle form initialization based on mode (new vs resume)
                         if is_resuming:
                             # RESUME MODE: Load the existing form from MongoDB
-                            print(f"[start_interview] Loading existing form {provided_form_id} (DEFAULT_FORM_ID) for user {provided_user_id} from MongoDB...")
+                            print("[start_interview] Loading existing default form")
                             
                             # Load the form from database (using formId + userId combination)
-                            existing_form = fetch_form_by_id(provided_form_id, provided_user_id)
+                            existing_form = await run_blocking(
+                                fetch_form_by_id,
+                                provided_form_id,
+                                provided_user_id,
+                                client_state.get("attempt_id"),
+                            )
                             
                             if existing_form:
                                 # Verify this form belongs to the current user (double-check)
                                 form_user_id = existing_form.get("userId")
                                 # Normalize to strings for comparison (ObjectId vs string)
                                 if str(form_user_id) != str(provided_user_id):
-                                    print(f"[start_interview] SECURITY ERROR: Form {provided_form_id} belongs to {form_user_id}, but current user is {provided_user_id}")
+                                    print("[start_interview] SECURITY ERROR: form ownership mismatch")
                                     await websocket.send_text(
                                         json.dumps({
                                             "type": "error",
@@ -2928,7 +2584,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 client_state["graph_form_sections"] = list(_get_tmpl().keys())
 
 
-                                print(f"[start_interview] ✓ Loaded form {provided_form_id}, section: {health_agent.current_section}, idx: {health_agent.idx}")
+                                print(f"[start_interview] Loaded form at section index {health_agent.idx}")
                                 
                                 # Decide whether we have enough information to show a full summary
                                 filled_field_count = 0
@@ -2944,11 +2600,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 if filled_field_count >= MIN_FIELDS_FOR_SUMMARY:
                                     # Generate a summary of information collected so far
                                     try:
-                                        summary_text = health_agent.generate_summary()
+                                        summary_text = await run_blocking(
+                                            health_agent.generate_summary
+                                        )
                                     except Exception as e:
-                                        print(f"[start_interview] Error generating resume summary: {e}")
-                                        import traceback
-                                        traceback.print_exc()
+                                        print(f"[start_interview] Resume summary failed: {error_type(e)}")
                                         summary_text = None
 
 
@@ -2970,7 +2626,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     websocket,
                                     client_state,
                                     resume_message,
-                                    build_interview_state(client_state),
+                                    await build_interview_state_async(client_state),
                                     user_response=None
                                 )
 
@@ -2987,7 +2643,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 else:
                                     try:
                                         prompt_template = health_agent.make_template(mode="query")
-                                        next_q_text = health_agent.talk_to_user(prompt_template)
+                                        next_q_text = await run_blocking(
+                                            health_agent.talk_to_user,
+                                            prompt_template,
+                                        )
                                     except Exception as _qe:
                                         print(f"[start_interview] Could not generate next question: {_qe}")
                                         next_q_text = PREDEFINED_QUESTIONS[0][1]
@@ -2996,13 +2655,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     websocket,
                                     client_state,
                                     next_q_text,
-                                    build_interview_state(client_state),
+                                    await build_interview_state_async(client_state),
                                     user_response=None
                                 )
 
                                 continue
                             else:
-                                print(f"[start_interview] ERROR: Form {provided_form_id} not found in database. Starting new interview instead.")
+                                print("[start_interview] Requested form not found; starting a new interview")
                                 # Fall through to create a new form
                                 is_resuming = False
                                 reset_health_agent_for_new_interview(client_state, provided_user_id, agent=health_agent)
@@ -3016,10 +2675,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     for field, value in fields.items():
                                         if value and str(value).strip():
                                             form_is_empty = False
-                                            print(f"[start_interview] ERROR: Form still has data after reset! {section}.{field} = {value}")
+                                            print(f"[start_interview] Reset verification failed at {section}.{field}")
                             
                             if form_is_empty:
-                                print(f"[start_interview] ✓ Interview started for user: {provided_user_id}, form is empty")
+                                print("[start_interview] Interview started with empty form state")
                             else:
                                 print(f"[start_interview] ✗ WARNING: Form has data after reset! Forcing another reset...")
                                 health_agent.init_form()
@@ -3029,20 +2688,27 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                             # Create a new placeholder form (skipped for PROM — form_id already set)
                             if not _raw_tagged:
-                                print(f"[start_interview] Creating new placeholder form for user: {client_state['user_id']}")
-                                form_id = create_placeholder_form(
-                                    client_state["user_id"], client_state
+                                print("[start_interview] Creating placeholder form")
+                                form_id = await run_blocking(
+                                    create_placeholder_form,
+                                    client_state["user_id"],
+                                    client_state,
                                 )
                             else:
                                 form_id = provided_form_id
-                                print(f"[start_interview] PROM mode — using provided form_id {form_id}, no placeholder")
+                                print("[start_interview] PROM mode uses requested form; no placeholder")
                             # Verify the form was created with empty data
                             if form_id:
-                                form_check = fetch_form_by_id(form_id, client_state["user_id"])
+                                form_check = await run_blocking(
+                                    fetch_form_by_id,
+                                    form_id,
+                                    client_state["user_id"],
+                                    client_state.get("attempt_id"),
+                                )
                                 if form_check:
                                     form_data_check = form_check.get("form_data", {})
                                     # Log what was actually saved
-                                    print(f"[start_interview] ✓ Created form {form_id}, verifying it's empty...")
+                                    print("[start_interview] Placeholder created; verifying empty state")
                                     # Check if any fields have non-empty values
                                     has_data = False
                                     for section, fields in form_data_check.items():
@@ -3050,11 +2716,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                             for field, value in fields.items():
                                                 if value and str(value).strip():
                                                     has_data = True
-                                                    print(f"[start_interview] WARNING: Found non-empty data in {section}.{field} = {value}")
+                                                    print(f"[start_interview] WARNING: non-empty value found at {section}.{field}")
                                     if not has_data:
-                                        print(f"[start_interview] ✓ Form {form_id} verified empty")
+                                        print("[start_interview] Placeholder verified empty")
                                     else:
-                                        print(f"[start_interview] ✗ ERROR: Form {form_id} was created with existing data!")
+                                        print("[start_interview] ERROR: placeholder contains existing data")
 
                             # CRITICAL: Ensure health_agent.form is still empty before proceeding
                             # Check if health_agent.form has been contaminated after placeholder creation
@@ -3064,7 +2730,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     for field, value in fields.items():
                                         if value and str(value).strip():
                                             form_has_data = True
-                                            print(f"[start_interview] WARNING: health_agent.form has data before main_processor! {section}.{field} = {value}")
+                            print(f"[start_interview] WARNING: agent state contains data at {section}.{field}")
                             
                             if form_has_data:
                                 print(f"[start_interview] CRITICAL: health_agent.form was contaminated! Resetting again...")
@@ -3083,7 +2749,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 client_state,
                                 "Welcome back! It looks like you've already completed all your outcome assessments. "
                                 "Your responses have been recorded — thank you!",
-                                build_interview_state(client_state, progress_override=100.0, use_db_form=True),
+                                await build_interview_state_async(client_state, progress_override=100.0, use_db_form=True),
                                 user_response=None,
                             )
                             continue
@@ -3101,7 +2767,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 client_state,
                                 "It looks like there are no outcome assessment questions assigned to this form yet. "
                                 "Please check with your clinician.",
-                                build_interview_state(client_state, progress_override=100.0, use_db_form=True),
+                                await build_interview_state_async(client_state, progress_override=100.0, use_db_form=True),
                                 user_response=None,
                             )
                             continue
@@ -3127,7 +2793,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             websocket,
                             client_state,
                             _welcome_text,
-                            build_interview_state(
+                            await build_interview_state_async(
                                 client_state, progress_override=progress, use_db_form=True
                             ),
                             user_response=None
@@ -3138,7 +2804,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             websocket,
                             client_state,
                             first_question,
-                            build_interview_state(
+                            await build_interview_state_async(
                                 client_state, progress_override=progress, use_db_form=True
                             ),
                             user_response=None,
@@ -3151,11 +2817,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         
                         # Ensure we have a valid user_id (may be provided in this message)
                         provided_user_id = data.get("userId")
-                        if client_state.get("user_id") is None and provided_user_id:
-                            client_state["user_id"] = provided_user_id
-                            print(f"[start_new_form] Set user_id from message: {provided_user_id}")
+                        target_user_id = client_state.get("user_id") or provided_user_id
 
-                        if client_state.get("user_id") is None:
+                        if target_user_id is None:
                             await websocket.send_text(
                                 json.dumps(
                                     {
@@ -3166,23 +2830,63 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             continue
 
+                        try:
+                            authorize_patient(
+                                client_state["auth_context"],
+                                target_user_id,
+                                "interview:write",
+                            )
+                        except AuthorizationError:
+                            await websocket.send_text(
+                                json.dumps({"type": "error", "message": "Access denied."})
+                            )
+                            continue
+
+                        if client_state.get("user_id") is None:
+                            client_state["user_id"] = target_user_id
+                            print("[start_new_form] Associated authorized subject with session")
+
                         # Clear the old form_id from client_state to ensure a fresh start
-                        old_form_id = client_state.get("form_id")
                         client_state["form_id"] = None
+                        client_state["attempt_id"] = None
                         
                         # Reset the health agent for a new form (this clears form data)
                         reset_health_agent_for_new_interview(client_state, client_state["user_id"], agent=health_agent)
                         health_agent.talk_mode = "START"
                         
                         # Create a new placeholder form with fresh form_id
-                        new_form_id = create_placeholder_form(client_state["user_id"], client_state)
+                        new_form_id = await run_blocking(
+                            create_placeholder_form,
+                            client_state["user_id"],
+                            client_state,
+                            True,
+                        )
+                        client_state["tagged_turns"] = None
+                        client_state["tagged_turn_metas"] = None
+                        client_state["tagged_turn_index"] = 0
+                        client_state["tagged_form_template"] = None
+                        client_state["prom_existing_data"] = {}
+                        client_state["prom_snapshot"] = None
+                        client_state["prom_source_doc_id"] = None
+                        if _interview_graph is not None and new_form_id:
+                            init_graph_state_in_client(
+                                client_state,
+                                user_id=client_state["user_id"],
+                                form_id=new_form_id,
+                            )
+                            client_state["graph_phase"] = "welcome"
                         
-                        print(f"[start_new_form] Old form_id: {old_form_id}, New form_id: {new_form_id}")
+                        print("[start_new_form] Form state reset requested")
                         print(f"[start_new_form] health_agent.form after reset - keys: {list(health_agent.form.keys())}")
                         
                         # Verify the new form is empty
                         if new_form_id:
-                            form_check = fetch_form_by_id(new_form_id, client_state["user_id"])
+                            form_check = await run_blocking(
+                                fetch_form_by_id,
+                                new_form_id,
+                                client_state["user_id"],
+                                client_state.get("attempt_id"),
+                            )
                             if form_check:
                                 form_data_check = form_check.get("form_data", {})
                                 has_data = any(
@@ -3191,16 +2895,21 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     for v in form_data_check.values()
                                 )
                                 if has_data:
-                                    print(f"[start_new_form] ✗ ERROR: New form {new_form_id} has data!")
+                                    print("[start_new_form] ERROR: new form state contains data")
                                 else:
-                                    print(f"[start_new_form] ✓ Verified new form {new_form_id} is empty")
+                                    print("[start_new_form] New form state verified empty")
                         
                         welcome_text = WELCOME_PROMPT.strip()
                         welcome_text += "\n\n" + READY_TO_START_PROMPT.strip()
                         
                         # Use database form for progress (should be 0% for new empty form)
                         if new_form_id:
-                            form_from_db = fetch_form_by_id(new_form_id, client_state["user_id"])
+                            form_from_db = await run_blocking(
+                                fetch_form_by_id,
+                                new_form_id,
+                                client_state["user_id"],
+                                client_state.get("attempt_id"),
+                            )
                             if form_from_db and form_from_db.get("form_data"):
                                 progress = calculate_form_progress(form_from_db["form_data"])
                             else:
@@ -3212,7 +2921,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             websocket,
                             client_state,
                             welcome_text,
-                            build_interview_state(
+                            await build_interview_state_async(
                                 client_state, progress_override=progress
                             ),
                             user_response=None
@@ -3221,6 +2930,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     elif msg_type == "load_form":
                         # User wants to load an existing form
                         form_id = data.get("formId", "")
+                        attempt_id = data.get("attemptId")
                         if not form_id:
                             await websocket.send_text(
                                 json.dumps(
@@ -3238,7 +2948,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         user_id_for_check = client_state.get("user_id")
                         if existing_form_id and existing_form_id != form_id and user_id_for_check:
                             # Check if the existing form is empty (just created by start_interview)
-                            existing_form = fetch_form_by_id(existing_form_id, user_id_for_check)
+                            existing_form = await run_blocking(
+                                fetch_form_by_id,
+                                existing_form_id,
+                                user_id_for_check,
+                                client_state.get("attempt_id"),
+                            )
                             if existing_form:
                                 form_data_existing = existing_form.get("form_data", {})
                                 is_empty = True
@@ -3252,19 +2967,27 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                             break
                                 
                                 if is_empty:
-                                    print(f"[load_form] Found empty form {existing_form_id} created by start_interview. Deleting it before loading existing form {form_id}.")
+                                    print("[load_form] Removing empty placeholder before loading requested form")
                                     # Delete the empty form to prevent orphaned forms in the database
                                     try:
                                         if customer_info_collection is not None:
-                                            result = customer_info_collection.delete_one({"formId": existing_form_id})
+                                            delete_filter = build_owned_form_filter(
+                                                existing_form,
+                                                user_id_for_check,
+                                                existing_form_id,
+                                            )
+                                            result = await run_blocking(
+                                                customer_info_collection.delete_one,
+                                                delete_filter,
+                                            )
                                             if result.deleted_count > 0:
-                                                print(f"[load_form] ✓ Deleted empty form {existing_form_id}")
+                                                print("[load_form] Deleted empty placeholder")
                                             else:
-                                                print(f"[load_form] Warning: Empty form {existing_form_id} not found in database (may have been already deleted)")
+                                                print("[load_form] Empty placeholder was already absent")
                                         else:
-                                            print(f"[load_form] Warning: MongoDB not initialized, cannot delete empty form {existing_form_id}")
+                                            print("[load_form] MongoDB unavailable; cannot delete empty placeholder")
                                     except Exception as e:
-                                        print(f"[load_form] Error deleting empty form {existing_form_id}: {e}")
+                                        print(f"[load_form] Placeholder deletion failed: {error_type(e)}")
                                     # Clear the form_id from client_state so we use the new one
                                     client_state.pop("form_id", None)
                         
@@ -3278,7 +3001,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 })
                             )
                             continue
-                        form = fetch_form_by_id(form_id, user_id_for_load)
+                        form = await run_blocking(
+                            fetch_form_by_id,
+                            form_id,
+                            user_id_for_load,
+                            attempt_id,
+                        )
                         if not form:
                             await websocket.send_text(
                                 json.dumps(
@@ -3298,7 +3026,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # If client_state doesn't have user_id, set it from the form
                         # (This handles load_form being called before start_interview)
                         if not current_user_id and form_user_id:
-                            print(f"[load_form] Setting user_id from form: {form_user_id}")
+                            print("[load_form] Associated stored subject with session")
                             client_state["user_id"] = form_user_id
                             current_user_id = form_user_id
                         
@@ -3312,7 +3040,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     }
                                 )
                             )
-                            print(f"[load_form] Security check failed: form belongs to {form_user_id}, but current user is {current_user_id}")
+                            print("[load_form] Security check failed: form ownership mismatch")
                             continue
                         
                         # CRITICAL: Initialize/reset health_agent BEFORE loading form data to prevent data leakage
@@ -3344,7 +3072,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         )
                         if has_form_data:
                             health_agent.talk_mode = "USER"
-                            print(f"[load_form] Form {form_id} has existing data, setting talk_mode to USER")
+                            print("[load_form] Existing data loaded; switching to user mode")
                         
                         # Determine the correct idx AND set current_section to first incomplete section
                         # idx=0: Present Complaint and Pain Assessment
@@ -3395,10 +3123,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         
                         print(f"[load_form] Restored idx={health_agent.idx} based on section completion status")
                         
-                        print(f"[load_form] Loaded form {form_id} for user {current_user_id} (deep copied, talk_mode={health_agent.talk_mode}, idx={health_agent.idx})")
+                        print(f"[load_form] Loaded deep-copied form state at index {health_agent.idx}")
                         
                         # Store form_id in client state for saving
                         client_state["form_id"] = form_id
+                        client_state["attempt_id"] = form.get("attemptId")
                         
                         # Calculate progress using the deep copied data
                         progress = calculate_form_progress(form_data_copy)
@@ -3413,15 +3142,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             if is_complete:
                                 # Form is complete - show summary for confirmation
                                 try:
-                                    summary = health_agent.generate_summary()
+                                    summary = await run_blocking(
+                                        health_agent.generate_summary
+                                    )
                                     health_agent.conversation_state['awaiting_summary_confirmation'] = True
                                     health_agent.history.append({"role": "agent", "message": summary})
                                     next_message = summary
                                     print(f"[load_form] Form is complete, generated summary for confirmation")
                                 except Exception as e:
-                                    print(f"[load_form] Error generating summary: {e}")
-                                    import traceback
-                                    traceback.print_exc()
+                                    print(f"[load_form] Summary generation failed: {error_type(e)}")
                             else:
                                 # Form has data but is not complete - generate next question
                                 try:
@@ -3438,23 +3167,24 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                             prompt_template = health_agent.make_template(mode="query")
                                     
                                     if prompt_template and prompt_template != "SKIP_SECTION":
-                                        next_message = health_agent.talk_to_user(prompt_template)
+                                        next_message = await run_blocking(
+                                            health_agent.talk_to_user,
+                                            prompt_template,
+                                        )
                                         # Add to history
                                         health_agent.history.append({"role": "agent", "message": next_message})
-                                        print(f"[load_form] Generated next question: {next_message[:100]}...")
+                                        print(f"[load_form] Generated next question ({len(next_message)} chars)")
                                     else:
                                         print(f"[load_form] Could not generate question (section may be complete or skipped)")
                                 except Exception as e:
-                                    print(f"[load_form] Error generating next question: {e}")
-                                    import traceback
-                                    traceback.print_exc()
+                                    print(f"[load_form] Question generation failed: {error_type(e)}")
                         
                         # Send confirmation and current state (use deep copy, not original)
                         response_data = {
                             "type": "form_loaded",
                             "text": f"Loaded form: {form.get('title', 'Untitled Form')}",
                             "session_id": client_state["session_id"],
-                            "interview_state": build_interview_state(
+                            "interview_state": await build_interview_state_async(
                                 client_state, progress_override=progress
                             ),
                             "form_data": form_data_copy,  # Use deep copy
@@ -3469,17 +3199,17 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 websocket,
                                 client_state,
                                 next_message,
-                                interview_state=build_interview_state(client_state, progress_override=progress),
+                                interview_state=await build_interview_state_async(client_state, progress_override=progress),
                                 user_response=None
                             )
-                            print(f"[load_form] Sent next question/summary to user: {next_message[:100]}...")
+                            print(f"[load_form] Sent next question/summary ({len(next_message)} chars)")
                         else:
                             # If no question could be generated, at least send a message indicating we're ready
                             await send_text_message(
                                 websocket,
                                 client_state,
                                 "Welcome back! Let's continue with your medical interview.",
-                                interview_state=build_interview_state(client_state, progress_override=progress),
+                                interview_state=await build_interview_state_async(client_state, progress_override=progress),
                                 user_response=None
                             )
                         
@@ -3488,23 +3218,36 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     elif msg_type == "end_session":
                         provided_user_id = data.get("userId")
                         if provided_user_id:
+                            try:
+                                authorize_patient(
+                                    client_state["auth_context"],
+                                    provided_user_id,
+                                    "interview:write",
+                                )
+                            except AuthorizationError:
+                                await websocket.send_text(
+                                    json.dumps({"type": "error", "message": "Access denied."})
+                                )
+                                continue
                             client_state["user_id"] = provided_user_id
 
                         try:
                             import copy
                             health_agent.save_progress()
                             form_id = client_state.get("form_id")
-                            save_customer_info(
+                            await run_blocking(
+                                save_customer_info,
                                 user_id=client_state["user_id"],
                                 form_data=copy.deepcopy(health_agent.form),  # Deep copy to prevent sharing
                                 current_section=health_agent.current_section,
-                                form_id=form_id
+                                form_id=form_id,
+                                attempt_id=client_state.get("attempt_id"),
                             )
                             await send_text_message(
                                 websocket,
                                 client_state,
                                 "Interview summary saved.",
-                                build_interview_state(
+                                await build_interview_state_async(
                                     client_state,
                                     progress_override=calculate_form_progress(
                                         health_agent.form
@@ -3513,15 +3256,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 user_response=None
                             )
                         except Exception as e:
-                            print(f"Error saving customer info on end_session: {e}")
+                            print(f"[end_session] Save failed: {error_type(e)}")
 
                     elif msg_type == "audio_start":
                         # Client is starting to send audio
                         client_state["is_recording"] = True
                         client_state["received_audio_buffer"] = bytearray()
-                        client_state["recording_start_time"] = data.get(
-                            "timestamp", time.time()
-                        )
+                        # Use a monotonic server clock; client timestamps can be
+                        # absent, use different units, or be manipulated.
+                        client_state["recording_start_time"] = time.monotonic()
                         print("Client started sending audio")
 
                     elif msg_type == "text_input":
@@ -3530,13 +3273,97 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         if not text_input:
                             continue
 
+                        try:
+                            _request_decision = _request_window.register(
+                                client_state.get("user_id"),
+                                data.get("requestId"),
+                                data.get("questionId"),
+                            )
+                        except ValueError as _request_error:
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "text": str(_request_error),
+                            }))
+                            continue
+                        if _request_decision is RequestDecision.CONFLICT:
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "text": "requestId was already used for a different question",
+                            }))
+                            continue
+                        if _request_decision is RequestDecision.DUPLICATE:
+                            await websocket.send_text(json.dumps({
+                                "type": "submission_ack",
+                                "status": "duplicate",
+                                "requestId": data.get("requestId"),
+                            }))
+                            continue
+
                         text_input = sanitize_patient_input(text_input)
                         if not _rate_limiter.check(client_state.get("user_id", "anon")):
                             await websocket.send_text(json.dumps({"type": "error", "text": "Too many messages. Please slow down."}))
                             continue
 
-                        print(f"Received text input: {text_input}")
+                        print(f"[text_input] Received patient input ({len(text_input)} chars)")
                         print(f"[text_input] Current talk_mode: {health_agent.talk_mode}, history length: {len(health_agent.history)}")
+
+                        # Identify only fully validated multi-answer UI payloads.
+                        # Voice/free-form input remains on the existing AI path.
+                        _prom_meta_for_input = None
+                        _prom_meta_index = client_state.get("tagged_turn_index", 1) - 1
+                        _prom_metas_for_input = client_state.get("tagged_turn_metas") or []
+                        if 0 <= _prom_meta_index < len(_prom_metas_for_input):
+                            _prom_meta_for_input = _prom_metas_for_input[_prom_meta_index]
+                        _structured_prom_answers = parse_structured_prom_answers(
+                            text_input,
+                            _prom_meta_for_input,
+                            data.get("inputMode"),
+                        )
+
+                        # Deterministic clinical safety boundary. This must remain before
+                        # every off-topic, assessment, extraction, and generation LLM call.
+                        _escalation = assess_urgent_risk(
+                            text_input,
+                            question_meta=_prom_meta_for_input,
+                            structured_answers=_structured_prom_answers,
+                        )
+                        if _escalation is not None:
+                            if clinical_escalations_collection is not None:
+                                try:
+                                    await run_blocking(
+                                        record_escalation,
+                                        clinical_escalations_collection,
+                                        _escalation,
+                                        patient_id=client_state.get("user_id") or "",
+                                        form_id=client_state.get("form_id"),
+                                        attempt_id=client_state.get("attempt_id"),
+                                        session_id=client_state.get("session_id"),
+                                        request_id=data.get("requestId"),
+                                    )
+                                except Exception as _escalation_store_error:
+                                    # Detection is fail-safe: storage failure must never resume AI.
+                                    _log.error(
+                                        "clinical_escalation_persist_failed",
+                                        error_type=error_type(_escalation_store_error),
+                                    )
+                            _log.warning(
+                                "clinical_escalation_detected",
+                                subject=pseudonymous_id(client_state.get("user_id")),
+                                rule_id=_escalation.rule_id,
+                                category=_escalation.category,
+                                severity=_escalation.severity,
+                                policy_version=_escalation.policy_version,
+                            )
+                            await websocket.send_text(json.dumps({
+                                "type": "clinical_escalation",
+                                "text": _escalation.patient_message,
+                                "category": _escalation.category,
+                                "severity": _escalation.severity,
+                                "policyVersion": _escalation.policy_version,
+                                "stopInterview": _escalation.stop_interview,
+                            }))
+                            await websocket.close(code=4003, reason="Clinical escalation")
+                            break
 
                         # ── Off-topic question shortcut — answer WITHOUT touching the graph ──
                         # Detects two categories:
@@ -3550,7 +3377,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # First turn (talk_mode START) is always the intake response.
                         _ti_lower = text_input.lower()
                         _word_count = len(text_input.split())
-                        _off_topic_eligible = health_agent.talk_mode != "START" and _word_count <= 25
+                        _off_topic_eligible = (
+                            _structured_prom_answers is None
+                            and health_agent.talk_mode != "START"
+                            and _word_count <= 25
+                        )
 
                         # "stance" alone always means Stance Health — catch it too
                         _is_just_stance = (
@@ -3622,7 +3453,7 @@ Information collected:
 Patient just asked: "{text_input}"
 
 Your response:"""
-                                _assess_ans = await asyncio.to_thread(health_agent.llm_complete, _assess_prompt)
+                                _assess_ans = await run_blocking(health_agent.llm_complete, _assess_prompt)
                                 _assess_ans = (_assess_ans or "").strip()
                                 if _assess_ans:
                                     print(f"[assessment] Provided preliminary clinical impression")
@@ -3631,7 +3462,7 @@ Your response:"""
                                             await websocket.send_text(json.dumps({"type": "token", "content": _word + " "}))
                                     await send_text_message(
                                         websocket, client_state, _assess_ans,
-                                        build_interview_state(client_state),
+                                        await build_interview_state_async(client_state),
                                         user_response=text_input,
                                     )
                                     continue
@@ -3644,12 +3475,12 @@ Your response:"""
 
                                 if _is_brand:
                                     # Query brandbook ChromaDB (stance_brand_collection)
-                                    _ans = await asyncio.to_thread(
+                                    _ans = await run_blocking(
                                         _answer_brand_question, text_input, health_agent.llm_complete
                                     )
                                 else:
                                     # Query Snell's anatomy ChromaDB (single_book_collection)
-                                    _ans = await asyncio.to_thread(
+                                    _ans = await run_blocking(
                                         _answer_medical_question, text_input, health_agent.llm_complete
                                     )
 
@@ -3667,7 +3498,7 @@ A patient asked: "{text_input}"
 {"IMPORTANT: Do NOT invent specific facts (number of centers, prices, addresses). If unsure, say to visit stancehealth.com." if _is_brand else "Answer with accurate, helpful medical information."}
 
 Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's continue with your assessment' — just answer naturally."""
-                                    _ans = await asyncio.to_thread(health_agent.llm_complete, _edu_prompt)
+                                    _ans = await run_blocking(health_agent.llm_complete, _edu_prompt)
                                     _ans = _ans.strip() if _ans else ""
 
                                 if _ans:
@@ -3677,7 +3508,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                             await websocket.send_text(json.dumps({"type": "token", "content": _word + " "}))
                                     await send_text_message(
                                         websocket, client_state, _ans,
-                                        build_interview_state(client_state),
+                                        await build_interview_state_async(client_state),
                                         user_response=text_input,
                                     )
                                     continue
@@ -3696,13 +3527,21 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
 
                                 # Send thought stages so the frontend shows the AgentThoughtStream card
                                 _current_sec = client_state.get("graph_current_section", "")
-                                await websocket.send_text(json.dumps({
-                                    "type": "thought_update",
-                                    "thoughts": [
+                                if _structured_prom_answers is not None:
+                                    _thoughts = [
+                                        {"stage": "Reading your response", "detail": "Checking assessment answers", "status": "active"},
+                                        {"stage": "Validating responses", "detail": "Structured assessment", "status": "pending"},
+                                        {"stage": "Preparing next question", "detail": "", "status": "pending"},
+                                    ]
+                                else:
+                                    _thoughts = [
                                         {"stage": "Reading your response", "detail": f"Processing: {text_input[:40]}...", "status": "active"},
                                         {"stage": "Extracting medical details", "detail": _current_sec or "Present Complaint", "status": "pending"},
                                         {"stage": "Formulating next question", "detail": "", "status": "pending"},
                                     ]
+                                await websocket.send_text(json.dumps({
+                                    "type": "thought_update",
+                                    "thoughts": _thoughts,
                                 }))
 
                                 # For PROM sessions: directly record the user's answer into
@@ -3711,11 +3550,11 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                 # empty and _fill_unanswered_fields stamps it
                                 # "Not mentioned by patient".
                                 _prom_injected_form = None  # set below when answers are injected
+                                _structured_prom_bypass = False
+                                _prom_answer_updates = {}
+                                _pt_meta = _prom_meta_for_input
                                 if client_state.get("tagged_form_template"):
-                                    _pt_idx = client_state.get("tagged_turn_index", 1) - 1
-                                    _pt_metas = client_state.get("tagged_turn_metas") or []
-                                    if 0 <= _pt_idx < len(_pt_metas):
-                                        _pt_meta = _pt_metas[_pt_idx]
+                                    if _pt_meta:
                                         import copy as _cp2
                                         _gf = _cp2.deepcopy(client_state.get("graph_form") or {})
                                         _qt_map = client_state.get("tagged_question_texts") or {}
@@ -3726,8 +3565,9 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                         if _pt_qids_multi:
                                             # Multi-answer turn: structured MCQ submit uses "|" separator.
                                             # Voice/paragraph input has no "|" — extract answers via LLM.
-                                            if "|" in text_input:
-                                                _answers = [a.strip() for a in text_input.split("|")]
+                                            if _structured_prom_answers is not None:
+                                                _answers = _structured_prom_answers
+                                                _structured_prom_bypass = True
                                             else:
                                                 # Natural speech: ask LLM to map the patient's words to
                                                 # the correct option for each question.
@@ -3750,8 +3590,9 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                                         _voice_prompt += f"Options: {', '.join(_vo)}\n"
                                                     _voice_prompt += f"Answer {_vi+1}: "
                                                 try:
-                                                    _voice_resp = health_agent.llm_complete(
-                                                        _voice_prompt
+                                                    _voice_resp = await run_blocking(
+                                                        health_agent.llm_complete,
+                                                        _voice_prompt,
                                                     )
                                                     # Parse "Answer N: <value>" lines
                                                     import re as _re
@@ -3760,7 +3601,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                                     # Pad / trim to match number of questions
                                                     while len(_answers) < len(_pt_qids_multi):
                                                         _answers.append("")
-                                                    print(f"[prom] Voice extraction: {_answers}")
+                                                    print(f"[prom] Voice extraction produced {len(_answers)} answers")
                                                 except Exception as _ve:
                                                     print(f"[prom] Voice extraction failed: {_ve}")
                                                     _answers = [""] * len(_pt_qids_multi)
@@ -3782,7 +3623,8 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                                 if _mscale not in _gf or not isinstance(_gf[_mscale], dict):
                                                     _gf[_mscale] = {}
                                                 _gf[_mscale][_mfield] = _manswer
-                                                print(f"[prom] Multi-saved: {_mscale}.{_mfield[:40]} = {_manswer!r}")
+                                                _prom_answer_updates[_mqid] = _manswer
+                                                print("[prom] Structured answer persisted")
 
                                         elif _pt_qid_single:
                                             # Single-question turn: save directly
@@ -3800,23 +3642,30 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                             if _pt_scale not in _gf or not isinstance(_gf[_pt_scale], dict):
                                                 _gf[_pt_scale] = {}
                                             _gf[_pt_scale][_pt_field] = text_input
-                                            print(f"[prom] Saved answer: {_pt_scale}.{_pt_field[:40]} = {text_input!r}")
+                                            _prom_answer_updates[_pt_qid_single] = text_input
+                                            print("[prom] Answer persisted")
 
                                         client_state["graph_form"] = _gf
+                                        if _prom_answer_updates and client_state.get("prom_snapshot"):
+                                            client_state["prom_snapshot"] = apply_prom_answers(
+                                                client_state["prom_snapshot"],
+                                                _prom_answer_updates,
+                                            )
                                         # Immediately persist answers — don't depend on result_state["form"]
                                         # after the graph runs, since graph nodes may not preserve the
                                         # per-question PROM dict structure.
                                         import copy as _cp_prom
                                         _prom_injected_form = _cp_prom.deepcopy(_gf)
-                                        asyncio.create_task(asyncio.to_thread(
+                                        await run_blocking(
                                             save_customer_info,
-                                            client_state.get("user_id", ""),
-                                            _prom_injected_form,
-                                            "PROM",
-                                            client_state.get("form_id", ""),
-                                            None, None,
-                                            client_state.get("prom_source_doc_id"),
-                                        ))
+                                            user_id=client_state.get("user_id", ""),
+                                            form_data=_prom_injected_form,
+                                            current_section="PROM",
+                                            form_id=client_state.get("form_id", ""),
+                                            preferred_doc_id=client_state.get("prom_source_doc_id"),
+                                            attempt_id=client_state.get("attempt_id"),
+                                            prom_snapshot=client_state.get("prom_snapshot"),
+                                        )
 
                                 # ── Re-ask unanswered PROM questions ──────────────────────────────
                                 # After injecting answers, check if any questions were left blank
@@ -3887,6 +3736,80 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                         client_state["tagged_turn_metas"] = _ttm2
                                         print(f"[prom] Re-ask: {len(_reask_ids)} unanswered questions inserted at idx {_cur_idx}")
 
+                                # Structured PROM submissions are already validated, mapped,
+                                # and queued for persistence above. Advancing the pre-built
+                                # question list is deterministic, so running general intake
+                                # extraction/question generation would add cost without changing
+                                # the response or saved values.
+                                if _structured_prom_bypass:
+                                    _next_index = client_state.get("tagged_turn_index", 0)
+                                    response_text, _prom_override_meta, _new_index, _is_complete = advance_tagged_turn(
+                                        client_state.get("tagged_turns") or [],
+                                        client_state.get("tagged_turn_metas") or [],
+                                        _next_index,
+                                    )
+                                    client_state["tagged_turn_index"] = _new_index
+
+                                    _history = list(client_state.get("graph_history") or [])
+                                    _history.extend([
+                                        {"role": "user", "message": text_input},
+                                        {"role": "agent", "message": response_text},
+                                    ])
+                                    client_state["graph_history"] = _history
+
+                                    _previous_prom = client_state.get("prom_existing_data") or {}
+                                    _prom_template = client_state.get("tagged_form_template") or {}
+                                    _all_scales = list({**_previous_prom, **_prom_template}.keys())
+                                    _answered_scales = sum(
+                                        1 for _scale in _all_scales
+                                        if _prom_scale_is_answered(_previous_prom.get(_scale))
+                                        or _prom_scale_is_answered((_prom_injected_form or {}).get(_scale))
+                                    )
+                                    progress = (
+                                        round(_answered_scales / len(_all_scales) * 100)
+                                        if _all_scales else (100.0 if _is_complete else 0.0)
+                                    )
+                                    _prom_result_state = {
+                                        "form": _prom_injected_form or {},
+                                        "current_section": "PROM",
+                                        "missing_fields": [],
+                                    }
+                                    await send_text_message(
+                                        websocket,
+                                        client_state,
+                                        response_text,
+                                        await run_blocking(
+                                            build_interview_state_from_graph,
+                                            _prom_result_state,
+                                            client_state,
+                                            fetch_form_attachments_fn=fetch_form_attachments,
+                                            calculate_form_progress_fn=calculate_form_progress,
+                                            calculate_section_completion_status_fn=calculate_section_completion_status,
+                                            fetch_form_by_id_fn=None,
+                                            progress_override=progress,
+                                        ),
+                                        user_response=text_input,
+                                        question_meta=_prom_override_meta,
+                                    )
+                                    _log.info(
+                                        "prom_structured_turn_complete",
+                                        question_count=len(_structured_prom_answers),
+                                        complete=_is_complete,
+                                    )
+                                    if _is_complete:
+                                        await run_blocking(
+                                            save_customer_info,
+                                            user_id=client_state.get("user_id", ""),
+                                            form_data=_prom_injected_form or client_state.get("graph_form") or {},
+                                            current_section="PROM",
+                                            form_id=client_state.get("form_id", ""),
+                                            preferred_doc_id=client_state.get("prom_source_doc_id"),
+                                            lifecycle_status=FORM_COMPLETED,
+                                            attempt_id=client_state.get("attempt_id"),
+                                            prom_snapshot=client_state.get("prom_snapshot"),
+                                        )
+                                    continue
+
                                 client_state["_fetch_form_fn"] = fetch_form_by_id
                                 # Capture next PROM turn index BEFORE graph runs so we can
                                 # override the response regardless of what the graph generates.
@@ -3894,7 +3817,12 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     client_state.get("tagged_turn_index", 0)
                                     if client_state.get("tagged_form_template") else None
                                 )
-                                graph_state = build_graph_state(client_state, text_input, _save_for_graph)
+                                graph_state = await run_blocking(
+                                    build_graph_state,
+                                    client_state,
+                                    text_input,
+                                    _save_for_graph,
+                                )
 
                                 # Attach Langfuse user/session context for this turn
                                 _lf_ctx = None
@@ -3902,11 +3830,9 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     try:
                                         from langfuse import propagate_attributes
                                         _lf_ctx = propagate_attributes(
-                                            user_id=client_state.get("user_id", "unknown"),
-                                            session_id=client_state.get("session_id", "unknown"),
+                                            user_id=pseudonymous_id(client_state.get("user_id")) or "anonymous",
+                                            session_id=pseudonymous_id(client_state.get("session_id")) or "anonymous",
                                             metadata={
-                                                "form_id": client_state.get("form_id", ""),
-                                                "section": client_state.get("graph_current_section", ""),
                                                 "phase": client_state.get("graph_phase", ""),
                                             },
                                         )
@@ -3916,8 +3842,8 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
 
                                 # Store user/session on health_agent so llm_complete can
                                 # attach them to the Langfuse trace from inside the thread.
-                                health_agent._langfuse_user_id = client_state.get("user_id", "")
-                                health_agent._langfuse_session_id = client_state.get("session_id", "")
+                                health_agent._langfuse_user_id = pseudonymous_id(client_state.get("user_id"))
+                                health_agent._langfuse_session_id = pseudonymous_id(client_state.get("session_id"))
 
                                 # ── Run graph + send thought updates around it ──
                                 # Stream via astream(stream_mode=["messages","values"], version="v2").
@@ -3953,9 +3879,10 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                         elif chunk["type"] == "values":
                                             result_state = chunk["data"]  # accumulate final state
                                 except Exception as _stream_err:
-                                    print(f"[graph] astream error: {_stream_err} — falling back to invoke")
-                                    result_state = await asyncio.get_event_loop().run_in_executor(
-                                        None, _interview_graph.invoke, graph_state
+                                    print(f"[graph] Streaming failed with {error_type(_stream_err)}; using invoke")
+                                    result_state = await run_blocking(
+                                        _interview_graph.invoke,
+                                        graph_state,
                                     )
 
                                 print(f"[timing] turn_total={(time.perf_counter() - _turn_t0) * 1000:.0f}ms "
@@ -3980,13 +3907,18 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                 response_text = _raw_response if isinstance(_raw_response, str) else (
                                     _raw_response.get("text", "") if isinstance(_raw_response, dict) else str(_raw_response)
                                 )
-                                _log.info("graph_turn_complete", phase=(result_state.get('phase') if result_state else 'unknown'), response_preview=response_text[:80])
+                                _log.info(
+                                    "graph_turn_complete",
+                                    phase=(result_state.get('phase') if result_state else 'unknown'),
+                                    response_chars=len(response_text),
+                                )
 
                                 # PROM session override: the graph's generate_question node
                                 # may produce FRM-01 intake questions when the user speaks
                                 # naturally (e.g. "i have a severe hip pain!"). Ignore the
                                 # graph's response_text and serve the correct next tagged turn.
                                 _prom_override_meta = None
+                                _prom_session_complete = False
                                 if _prom_next_turn_idx is not None:
                                     _tt_list = client_state.get("tagged_turns") or []
                                     _tt_metas = client_state.get("tagged_turn_metas") or []
@@ -4001,6 +3933,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     else:
                                         response_text = "Thank you for completing the assessment! Your responses have been recorded."
                                         client_state["tagged_turn_index"] = _prom_next_turn_idx
+                                        _prom_session_complete = True
 
                                 # Opt 3: use cached form for progress — no blocking DB fetch per turn
                                 _cached_form = result_state.get("form", {})
@@ -4021,7 +3954,8 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     websocket,
                                     client_state,
                                     response_text,
-                                    build_interview_state_from_graph(
+                                    await run_blocking(
+                                        build_interview_state_from_graph,
                                         result_state,
                                         client_state,
                                         fetch_form_attachments_fn=fetch_form_attachments,
@@ -4035,7 +3969,8 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     question_meta=_prom_override_meta if _prom_override_meta is not None else result_state.get("tagged_question_meta"),
                                 )
 
-                                # Opt 3: persist to MongoDB as background task — don't block response
+                                # Persist after sending the response, but await completion so a
+                                # disconnect/shutdown cannot silently abandon the clinical save.
                                 _save_user_id = client_state.get("user_id", "")
                                 _save_form_id = client_state.get("form_id", "")
                                 _save_form = result_state.get("form", {})
@@ -4044,13 +3979,27 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                 # avoid overwriting the per-question dict structure with empty strings
                                 # if the graph didn't preserve the injected answers in result_state["form"].
                                 if client_state.get("tagged_form_template"):
-                                    _save_form = None  # skip post-graph save for PROM (already saved above)
+                                    if _prom_session_complete:
+                                        await run_blocking(
+                                            save_customer_info,
+                                            user_id=_save_user_id,
+                                            form_data=_prom_injected_form or client_state.get("graph_form") or {},
+                                            current_section="PROM",
+                                            form_id=_save_form_id,
+                                            preferred_doc_id=client_state.get("prom_source_doc_id"),
+                                            lifecycle_status=FORM_COMPLETED,
+                                            attempt_id=client_state.get("attempt_id"),
+                                            prom_snapshot=client_state.get("prom_snapshot"),
+                                        )
                                 else:
                                     _save_section = result_state.get("current_section", "")
-                                    asyncio.create_task(asyncio.to_thread(
+                                    await run_blocking(
                                         _save_for_graph,
-                                        _save_user_id, _save_form, _save_section, _save_form_id
-                                    ))
+                                        _save_user_id, _save_form, _save_section, _save_form_id,
+                                        None, None,
+                                        FORM_COMPLETED if result_state.get("phase") == "complete" else None,
+                                        client_state.get("attempt_id"),
+                                    )
 
                             # ── HEALTHAGENT FALLBACK PATH ───────────────────────
                             else:
@@ -4061,7 +4010,10 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     completed_nodes=[],
                                     active_node="extract_form_data",
                                 )
-                                response_text = health_agent.main_processor(text_input)
+                                response_text = await run_blocking(
+                                    health_agent.main_processor,
+                                    text_input,
+                                )
                                 # Send thought update after processing
                                 await _send_thought_update(
                                     websocket,
@@ -4074,7 +4026,10 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                         health_agent.current_section = health_agent.form_sections[current_index + 1]
                                         prompt_template = health_agent.make_template(mode="query")
                                         if prompt_template and prompt_template != "SKIP_SECTION":
-                                            response_text = health_agent.talk_to_user(prompt_template)
+                                            response_text = await run_blocking(
+                                                health_agent.talk_to_user,
+                                                prompt_template,
+                                            )
                                             health_agent.history.append({"role": "agent", "message": response_text})
                                         else:
                                             response_text = "Let me move on to the next section."
@@ -4088,18 +4043,26 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     form_id = client_state.get("form_id")
                                     user_id = client_state.get("user_id")
                                     if form_id and user_id:
-                                        existing_form = fetch_form_by_id(form_id, user_id)
+                                        existing_form = await run_blocking(
+                                            fetch_form_by_id,
+                                            form_id,
+                                            user_id,
+                                            client_state.get("attempt_id"),
+                                        )
                                         if existing_form:
                                             form_user_id = existing_form.get("userId")
                                             if str(form_user_id) != str(user_id):
-                                                print(f"[text_input] SECURITY ERROR: Form {form_id} belongs to {form_user_id}, not {user_id}")
+                                                print("[text_input] SECURITY ERROR: form ownership mismatch")
                                                 continue
                                     import copy
-                                    saved_form_id = save_customer_info(
+                                    saved_form_id = await run_blocking(
+                                        save_customer_info,
                                         user_id=user_id,
                                         form_data=copy.deepcopy(health_agent.form),
                                         current_section=health_agent.current_section,
                                         form_id=form_id,
+                                        lifecycle_status=FORM_COMPLETED if is_complete else None,
+                                        attempt_id=client_state.get("attempt_id"),
                                     )
                                     if saved_form_id and not form_id:
                                         client_state["form_id"] = saved_form_id
@@ -4110,7 +4073,12 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     form_id = client_state.get("form_id")
                                     user_id = client_state.get("user_id")
                                     if form_id and user_id:
-                                        db_form = fetch_form_by_id(form_id, user_id)
+                                        db_form = await run_blocking(
+                                            fetch_form_by_id,
+                                            form_id,
+                                            user_id,
+                                            client_state.get("attempt_id"),
+                                        )
                                         progress = calculate_form_progress(
                                             db_form["form_data"] if db_form and db_form.get("form_data")
                                             else health_agent.form
@@ -4120,21 +4088,19 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
 
                                 await send_text_message(
                                     websocket, client_state, response_text,
-                                    build_interview_state(client_state, progress_override=progress),
+                                    await build_interview_state_async(client_state, progress_override=progress),
                                     user_response=text_input,
                                 )
 
                         except Exception as e:
-                            import traceback
                             err_str = str(e)
                             # 1001 = client navigated away; 1000 = normal close — don't try to send
                             is_disconnect = any(code in err_str for code in ("1001", "1000", "going away", "ConnectionClosed", "disconnect"))
                             if not is_disconnect:
-                                print(f"Error processing text input: {e}")
-                                traceback.print_exc()
+                                print(f"[text_input] Processing failed: {error_type(e)}")
                                 try:
                                     await websocket.send_text(
-                                        json.dumps({"type": "error", "text": f"Error: {err_str}"})
+                                        json.dumps({"type": "error", "text": "Unable to process that response. Please try again."})
                                     )
                                 except Exception:
                                     pass  # socket already closed
@@ -4148,8 +4114,32 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                         client_state["is_recording"] = False
 
                         # Process the accumulated audio
-                        audio_bytes = client_state["received_audio_buffer"]
-                        audio_duration = data.get("duration", 0)
+                        audio_bytes = bytes(client_state["received_audio_buffer"])
+                        client_state["received_audio_buffer"].clear()
+                        started_at = client_state.get("recording_start_time")
+                        elapsed_seconds = (
+                            max(0.0, time.monotonic() - started_at)
+                            if isinstance(started_at, (int, float))
+                            else 0.0
+                        )
+                        client_state["recording_start_time"] = None
+                        try:
+                            audio_duration = float(data.get("duration", 0) or 0)
+                        except (TypeError, ValueError):
+                            audio_duration = 0.0
+                        limit_error = audio_limit_error(
+                            current_bytes=len(audio_bytes),
+                            incoming_bytes=0,
+                            elapsed_seconds=elapsed_seconds,
+                            max_total_bytes=MAX_AUDIO_SESSION_BYTES,
+                            max_duration_seconds=MAX_AUDIO_SESSION_SECONDS,
+                            declared_duration_seconds=audio_duration,
+                        )
+                        if limit_error:
+                            await websocket.send_text(
+                                json.dumps({"type": "error", "text": limit_error})
+                            )
+                            continue
                         print(
                             f"Received complete audio: {len(audio_bytes)} bytes, duration: {audio_duration:.2f}s"
                         )
@@ -4180,11 +4170,11 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                             from app.audio.stt import transcribe_audio_bytes, is_hallucination, clean_transcript
 
                             t_stt_start = time.perf_counter()
-                            transcription = await asyncio.to_thread(
+                            transcription = await run_blocking(
                                 transcribe_audio_bytes, audio_bytes
                             )
                             t_stt_ms = (time.perf_counter() - t_stt_start) * 1000
-                            print(f"[audio] Google STT {t_stt_ms:.0f}ms → {transcription[:80]!r}")
+                            print(f"[audio] STT latency={t_stt_ms:.0f}ms transcript_chars={len(transcription)}")
 
                             if is_hallucination(transcription):
                                 print("[audio] Hallucination detected — discarding transcription")
@@ -4229,29 +4219,55 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                             print(f"Transcription sent to frontend. Waiting for user to click send...")
 
                         except Exception as e:
-                            import traceback
-                            error_details = traceback.format_exc()
-                            print(f"❌ Error processing audio: {e}")
-                            print(f"Error details:\n{error_details}")
+                            print(f"[audio] Processing failed: {error_type(e)}")
                             await websocket.send_text(
                                 json.dumps(
                                     {
                                         "type": "error", 
-                                        "text": f"Error processing audio: {str(e)}. Please ensure ffmpeg is installed for audio conversion."
+                                        "text": "Unable to process audio. Please try again or type your response."
                                     }
                                 )
                             )
 
                 except json.JSONDecodeError:
-                    print(f"Error decoding JSON: {message['text'][:100]}...")
+                    print("[websocket] Invalid JSON message received")
                 except Exception as e:
-                    print(f"Error handling text message: {e}")
+                    print(f"[websocket] Text-message handling failed: {error_type(e)}")
 
             # Handle binary messages (audio data)
             elif "bytes" in message:
+                if client_state.get("auth_context") is None:
+                    await websocket.send_text(
+                        json.dumps(
+                            {"type": "error", "message": "Authentication is required."}
+                        )
+                    )
+                    await websocket.close(code=1008, reason="Authentication required")
+                    break
                 if client_state["is_recording"]:
                     # Accumulate audio chunks
                     audio_chunk = message["bytes"]
+                    started_at = client_state.get("recording_start_time")
+                    elapsed_seconds = (
+                        max(0.0, time.monotonic() - started_at)
+                        if isinstance(started_at, (int, float))
+                        else 0.0
+                    )
+                    limit_error = audio_limit_error(
+                        current_bytes=len(client_state["received_audio_buffer"]),
+                        incoming_bytes=len(audio_chunk),
+                        elapsed_seconds=elapsed_seconds,
+                        max_total_bytes=MAX_AUDIO_SESSION_BYTES,
+                        max_duration_seconds=MAX_AUDIO_SESSION_SECONDS,
+                    )
+                    if limit_error:
+                        client_state["is_recording"] = False
+                        client_state["received_audio_buffer"].clear()
+                        client_state["recording_start_time"] = None
+                        await websocket.send_text(
+                            json.dumps({"type": "error", "text": limit_error})
+                        )
+                        continue
                     client_state["received_audio_buffer"].extend(audio_chunk)
 
                     # Log progress
@@ -4264,11 +4280,14 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                     print("Received unexpected binary data when not recording")
 
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        print(f"WebSocket failed: {error_type(e)}")
     finally:
+        client_state["is_recording"] = False
+        client_state["received_audio_buffer"].clear()
+        client_state["recording_start_time"] = None
         WS_CONNECTIONS.dec()
         _active_ws_connections.discard(websocket)
-        _log.info("ws_disconnected", client_id=client_id)
+        _log.info("ws_disconnected", subject=pseudonymous_id(client_id))
         print("Client disconnected")
         # Close database connection
         # MongoDB DISABLED - Commented out
@@ -4301,7 +4320,7 @@ def validate_user_exists(user_id: str) -> bool:
         try:
             user_object_id = ObjectId(user_id) if isinstance(user_id, str) else user_id
         except Exception:
-            print(f"[validate_user_exists] Invalid user_id format: {user_id}")
+            print("[validate_user_exists] Invalid subject identifier format")
             return False
         
         # Check if user exists
@@ -4309,16 +4328,14 @@ def validate_user_exists(user_id: str) -> bool:
         exists = user is not None
         
         if exists:
-            print(f"[validate_user_exists] ✓ User {user_id} exists in {db_name}.{collection_name}")
+            print(f"[validate_user_exists] Subject exists in {db_name}.{collection_name}")
         else:
-            print(f"[validate_user_exists] ✗ User {user_id} NOT FOUND in {db_name}.{collection_name}")
+            print(f"[validate_user_exists] Subject not found in {db_name}.{collection_name}")
         
         return exists
         
     except Exception as e:
-        print(f"[validate_user_exists] Error validating user {user_id}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[validate_user_exists] Validation failed: {error_type(e)}")
         return False
 
 
@@ -4336,14 +4353,29 @@ def ensure_users_collection() -> Collection:
     return users_collection
 
 
+def _fetch_users_sync(collection: Collection, mongo_query: dict, limit: int) -> list[dict]:
+    """Execute and consume the synchronous PyMongo cursor off the event loop."""
+
+    cursor = collection.find(mongo_query).sort("updatedAt", -1).limit(limit)
+    users = []
+    for doc in cursor:
+        serialized = serialize_user(doc)
+        if serialized and serialized["id"]:
+            users.append(serialized)
+    return users
+
+
 @app.get("/api/users")
 async def get_users(
     search: str = Query(default="", description="Optional search term"),
     limit: int = Query(default=50, ge=1, le=500),
+    authorization: Optional[str] = Header(None),
 ):
     """Return up-to-date list of users for the selector."""
     try:
-        collection = ensure_users_collection()
+        context = _http_auth_context(authorization)
+        _authorize_directory_http(context)
+        collection = await run_blocking(ensure_users_collection)
 
         mongo_query = {}
         if search:
@@ -4357,18 +4389,11 @@ async def get_users(
                 ]
             }
 
-        cursor = (
-            collection.find(mongo_query)
-            .sort("updatedAt", -1)
-            .limit(limit)
-        )
-        users = []
-        for doc in cursor:
-            serialized = serialize_user(doc)
-            if serialized and serialized["id"]:
-                users.append(serialized)
+        users = await run_blocking(_fetch_users_sync, collection, mongo_query, limit)
 
         return {"users": users}
+    except HTTPException:
+        raise
     except RuntimeError as err:
         raise HTTPException(
             status_code=500,
@@ -4381,7 +4406,10 @@ async def get_users(
 
 
 @app.get("/api/users/{user_id}/consent")
-async def get_consent_status(user_id: str):
+async def get_consent_status(
+    user_id: str,
+    authorization: Optional[str] = Header(None),
+):
     """
     Check whether a user has accepted the consent policy.
     Checks two sources:
@@ -4389,12 +4417,15 @@ async def get_consent_status(user_id: str):
     2. consentrecords collection (written by consent.stance.health via recordConsent GraphQL mutation)
     """
     try:
+        context = _http_auth_context(authorization)
+        _authorize_patient_http(context, user_id, "consent:read")
         from app.config import MONGO_DB_NAME
-        users_col = ensure_users_collection()
+        users_col = await run_blocking(ensure_users_collection)
         user_oid = ObjectId(user_id)
 
         # Source 1: users.profileData.consentAccepted
-        user = users_col.find_one(
+        user = await run_blocking(
+            users_col.find_one,
             {"_id": user_oid},
             {"profileData.consentAccepted": 1, "profileData.consentAcceptedAt": 1}
         )
@@ -4413,7 +4444,8 @@ async def get_consent_status(user_id: str):
         try:
             db = users_col.database
             consent_col = db["consentrecords"]
-            record = consent_col.find_one(
+            record = await run_blocking(
+                consent_col.find_one,
                 {"userId": user_oid, "isActive": True},
                 {"acceptedAt": 1}
             )
@@ -4435,13 +4467,19 @@ async def get_consent_status(user_id: str):
 
 
 @app.post("/api/users/{user_id}/consent")
-async def accept_consent(user_id: str):
+async def accept_consent(
+    user_id: str,
+    authorization: Optional[str] = Header(None),
+):
     """Record that a user has accepted the consent policy."""
     try:
+        context = _http_auth_context(authorization)
+        _authorize_patient_http(context, user_id, "consent:write")
         from datetime import datetime, timezone
-        collection = ensure_users_collection()
+        collection = await run_blocking(ensure_users_collection)
         user_oid = ObjectId(user_id)
-        result = collection.update_one(
+        result = await run_blocking(
+            collection.update_one,
             {"_id": user_oid},
             {"$set": {
                 "profileData.consentAccepted": True,
@@ -4459,11 +4497,18 @@ async def accept_consent(user_id: str):
 
 
 @app.get("/api/users/{user_id}/forms")
-async def get_user_forms_endpoint(user_id: str):
+async def get_user_forms_endpoint(
+    user_id: str,
+    authorization: Optional[str] = Header(None),
+):
     """Return all forms for a specific user."""
     try:
-        forms = fetch_user_forms(user_id)
+        context = _http_auth_context(authorization)
+        _authorize_patient_http(context, user_id, "forms:read")
+        forms = await run_blocking(fetch_user_forms, user_id)
         return {"forms": forms}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch user forms: {str(e)}"
@@ -4471,10 +4516,17 @@ async def get_user_forms_endpoint(user_id: str):
 
 
 @app.get("/api/forms/{form_id}")
-async def get_form_endpoint(form_id: str, userId: str = Query(..., description="User ID (required)")):
+async def get_form_endpoint(
+    form_id: str,
+    userId: str = Query(..., description="User ID (required)"),
+    attemptId: Optional[str] = Query(None, description="Form attempt ID"),
+    authorization: Optional[str] = Header(None),
+):
     """Return a specific form by form_id and userId."""
     try:
-        form = fetch_form_by_id(form_id, userId)
+        context = _http_auth_context(authorization)
+        _authorize_patient_http(context, userId, "forms:read")
+        form = await run_blocking(fetch_form_by_id, form_id, userId, attemptId)
         if form is None:
             raise HTTPException(status_code=404, detail="Form not found")
         return {"form": form}
@@ -4487,13 +4539,20 @@ async def get_form_endpoint(form_id: str, userId: str = Query(..., description="
 
 
 @app.get("/api/forms/{form_id}/progress")
-async def get_form_progress_endpoint(form_id: str, userId: str = Query(..., description="User ID (required)")):
+async def get_form_progress_endpoint(
+    form_id: str,
+    userId: str = Query(..., description="User ID (required)"),
+    attemptId: Optional[str] = Query(None, description="Form attempt ID"),
+    authorization: Optional[str] = Header(None),
+):
     """
     Return section completion status for a form.
     Sections are ordered with completed sections first, incomplete sections at the bottom.
     """
     try:
-        form = fetch_form_by_id(form_id, userId)
+        context = _http_auth_context(authorization)
+        _authorize_patient_http(context, userId, "forms:read")
+        form = await run_blocking(fetch_form_by_id, form_id, userId, attemptId)
         if form is None:
             raise HTTPException(status_code=404, detail="Form not found")
         
@@ -4514,15 +4573,20 @@ async def upload_form_attachment(
     form_id: str,
     files: List[UploadFile] = File(...),
     userId: str = Form(...),
+    attemptId: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(None),
 ):
     """Upload multiple scans/reports to S3, generate combined summary, and auto-fill Reports section."""
+    context = _http_auth_context(authorization)
+    _authorize_patient_http(context, userId, "forms:write")
+
     if not is_s3_configured():
         raise HTTPException(
             status_code=500,
             detail="S3 is not configured on the server.",
         )
 
-    form = fetch_form_by_id(form_id, userId)
+    form = await run_blocking(fetch_form_by_id, form_id, userId, attemptId)
     if not form:
         raise HTTPException(status_code=404, detail="Form not found.")
 
@@ -4536,123 +4600,200 @@ async def upload_form_attachment(
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
+    if len(files) > MAX_ATTACHMENT_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A maximum of {MAX_ATTACHMENT_FILES} files is allowed per request.",
+        )
 
     max_bytes = MAX_ATTACHMENT_SIZE_MB * 1024 * 1024
-    file_data_list = []
-    attachment_records = []
+    max_total_bytes = MAX_ATTACHMENT_TOTAL_MB * 1024 * 1024
+    validated_files = []
+    total_pages = 0
 
-    # Upload all files to S3 first
-    for file in files:
-        file_bytes = await file.read()
-        if not file_bytes:
-            continue
-
-        if len(file_bytes) > max_bytes:
+    # Read and validate the complete request before creating any S3 objects.
+    # This prevents a late invalid/oversized file from leaving partial uploads.
+    for file_index, file in enumerate(files, start=1):
+        filename = file.filename or "upload.bin"
+        current_total = sum(len(item[0]) for item in validated_files)
+        remaining_total = max_total_bytes - current_total
+        try:
+            if remaining_total <= 0:
+                raise ValueError("Combined files exceed the request size limit")
+            read_limit = min(max_bytes, remaining_total)
+            try:
+                file_bytes = await read_upload_bounded(file, max_bytes=read_limit)
+            except ValueError as exc:
+                if remaining_total < max_bytes:
+                    raise ValueError(
+                        "Combined files exceed the request size limit"
+                    ) from exc
+                raise ValueError("File exceeds the per-file size limit") from exc
+            validate_upload_quotas(
+                [len(file_bytes)],
+                max_files=1,
+                max_file_bytes=max_bytes,
+                max_total_bytes=max_bytes,
+            )
+            running_total = current_total + len(file_bytes)
+            if running_total > max_total_bytes:
+                raise ValueError("Combined files exceed the request size limit")
+            inspection = await run_blocking(
+                inspect_report_upload,
+                file_bytes,
+                filename,
+                file.content_type,
+            )
+            total_pages += inspection.page_count
+            if total_pages > MAX_REPORT_TOTAL_PAGES:
+                raise ValueError(
+                    f"Combined reports exceed the {MAX_REPORT_TOTAL_PAGES}-page limit"
+                )
+        except ValueError as exc:
             raise HTTPException(
                 status_code=400,
-                detail=f"File {file.filename} exceeds {MAX_ATTACHMENT_SIZE_MB} MB limit.",
-            )
+                detail=f"File {file_index} was rejected: {exc}",
+            ) from exc
+        except Exception as exc:
+            print(f"[upload_attachment] Content inspection failed: {error_type(exc)}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"File {file_index} is corrupt or cannot be decoded.",
+            ) from exc
 
-        content_type = file.content_type or "application/octet-stream"
-        key = generate_object_key(userId, form_id, file.filename or "upload.bin")
+        validated_files.append(
+            (file_bytes, filename, inspection.identity.content_type)
+        )
+
+    try:
+        validate_upload_quotas(
+            (len(item[0]) for item in validated_files),
+            max_files=MAX_ATTACHMENT_FILES,
+            max_file_bytes=max_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if report_jobs_collection is None:
+        await run_blocking(init_mongo)
+    if report_jobs_collection is None:
+        raise HTTPException(status_code=500, detail="Report queue is unavailable.")
+    active_report_jobs = await run_blocking(
+        report_jobs_collection.count_documents,
+        {"status": {"$in": ["queued", "retry", "processing"]}},
+        limit=REPORT_JOB_MAX_BACKLOG,
+    )
+    if active_report_jobs >= REPORT_JOB_MAX_BACKLOG:
+        raise HTTPException(
+            status_code=503,
+            detail="Report processing is at capacity. Please retry later.",
+        )
+
+    report_objects = []
+    attachment_records = []
+
+    # Upload only after the entire batch has passed preflight validation.
+    for file_bytes, filename, content_type in validated_files:
+        key = generate_object_key(userId, form_id, filename)
         
         try:
-            s3_url = upload_bytes_to_s3(file_bytes, key, content_type)
-            print(f"[upload_attachment] Uploaded {file.filename} to S3: {s3_url}")
+            s3_url = await run_blocking(
+                upload_bytes_to_s3,
+                file_bytes,
+                key,
+                content_type,
+            )
+            print(f"[upload_attachment] Uploaded object ({len(file_bytes)} bytes)")
         except RuntimeError as exc:
-            print(f"[upload_attachment] S3 upload failed for {file.filename}: {exc}")
+            print(f"[upload_attachment] S3 upload failed: {error_type(exc)}")
             continue
 
-        file_data_list.append((file_bytes, file.filename or key.split("/")[-1]))
+        report_objects.append({"key": key, "filename": filename})
         
         attachment_records.append({
             "id": str(uuid.uuid4()),
             "type": "report",
             "label": "Medical Report",
-            "fileName": file.filename or key.split("/")[-1],
+            "fileName": filename,
             "url": s3_url,
             "uploadedAt": datetime.now(timezone.utc).isoformat(),
             "contentType": content_type,
         })
 
-    if not file_data_list:
+    if not report_objects:
         raise HTTPException(status_code=400, detail="No valid files were uploaded.")
 
     # ── Step 1: Save attachment records to MongoDB immediately ────────────────
-    if customer_info_collection is None:
-        init_mongo()
-    if customer_info_collection is None:
+    if customer_info_collection is None or report_jobs_collection is None:
+        await run_blocking(init_mongo)
+    if customer_info_collection is None or report_jobs_collection is None:
         raise HTTPException(status_code=500, detail="Database unavailable.")
 
-    customer_info_collection.update_one(
-        {"formId": form_id, "userId": normalize_user_id(userId)},
-        {"$push": {"attachments": {"$each": attachment_records}}},
+    owned_form_filter = build_owned_form_filter(form, userId, form_id)
+    job_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    form_data = form.get("form_data", {})
+    hist_diag = form_data.get("History & Diagnostics", {})
+    processing_text = (
+        f"Uploaded {len(attachment_records)} document(s). "
+        "Report summary processing is in progress."
+    )
+    update_fields = {
+        "reportProcessing": {
+            "jobId": job_id,
+            "status": "queued",
+            "queuedAt": now,
+        },
+        "updatedAt": now,
+    }
+    if not str(hist_diag.get("Reports", "")).strip():
+        update_fields["form_data.History & Diagnostics.Reports"] = processing_text
+        form_data.setdefault("History & Diagnostics", {})["Reports"] = processing_text
+
+    await run_blocking(
+        customer_info_collection.update_one,
+        owned_form_filter,
+        {
+            "$push": {"attachments": {"$each": attachment_records}},
+            "$set": update_fields,
+        },
     )
     print(f"[upload_attachment] Saved {len(attachment_records)} attachment(s) to MongoDB")
 
-    # Mark Reports as "processing" so the form knows uploads exist
-    form_data = form.get("form_data", {})
-    hist_diag = form_data.get("History & Diagnostics", {})
-    if not hist_diag.get("Reports", "").strip():
-        form_data.setdefault("History & Diagnostics", {})["Reports"] = (
-            f"Uploaded {len(attachment_records)} document(s). OCR summary processing in background."
+    try:
+        job = build_report_job(
+            job_id=job_id,
+            user_id=owned_form_filter["userId"],
+            form_id=form_id,
+            objects=report_objects,
+            now=now,
         )
-        customer_info_collection.update_one(
-            {"formId": form_id, "userId": normalize_user_id(userId)},
-            {"$set": {"form_data": form_data, "updatedAt": datetime.now(timezone.utc)}},
+        await run_blocking(
+            report_jobs_collection.insert_one,
+            job,
         )
+    except Exception as exc:
+        await run_blocking(
+            customer_info_collection.update_one,
+            {
+                "formId": form_id,
+                "userId": owned_form_filter["userId"],
+                "reportProcessing.jobId": job_id,
+            },
+            {
+                "$set": {
+                    "reportProcessing.status": "enqueue_failed",
+                    "reportProcessing.failedAt": datetime.now(timezone.utc),
+                }
+            },
+        )
+        _log.error("report_job_enqueue_failed", error_type=error_type(exc))
+        raise HTTPException(
+            status_code=503,
+            detail="Reports were uploaded, but summary processing could not be queued.",
+        ) from exc
 
-    # ── Step 2: Run OCR/summarisation as a background task ───────────────────
-    async def _run_ocr_and_update():
-        from docscanner.service import summarize_multiple_reports as _summarize
-        try:
-            combined_summary = await asyncio.to_thread(_summarize, file_data_list)
-            print(f"[ocr_bg] Summary done for {len(file_data_list)} doc(s)")
-        except Exception as exc:
-            print(f"[ocr_bg] Doc-scanner failed: {exc}")
-            combined_summary = {"error": str(exc)}
-
-        # Build human-readable text from summary
-        reports_text = ""
-        if combined_summary and not combined_summary.get("error"):
-            findings = combined_summary.get("findings", [])
-            impression = combined_summary.get("impression", "")
-            measurements = combined_summary.get("measurements", [])
-            if findings:
-                reports_text += "Findings:\n"
-                for f in findings:
-                    t, d = f.get("title", ""), f.get("details", "")
-                    reports_text += f"- {t}: {d}\n" if t else f"- {d}\n"
-            if measurements:
-                reports_text += "\nMeasurements:\n"
-                for m in measurements:
-                    lbl, val, u, loc = m.get("label",""), m.get("value",""), m.get("units",""), m.get("anatomical_location","")
-                    if lbl and val:
-                        reports_text += f"- {lbl}: {val}{' '+u if u else ''}{' ('+loc+')' if loc else ''}\n"
-            if impression:
-                reports_text += f"\nImpression: {impression}"
-        else:
-            err = (combined_summary or {}).get("error", "unknown error")
-            reports_text = f"Uploaded {len(attachment_records)} document(s). Summary failed: {err}"
-
-        # Write OCR result back to MongoDB
-        try:
-            if customer_info_collection is not None:
-                _form = fetch_form_by_id(form_id, userId) or {}
-                _fd = _form.get("form_data", form_data)
-                _fd.setdefault("History & Diagnostics", {})["Reports"] = reports_text.strip()
-                # Also store summary in attachment records
-                customer_info_collection.update_one(
-                    {"formId": form_id, "userId": normalize_user_id(userId)},
-                    {"$set": {"form_data": _fd, "updatedAt": datetime.now(timezone.utc)}},
-                )
-                print("[ocr_bg] Wrote OCR summary to MongoDB")
-        except Exception as exc:
-            print(f"[ocr_bg] Failed to write summary: {exc}")
-
-    asyncio.create_task(_run_ocr_and_update())
-
-    # ── Return immediately — OCR runs in the background ──────────────────────
     updated_progress = calculate_form_progress(form_data)
     section_progress = calculate_section_completion_status(form_data)
 
@@ -4660,6 +4801,7 @@ async def upload_form_attachment(
         "attachments": attachment_records,
         "reports_filled": True,
         "ocr_status": "processing",
+        "ocr_job_id": job_id,
         "form_data": form_data,
         "progress": updated_progress,
         "sectionProgress": section_progress,

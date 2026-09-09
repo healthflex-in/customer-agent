@@ -4,8 +4,8 @@ Build and return the compiled LangGraph StateGraph for the medical interview.
 Optimised graph (vs original):
 - extract_form_data now runs extraction + intent classification concurrently
   and folds in the gap-fill pass inline — replacing 3 sequential LLM nodes.
-- save_to_db removed from graph; server.py fires it as a background task
-  after sending the response so the user never waits for the DB write.
+- save_to_db is outside graph topology; server.py sends the response and then
+  awaits persistence through the concurrency-limited blocking-I/O boundary.
 """
 from langgraph.graph import StateGraph, END
 
@@ -16,7 +16,6 @@ from src.prompts import WELCOME_PROMPT
 from src.graph.nodes.first_turn import make_handle_first_turn_node
 from src.graph.nodes.extract import (
     make_extract_node as make_extract_form_data_node,
-    make_classify_intent_node,
 )
 from src.graph.nodes.validate import (
     make_validate_section_node,
@@ -39,7 +38,7 @@ from src.graph.nodes.upload import make_handle_upload_response_node
 # Edge routing functions
 from src.graph.edges import (
     route_by_phase,
-    after_classify_intent,
+    after_extract,
     after_validate_section,
     after_advance_section,
     after_apply_correction,
@@ -71,8 +70,6 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
     graph.add_node("handle_first_turn", make_handle_first_turn_node(llm_complete, WELCOME_PROMPT, reasoning_llm=reasoning_llm))
     # Combined node: extraction + gap-fill + intent classification (concurrent)
     graph.add_node("extract_form_data", make_extract_form_data_node(llm_complete, reasoning_llm=reasoning_llm))
-    # classify_intent is now a no-op stub (logic merged into extract_form_data)
-    graph.add_node("classify_intent", make_classify_intent_node(llm_complete))
     graph.add_node("validate_section", make_validate_section_node())
     graph.add_node("advance_section", make_advance_section_node())
     graph.add_node("detect_correction", make_detect_correction_node(llm_complete))
@@ -98,10 +95,6 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
     # ── Linear edges ──────────────────────────────────────────────────────────
     graph.add_edge("handle_first_turn", END)
 
-    # extract_form_data now returns is_correction_turn + reports_intent directly
-    # so classify_intent (now a no-op) just passes through to the conditional edge
-    graph.add_edge("extract_form_data", "classify_intent")
-
     graph.add_edge("detect_correction", "apply_correction")
 
     graph.add_edge("generate_question", END)
@@ -111,8 +104,8 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
 
     # ── Conditional edges ─────────────────────────────────────────────────────
     graph.add_conditional_edges(
-        "classify_intent",
-        after_classify_intent,
+        "extract_form_data",
+        after_extract,
         {
             "detect_correction": "detect_correction",
             "handle_upload_response": "handle_upload_response",

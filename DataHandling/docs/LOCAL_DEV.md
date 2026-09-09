@@ -1,90 +1,255 @@
-# Local development
+# Local Development
 
-Local-first workflow: run the full container stack on your laptop, refactor,
-smoke-test, *then* push to EC2.
+Use non-production services and synthetic patient records only. The repository
+does not contain a test database, authenticated sandbox, or provider emulator.
+The API requires a signed access token whose claims authorize the supplied
+`userId`; use only locally issued test tokens and synthetic users.
+
+## Repository layout
+
+```text
+customerAgent/
+├── customer-agent/              backend repository and Compose project
+│   ├── docker-compose.yml
+│   └── DataHandling/            Python application root
+└── customer-agent-frontend/     React/Vite frontend repository
+```
+
+Run backend Compose commands from `customer-agent/`, not from `DataHandling/`.
 
 ## Prerequisites
 
-- Docker Desktop running (Apple Silicon / Intel — same image works).
-- `DataHandling/.env` present (already checked in for this repo; matches EC2).
-- `DataHandling/config/*.json` Google service-account keys (already present).
+- Docker Engine with the Compose plugin;
+- permission to access the Docker daemon;
+- a non-production MongoDB database containing a test user;
+- a Gemini API key;
+- Node.js 20 or newer for frontend work;
+- optional Google Cloud Speech, AWS S3/Bedrock, Langfuse, and MCP credentials
+  only when testing those features.
 
-## Boot the stack
+If Docker reports permission denied for `/var/run/docker.sock`, correct the host
+Docker installation/group membership or run Docker through the organization’s
+approved privilege workflow. This is a host permission problem, not an
+application WebSocket problem.
 
-From the **`healthflex-agent/`** directory (one level above `DataHandling/`):
+## Backend configuration
+
+Secrets are ignored by Git and are not supplied by the repository.
 
 ```bash
-docker compose up -d --build       # first time: ~10–15 min (torch, whisper, etc.)
-docker compose logs -f             # watch the boot — Whisper + HealthAgent take ~30–60s
+cp DataHandling/.env.example DataHandling/.env
 ```
 
-First boot will:
-1. Build the image from `DataHandling/deployment/Dockerfile`.
-2. Download the Whisper `base` model (~150 MB) into the container.
-3. Initialize ChromaDB at `/app/db/vector/...` (persisted via bind mount).
-4. Initialize `HealthAgent` (LlamaIndex + Gemini wiring).
+At minimum configure:
 
-Server is ready when logs show `Application startup complete.` and the container
-is marked `(healthy)` by `docker ps`.
+- `MONGO_URI` for a non-production database;
+- `GEMINI_API_KEY`;
+- `AUTH_SIGNING_SECRET`, `AUTH_ISSUER`, and `AUTH_AUDIENCE` for local signed links;
+- `OBSERVABILITY_HASH_KEY` if pseudonymous cross-event correlation is required.
 
-## Smoke test
+For audio fallback, place an untracked Google service-account JSON file at
+`DataHandling/config/google_key.json`; Compose exposes it through
+`GOOGLE_APPLICATION_CREDENTIALS`. Gemini uses `GEMINI_API_KEY`, not this JSON.
+
+For report uploads/summaries, configure the S3 bucket, explicit AWS access key
+and secret currently required by `upload/s3_client.py`, AWS region, and Bedrock
+model/profile. Ensure both services contain no production data during development.
+
+Never reuse a production `.env` merely to make local startup succeed.
+
+Urgent-risk tests may create metadata-only records in the configured
+`MONGO_CLINICAL_ESCALATIONS_COLLECTION`. Use a non-production database and do
+not test safety rules with a real patient identity.
+
+For non-default assessment forms, use synthetic question-bank records with a
+stable unique ID and explicit response type/options for every item. Recognized
+clinical `prom_*` questions are immutable. New records store a `promSnapshot`
+with the exact administered definition and stable-ID answers; scoring remains
+disabled until an approved instrument contract is supplied.
+
+Set a local-only authentication secret of at least 32 bytes plus the documented
+issuer and audience. Do not put this secret in any `VITE_*` variable.
+
+## Start the backend
+
+From `customer-agent/`:
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs -f healthflex-agent
+```
+
+The backend is published at `http://localhost:8000`. The immutable image starts
+one Uvicorn process without `--reload`. Rebuild after Python or dependency edits:
+
+```bash
+docker compose up -d --build healthflex-agent
+```
+
+Check liveness and metrics:
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/metrics
+```
+
+`/health` reports local initialization state. It does not call Gemini, Google,
+AWS, or MongoDB on every request and therefore is not proof of provider access.
+
+## Start the frontend
+
+From the sibling frontend repository:
+
+```bash
+cd ../customer-agent-frontend
+cp .env.example .env.local
+npm install
+npm run dev
+```
+
+The local template uses:
+
+```dotenv
+VITE_APP_ENV=local
+VITE_API_URL=http://localhost:8000
+VITE_WS_URL=ws://localhost:8000
+```
+
+All `VITE_*` values are public browser configuration. Never put a server secret
+in them. The configuration validator requires pathless API/WebSocket bases,
+localhost endpoints for local mode, HTTPS/WSS in deployed modes, and rejects
+known cross-environment hosts.
+
+Generate a short-lived token from `DataHandling/` for a synthetic patient:
+
+```bash
+python3 -m scripts.generate_access_token \
+  --subject YOUR_SYNTHETIC_USER_ID \
+  --role patient \
+  --scope interview:write \
+  --scope forms:read \
+  --scope forms:write \
+  --scope consent:read \
+  --scope consent:write
+```
+
+The patient page requires a link shaped like the following. Put the token in
+the URL fragment so it is not sent in the HTTP request or referrer:
+
+```text
+http://localhost:8080/{userId}/{formId}#access_token={token}
+```
+
+Use only a synthetic user ID that exists in the configured non-production
+MongoDB database. `FRM-01` selects the standard intake; other form IDs attempt to
+load assigned PROM questions. The frontend consumes the fragment, removes it
+from the address bar, retains it for the tab in `sessionStorage`, adds it as a
+Bearer header to REST calls, and includes it only in the first WebSocket control
+message.
+
+## Verification
+
+Host Python can run the dependency-light tests:
 
 ```bash
 cd DataHandling
-pip install requests websockets       # one-time, host-side
-python tests/smoke.py
+python3 -m compileall -q app docscanner src server.py
+python3 -m unittest discover -s tests
 ```
 
-Expected output:
+Some optional exporter/integration assertions may skip when their dependency is
+not installed on the host. Run the same suite in the built image for the
+dependency-complete result.
 
-```
-Smoke test against http://localhost:8000
-— GET /health
-  ✓ 200 OK — body: ...
-— GET /api/users
-  ✓ 200 — ...
-— WebSocket /ws/<client_id> — start_interview round trip
-  ✓ connected to ws://localhost:8000/ws/smoke-...
-  ✓ sent start_interview
-  ✓ received text_message — ...
-  ✓ sent end_session, closing
-
-ALL CHECKS PASSED
-```
-
-A failing smoke test = refactor regression. Revert the last commit.
-
-## Hot-reload during refactor
-
-`docker-compose.yml` bind-mounts `./DataHandling` → `/app`, so file edits are
-visible to the container immediately. **But uvicorn is not started with
-`--reload`**, so the Python process won't pick up changes until you restart:
+The reviewed direct dependencies live in `requirements.in`; both local and
+container installs consume the fully pinned `requirements-docker.txt` lock. To
+update that lock deliberately with Python 3.12:
 
 ```bash
-docker compose restart        # ~30s to reload Whisper + HealthAgent
+python3.12 -m venv .venv-lock
+.venv-lock/bin/python -m pip install pip-tools==7.5.1
+.venv-lock/bin/pip-compile --strip-extras --allow-unsafe \
+  --output-file requirements-docker.txt requirements.in
 ```
 
-If you want true hot-reload during refactor, edit the Dockerfile CMD
-temporarily:
+Review the lock diff and run the complete suite before committing it. Do not
+edit transitive versions directly in the generated file.
 
-```dockerfile
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
-```
-
-(Don't ship this to prod — `--reload` doubles memory.)
-
-## Tearing down
+With the backend running, the smoke test verifies health, the users route, and
+the WebSocket missing-user validation path without creating a patient intake:
 
 ```bash
-docker compose down            # stop and remove the container
-docker compose down -v         # ...and delete named volumes (won't touch bind mounts)
+cd DataHandling
+python3 tests/smoke.py
 ```
 
-## Pushing to EC2 (only after local smoke test passes)
+To target another local backend:
 
-Use the existing scripts in `DataHandling/deployment/`:
+```bash
+BASE_URL=http://localhost:8001 python3 tests/smoke.py
+```
 
-- `update-fast.sh` — rsync code + `docker compose restart` (no rebuild)
-- `update.sh` — rsync + rebuild (use when requirements change)
+Frontend gates:
 
-Always run `tests/smoke.py` locally before either script.
+```bash
+cd ../customer-agent-frontend
+npx tsc -b
+npm run lint
+npm run build
+npm audit
+```
+
+## Safe manual test
+
+1. Create or obtain a synthetic user in the non-production database.
+2. Open `http://localhost:8080/{syntheticUserId}/FRM-01`.
+3. Confirm the UI status becomes connected.
+4. Submit synthetic text such as “I have test knee discomfort since yesterday.”
+5. Confirm a question arrives and progress persists only under that test user.
+6. Test microphone/report flows only with synthetic audio/documents.
+
+Do not use a guessed all-zero ID against a shared database. The server validates
+that a user exists, and a production connection could still mutate real records.
+
+## Stop the stack
+
+```bash
+docker compose down
+```
+
+Runtime directories under `DataHandling/` are bind-mounted. Review them before
+deleting anything; they may contain local reports, audio, or database files.
+
+## Common failures
+
+### `DataHandling/.env not found`
+
+Create it from the template and fill non-production values:
+
+```bash
+cp DataHandling/.env.example DataHandling/.env
+```
+
+### Browser shows “Access via your link”
+
+The root page is intentionally not an intake. Open a valid
+`/{userId}/{formId}` URL.
+
+### WebSocket remains offline
+
+Check, in order:
+
+1. `docker compose ps` and backend logs;
+2. `curl http://localhost:8000/health`;
+3. frontend `VITE_WS_URL=ws://localhost:8000` and restart Vite after changes;
+4. browser developer-tools Network → WS handshake/status;
+5. that the URL user exists in the configured non-production database;
+6. that the link contains a current access token with `interview:write` scope
+   and that backend issuer/audience/secret values match the token issuer.
+
+### Report upload fails
+
+Confirm S3 configuration, target-region access, report queue initialization,
+Bedrock model/profile access, and the configured file/page limits. An accepted
+upload returns a queued job; summary completion is asynchronous.

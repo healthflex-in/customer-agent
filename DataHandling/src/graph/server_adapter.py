@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
+from app.observability.privacy import error_type
 from src.graph.state import InterviewState, get_fresh_interview_state
 
 
@@ -98,7 +99,11 @@ def build_graph_state(
         try:
             _fetch = client_state.get("_fetch_form_fn")
             if _fetch:
-                _doc = _fetch(client_state.get("form_id", ""), client_state.get("user_id", ""))
+                _doc = _fetch(
+                    client_state.get("form_id", ""),
+                    client_state.get("user_id", ""),
+                    client_state.get("attempt_id"),
+                )
                 if _doc and _doc.get("attachments"):
                     _reports_uploaded = True
                     client_state["graph_reports_uploaded"] = True
@@ -142,7 +147,6 @@ def build_graph_state(
         tagged_turns=client_state.get("tagged_turns"),
         tagged_turn_metas=client_state.get("tagged_turn_metas"),
         tagged_turn_index=client_state.get("tagged_turn_index", 0),
-        tagged_cleanup_done=client_state.get("tagged_cleanup_done", False),
         tagged_form_template=client_state.get("tagged_form_template"),
         tagged_question_meta=None,  # always reset; populated by generate node
         # Output — always reset at turn start; populated by graph nodes
@@ -192,9 +196,8 @@ def sync_client_state_from_graph(
     visit_context = result_state.get("visit_context", "unknown")
     if visit_context and visit_context != "unknown":
         client_state["graph_visit_context"] = visit_context
-    # Sync tagged turn index and cleanup flag so the next turn picks up where we left off
+    # Sync tagged turn index so the next turn picks up where it left off.
     client_state["tagged_turn_index"] = result_state.get("tagged_turn_index", 0)
-    client_state["tagged_cleanup_done"] = result_state.get("tagged_cleanup_done", False)
 
 
 # ---------------------------------------------------------------------------
@@ -256,24 +259,27 @@ def build_interview_state_from_graph(
     """
     form_id = client_state.get("form_id")
     user_id = client_state.get("user_id")
+    attempt_id = client_state.get("attempt_id")
 
     # ── Attachments ──────────────────────────────────────────────────────────
     attachments: list = []
     if fetch_form_attachments_fn and form_id and user_id:
         try:
-            attachments = fetch_form_attachments_fn(form_id, user_id) or []
+            attachments = fetch_form_attachments_fn(
+                form_id, user_id, attempt_id
+            ) or []
         except Exception as exc:
-            print(f"[build_interview_state_from_graph] Warning: could not fetch attachments: {exc}")
+            print(f"[graph_adapter] Attachment lookup failed: {error_type(exc)}")
 
     # ── Form data for progress (prefer DB when available) ───────────────────
     form_data_for_progress = result_state["form"]
     if fetch_form_by_id_fn and form_id and user_id:
         try:
-            db_form = fetch_form_by_id_fn(form_id, user_id)
+            db_form = fetch_form_by_id_fn(form_id, user_id, attempt_id)
             if db_form and db_form.get("form_data"):
                 form_data_for_progress = db_form["form_data"]
         except Exception as exc:
-            print(f"[build_interview_state_from_graph] Warning: could not fetch DB form: {exc}")
+            print(f"[graph_adapter] Form lookup failed: {error_type(exc)}")
 
     # ── Progress ─────────────────────────────────────────────────────────────
     if progress_override is not None:
@@ -282,7 +288,7 @@ def build_interview_state_from_graph(
         try:
             progress = calculate_form_progress_fn(form_data_for_progress)
         except Exception as exc:
-            print(f"[build_interview_state_from_graph] Warning: progress calculation failed: {exc}")
+            print(f"[graph_adapter] Progress calculation failed: {error_type(exc)}")
             progress = 0.0
     else:
         progress = 0.0
@@ -293,7 +299,7 @@ def build_interview_state_from_graph(
         try:
             section_progress = calculate_section_completion_status_fn(form_data_for_progress)
         except Exception as exc:
-            print(f"[build_interview_state_from_graph] Warning: section status calculation failed: {exc}")
+            print(f"[graph_adapter] Section calculation failed: {error_type(exc)}")
 
     # PROM session detection: template (remaining) OR previously-answered data
     _tagged_tmpl = client_state.get("tagged_form_template")
@@ -329,6 +335,7 @@ def build_interview_state_from_graph(
         "missing_fields": result_state.get("missing_fields") or [],
         "attachments": attachments,
         "formId": form_id,
+        "attemptId": attempt_id,
         "sectionProgress": section_progress,
         "promSteps": _all_prom_scales if _is_prom else None,
     }
@@ -404,4 +411,3 @@ def init_graph_state_in_client(
         client_state["tagged_turn_index"] = 0
     if "tagged_form_template" not in client_state:
         client_state["tagged_form_template"] = None
-    client_state["tagged_cleanup_done"] = False

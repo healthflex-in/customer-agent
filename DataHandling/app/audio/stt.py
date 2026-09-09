@@ -1,6 +1,6 @@
 """Speech-to-Text — transcription service.
 
-Primary:  Gemini 2.0 Flash audio transcription
+Primary:  configured, startup-validated Gemini audio model
   - Handles Indian English natively, understands medical context
   - Accepts webm/ogg directly — no pydub decode overhead
   - Typical latency: 2–4 s
@@ -18,6 +18,10 @@ import os
 import re
 import sys
 import logging
+
+from app.ai.models import MODEL_REGISTRY
+from app.observability.ai_usage import AIUsage, gemini_usage, tracked_ai_call
+from app.observability.privacy import error_type
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +106,7 @@ def _detect_mime_type(raw_bytes: bytes) -> str:
 
 
 def _transcribe_with_gemini(raw_audio_bytes: bytes) -> str:
-    """Transcribe audio using Gemini 2.0 Flash. Returns transcript or raises."""
+    """Transcribe audio using the configured Gemini audio model."""
     import time as _time
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
@@ -115,12 +119,18 @@ def _transcribe_with_gemini(raw_audio_bytes: bytes) -> str:
     client = _genai.Client(api_key=api_key)
 
     _t0 = _time.perf_counter()
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            _types.Part.from_bytes(data=raw_audio_bytes, mime_type=mime_type),
-            _GEMINI_STT_PROMPT,
-        ],
+    response = tracked_ai_call(
+        provider="google_genai",
+        model=MODEL_REGISTRY.audio,
+        operation="audio_transcription",
+        call=lambda: client.models.generate_content(
+            model=MODEL_REGISTRY.audio,
+            contents=[
+                _types.Part.from_bytes(data=raw_audio_bytes, mime_type=mime_type),
+                _GEMINI_STT_PROMPT,
+            ],
+        ),
+        usage_extractor=gemini_usage,
     )
     _ms = (_time.perf_counter() - _t0) * 1000
     text = (response.text or "").strip()
@@ -197,9 +207,15 @@ def _transcribe_with_gcloud(raw_audio_bytes: bytes) -> str:
     if audio_duration_seconds <= _MAX_CHUNK_SECONDS:
         buf = io.BytesIO()
         segment.export(buf, format="wav")
-        response = client.recognize(
-            config=config,
-            audio=speech.RecognitionAudio(content=buf.getvalue()),
+        response = tracked_ai_call(
+            provider="google_speech",
+            model=f"v1-{model}-enhanced",
+            operation="audio_transcription_fallback",
+            call=lambda: client.recognize(
+                config=config,
+                audio=speech.RecognitionAudio(content=buf.getvalue()),
+            ),
+            submitted_usage=AIUsage(measured=True, audio_seconds=audio_duration_seconds),
         )
         results = list(response.results)
     else:
@@ -212,9 +228,16 @@ def _transcribe_with_gcloud(raw_audio_bytes: bytes) -> str:
             chunk = segment[i * max_ms: (i + 1) * max_ms]
             buf = io.BytesIO()
             chunk.export(buf, format="wav")
-            resp = client.recognize(
-                config=config,
-                audio=speech.RecognitionAudio(content=buf.getvalue()),
+            chunk_seconds = len(chunk) / 1000.0
+            resp = tracked_ai_call(
+                provider="google_speech",
+                model=f"v1-{model}-enhanced",
+                operation="audio_transcription_fallback",
+                call=lambda: client.recognize(
+                    config=config,
+                    audio=speech.RecognitionAudio(content=buf.getvalue()),
+                ),
+                submitted_usage=AIUsage(measured=True, audio_seconds=chunk_seconds),
             )
             results.extend(resp.results)
 
@@ -271,7 +294,7 @@ def transcribe_audio_bytes(raw_audio_bytes: bytes) -> str:
         sys.stderr.write("[stt] Gemini returned empty — falling back to Google Cloud STT\n")
         sys.stderr.flush()
     except Exception as e:
-        sys.stderr.write(f"[stt] Gemini failed ({e.__class__.__name__}: {str(e)[:120]}) — falling back to gcloud\n")
+        sys.stderr.write(f"[stt] Gemini failed ({error_type(e)}) — falling back to gcloud\n")
         sys.stderr.flush()
 
     text = _transcribe_with_gcloud(raw_audio_bytes)

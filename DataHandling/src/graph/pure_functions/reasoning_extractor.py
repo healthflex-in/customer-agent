@@ -12,6 +12,7 @@ import copy
 import json
 from typing import Callable, Optional
 
+from app.observability.privacy import error_type
 from src.prompts import REASONING_EXTRACTOR_PROMPT, PROM_EXTRACTOR_PROMPT
 
 
@@ -86,5 +87,5 @@ def reasoning_extract(
         return result
 
     except Exception as e:
-        print(f"[reasoning_extract] Failed ({e}), falling back to regular extraction")
+        print(f"[reasoning_extract] Failed with {error_type(e)}; using regular extraction")
         return None

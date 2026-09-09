@@ -7,6 +7,7 @@ import copy
 import time as _time
 from typing import Callable, Optional
 
+from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
 from src.prompts import TEMPLATE_PROMPT, CORRECTION_DETECTION_PROMPT, CORRECTION_APPLY_PROMPT
 
@@ -70,7 +71,7 @@ def extract_form_data_from_text(
         llm_response = llm_complete(enhanced_prompt)
         _extract_ms = (_time.perf_counter() - _t0) * 1000
         print(f"[timing] form_extraction_llm={_extract_ms:.0f}ms section={current_section!r}")
-        print("LLM FORMATTING RESPONSE:\n", llm_response)
+        print(f"[form_extraction] LLM response received ({len(llm_response)} chars)")
         json_str = extract_json_from_response(llm_response)
 
         if not json_str:
@@ -109,16 +110,18 @@ def extract_form_data_from_text(
         # The function guards itself: if Source is already filled it returns immediately.
         updated_form = _post_process_referral_from_input(updated_form, user_input)
 
-        print("Updated form sections after formatting:")
-        for section, fields in updated_form.items():
-            non_empty = {k: v for k, v in fields.items() if v}
-            if non_empty:
-                print(f"  {section}: {non_empty}")
+        filled_count = sum(
+            1
+            for fields in updated_form.values()
+            for value in fields.values()
+            if value
+        )
+        print(f"[form_extraction] Updated form ({filled_count} filled fields)")
 
         return updated_form
 
     except Exception as e:
-        print(f"Error in extract_form_data_from_text: {e}")
+        print(f"Form extraction failed: {error_type(e)}")
         return updated_form
 
 
@@ -243,11 +246,11 @@ def _post_process_referral_from_input(form: dict, user_input: str) -> dict:
 
     if matched_channel:
         form["Referral"]["Source"] = matched_channel
-        print(f"[referral_fill] Source extracted as channel: '{matched_channel}'")
+        print("[referral_fill] Source normalized to a known channel")
     elif user_lower not in {"no", "nope", "nah", "none", "nothing", "n/a"}:
         # Any other non-negative answer: store as-is and let validate_section decide
         form["Referral"]["Source"] = user_input.strip()
-        print(f"[referral_fill] Source filled from input (fallback): '{user_input.strip()}'")
+        print("[referral_fill] Source filled using deterministic fallback")
     return form
 
 
@@ -323,7 +326,7 @@ Respond with a JSON object:
             return data
         return None
     except Exception as e:
-        print(f"[detect_form_correction] Error: {e}")
+        print(f"[detect_form_correction] Failed: {error_type(e)}")
         return None
 
 

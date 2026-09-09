@@ -8,6 +8,9 @@ the medical interview flow.
 
 import os
 from pathlib import Path
+from app.ai.models import MODEL_REGISTRY
+from app.observability.ai_usage import gemini_usage, tracked_ai_call
+from app.observability.privacy import error_type
 
 
 def _get_chroma_client():
@@ -45,20 +48,28 @@ def _answer_with_web_search(user_input: str) -> str:
             f"Search for information about Stance Health and answer warmly in 2-4 sentences. "
             f"If you can't find specific information, say you'll connect them with the team."
         )
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=search_prompt,
-            config=_types.GenerateContentConfig(
-                tools=[_types.Tool(google_search=_types.GoogleSearch())],
-                temperature=0.3,
+        response = tracked_ai_call(
+            # Grounding has a separate quota/charge, so it remains explicitly
+            # unpriced until the deployment supplies a billing-aware rate.
+            provider="google_genai_grounded",
+            model=MODEL_REGISTRY.search,
+            operation="grounded_brand_search",
+            call=lambda: client.models.generate_content(
+                model=MODEL_REGISTRY.search,
+                contents=search_prompt,
+                config=_types.GenerateContentConfig(
+                    tools=[_types.Tool(google_search=_types.GoogleSearch())],
+                    temperature=0.3,
+                ),
             ),
+            usage_extractor=gemini_usage,
         )
         text = response.text.strip() if response.text else ""
         if text and len(text) > 20:
             print(f"[brand_web_search] Answered via Google Search grounding")
             return text
     except Exception as e:
-        print(f"[brand_web_search] Error: {e}")
+        print(f"[brand_web_search] Failed: {error_type(e)}")
     return ""
 
 
@@ -121,7 +132,7 @@ STRICT RULES:
 Answer:"""
         return llm_complete(prompt).strip()
     except Exception as e:
-        print(f"[brand_rag] Error: {e}")
+        print(f"[brand_rag] Failed: {error_type(e)}")
         return ""
 
 
@@ -153,7 +164,7 @@ Clinical context:
 Answer:"""
         return llm_complete(prompt).strip()
     except Exception as e:
-        print(f"[medical_rag] Error: {e}")
+        print(f"[medical_rag] Failed: {error_type(e)}")
         return ""
 
 
@@ -187,7 +198,7 @@ def _classify_visit_context(user_input: str, llm_complete) -> str:
             print(f"[visit_context] classified as: {result}")
             return result
     except Exception as e:
-        print(f"[visit_context] classification error (non-fatal): {e}")
+        print(f"[visit_context] Classification failed: {error_type(e)}")
     return "unknown"
 
 
@@ -203,8 +214,8 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
     Combined node: runs form extraction AND intent classification concurrently,
     then applies the classify_unanswered_fields gap-fill inline.
 
-    Replaces three sequential nodes (extract → classify_unanswered → classify_intent)
-    with one node that does all three work items in ~max(extract_time, intent_time).
+    Replaces three sequential extraction/gap-fill/intent stages with one node
+    that performs all three work items in ~max(extract_time, intent_time).
 
     Updates:
       - form                (extracted + gap-filled)
@@ -293,7 +304,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                         _visit_context_update["mcp_questions"] = _mcp_recs
                         print(f"[mcp] Loaded {len(_mcp_recs)} question recommendations from clinical-mcp")
             except Exception as _mcp_err:
-                print(f"[mcp] Non-fatal: {_mcp_err}")
+                print(f"[mcp] Recommendation lookup failed: {error_type(_mcp_err)}")
 
         # ── Detect complaint emerging in a general_assessment visit ──────────────
         # If the patient reveals a specific health complaint mid-general-visit,
@@ -307,7 +318,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             "elbow", "spine", "head", "headache", "lower back", "upper back",
         ]
         if _effective_context == "general_assessment" and any(kw in user_input.lower() for kw in _COMPLAINT_KW):
-            print(f"[extract] General visit → complaint detected mid-session: '{user_input[:60]}'")
+            print("[extract] Complaint detected during general assessment")
             _visit_context_update["visit_context"] = "specific_complaint"
             _effective_context = "specific_complaint"
             # Clear "Not applicable" placeholders so these fields can be properly filled
@@ -401,7 +412,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 )
                 return ("format_prompt", result)
             except Exception as _ex:
-                print(f"[extract_node] Extraction failed: {_ex}")
+                print(f"[extract_node] Extraction failed: {error_type(_ex)}")
                 return ("failed", form)
 
         def _run_intent():
@@ -427,7 +438,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 _visit_ctx = state.get("visit_context", "unknown")
                 return _generate_intelligent_question([], _hist, _visit_ctx, form, llm_complete)
             except Exception as _e:
-                print(f"[question_prefetch] Non-fatal: {_e}")
+                print(f"[question_prefetch] Failed: {error_type(_e)}")
                 return None
 
         # All three run concurrently: extraction (slow), intent (fast), question (slow).
@@ -504,9 +515,9 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                                 existing = updated_form[current_section].get(field, "")
                                 if not existing or not str(existing).strip():
                                     updated_form[current_section][field] = str(value).strip()
-                                    print(f"[gap_fill] {field} → {value}")
+                                    print(f"[gap_fill] Filled {field}")
             except Exception as _e:
-                print(f"[gap_fill] Non-fatal error: {_e}")
+                print(f"[gap_fill] Failed: {error_type(_e)}")
 
         # ── Sweep fill for short denial responses ("nothing", "no", "none", etc.) ─────────
         # When a user gives a sweeping denial to a compound question, deterministically
@@ -569,7 +580,7 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                         existing = sec_data.get(field, "")
                         if not existing or not str(existing).strip():
                             updated_form[section][field] = fill_value
-                            print(f"[sweep_fill] {section}.{field} → '{fill_value}'")
+                            print(f"[sweep_fill] Filled {section}.{field}")
 
         result_extra = {}
 
@@ -601,12 +612,12 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
             _is_medical = any(s in _ref_input.lower() for s in _medical_signals)
 
             if _is_farewell:
-                print(f"[referral_fill] Farewell detected, not storing as referral: '{_ref_input[:60]}'")
+                print("[referral_fill] Farewell detected; referral left unchanged")
                 result_extra = {}  # Leave referral as-is; interview is ending anyway
             elif _is_medical:
                 # This is a medical answer, not a referral — let extraction handle it
                 # and mark referral as not yet asked so it gets re-asked next turn
-                print(f"[referral_fill] Medical answer detected, not storing as referral: '{_ref_input[:60]}'")
+                print("[referral_fill] Medical answer detected; referral will be re-asked")
                 result_extra = {"referral_asked": False}
             elif _ref_input and not _is_null:
                 _channel_map = {
@@ -627,7 +638,7 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                 updated_form = dict(updated_form)
                 updated_form["Referral"] = dict(updated_form.get("Referral", {}))
                 updated_form["Referral"]["Source"] = matched or _ref_input
-                print(f"[referral_fill] Source → {updated_form['Referral']['Source']}")
+                print("[referral_fill] Referral source recorded")
                 result_extra = {}
             else:
                 result_extra = {}
@@ -668,7 +679,7 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                                             updated_form[_sec][_field] = str(_val).strip()
                             print(f"[comprehensive_fill] Done — {_still_empty} empty fields filled from conversation")
                 except Exception as _e:
-                    print(f"[comprehensive_fill] Non-fatal: {_e}")
+                    print(f"[comprehensive_fill] Failed: {error_type(_e)}")
 
         new_history = history + [{"role": "user", "message": user_input}]
 
@@ -686,10 +697,3 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
         return result
 
     return extract_form_data_node
-
-
-def make_classify_intent_node(llm_complete: Callable[[str], str]):
-    """No-op stub — intent classification is now handled inside make_extract_node."""
-    def classify_intent_node(state: InterviewState) -> dict:
-        return {}
-    return classify_intent_node

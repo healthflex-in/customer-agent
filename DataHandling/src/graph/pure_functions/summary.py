@@ -6,6 +6,7 @@ import json
 import time as _time
 from typing import Callable, Optional
 
+from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
 
 
@@ -55,7 +56,7 @@ Return ONLY the summary text."""
             summary = _fallback_summary(form)
         return summary or _fallback_summary(form)
     except Exception as e:
-        print(f"[generate_interview_summary] Error: {e}")
+        print(f"[generate_interview_summary] Failed: {error_type(e)}")
         return _fallback_summary(form)
 
 
@@ -129,7 +130,7 @@ Respond ONLY with compact JSON:
             "wants_upload": data.get("wants_upload"),
         }
     except Exception as e:
-        print(f"[classify_summary_response] Error: {e}")
+        print(f"[classify_summary_response] Failed: {error_type(e)}")
         return {}
 
 
@@ -229,5 +230,5 @@ RULES:
             has_reports = True
         return {"has_reports": has_reports, "wants_upload": wants_upload}
     except Exception as e:
-        print(f"[classify_reports_intent] Error: {e}")
+        print(f"[classify_reports_intent] Failed: {error_type(e)}")
         return {}

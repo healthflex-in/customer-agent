@@ -1,118 +1,174 @@
-# Public API Contract (pre-refactor snapshot)
+# Current HTTP and WebSocket Contract
 
-This file is the source of truth for what behaviour the refactor MUST preserve.
-Any deviation from this surface is a regression.
+Verified against `server.py` and the frontend `useWebSocket` consumer on
+3 September 2026. This describes the current implementation, including known
+limitations; it is not a promise that unsafe behavior must be preserved.
 
-Generated from `server.py` and `src/llm/functionalities.py` as of the snapshot
-date below. Update only when intentional, externally-visible changes ship.
+## Security boundary
 
-Snapshot date: 2026-05-26
-Snapshot SHA (server.py): `144152 bytes` (matches EC2 host)
+Every patient-data HTTP route requires an `Authorization: Bearer <token>`
+header. The first WebSocket `start_interview` message requires the same signed
+token in `accessToken`; unauthenticated control/audio messages are rejected and
+the socket is closed with policy code `1008`. `/health`, framework API docs,
+and metadata-only metrics remain public.
 
----
+Tokens are short-lived HS256 JWTs with strict `iss`, `aud`, `sub`, `role`,
+`scope`, `iat`, and `exp` validation. Patient tokens can access only the patient
+whose ID equals `sub`. Clinician tokens require an explicit `patients` allow-
+list, while admin tokens can address any patient but still require the operation
+scope. The user directory additionally requires clinician/admin role plus
+`users:read`. The server rejects missing/short signing secrets, unsupported
+algorithms/roles, invalid signatures, future/expired/excessively long tokens,
+and wrong issuer/audience values. There is deliberately no public token-
+issuance endpoint.
 
-## 1. HTTP routes (FastAPI)
+The API has no question/category administration routes. It cannot add, edit,
+publish, categorise, or delete clinical questions.
 
-| Method | Path                                   | Handler                          | Notes                                              |
-|--------|----------------------------------------|----------------------------------|----------------------------------------------------|
-| GET    | `/health`                              | `health_check`                   | Liveness probe used by Docker healthcheck.         |
-| GET    | `/api/users`                           | `get_users`                      | User directory listing for the dashboard.          |
-| GET    | `/api/users/{user_id}/forms`           | `get_user_forms_endpoint`        | All forms for one user.                            |
-| GET    | `/api/forms/{form_id}`                 | `get_form_endpoint`              | Requires `userId` query param.                     |
-| GET    | `/api/forms/{form_id}/progress`        | `get_form_progress_endpoint`     | Requires `userId` query param.                     |
-| POST   | `/api/forms/{form_id}/attachments`     | `upload_form_attachment`         | Multipart upload, S3-backed.                       |
+## HTTP endpoints
 
-CORS origins (must remain identical):
-- `https://customerai.stance.health`
-- `https://customer-agent-mu.vercel.app`
-- `http://localhost:3000`, `:8000`, `:8080`, `:8081`
+FastAPI also exposes its default `/docs`, `/redoc`, and `/openapi.json` pages.
+When Prometheus dependencies are installed, metrics are mounted at `/metrics`.
 
-## 2. WebSocket: `/ws/{client_id}`
+| Method | Path | Input | Successful response |
+|---|---|---|---|
+| `GET` | `/health` | None | Service/component state and AI telemetry pricing version. This is liveness/configuration state, not an external-provider probe. |
+| `GET` | `/api/users` | Bearer token with clinician/admin `users:read`; query `search`, `limit` | `{ "users": [...] }`, sorted by `updatedAt` descending. |
+| `GET` | `/api/users/{user_id}/consent` | Patient-bound Bearer token with `consent:read` | Consent state from `users.profileData` or active `consentrecords`. |
+| `POST` | `/api/users/{user_id}/consent` | Patient-bound Bearer token with `consent:write` | Marks consent accepted with policy version `1.1.0`. |
+| `GET` | `/api/users/{user_id}/forms` | Patient-bound Bearer token with `forms:read` | `{ "forms": [...] }`. |
+| `GET` | `/api/forms/{form_id}` | Patient-bound `forms:read`; required `userId`, optional `attemptId` | `{ "form": {...} }` for the exact/latest attempt. |
+| `GET` | `/api/forms/{form_id}/progress` | Patient-bound `forms:read`; required `userId`, optional `attemptId` | Completion state for the selected/latest attempt. |
+| `POST` | `/api/forms/{form_id}/attachments` | Patient-bound `forms:write`; multipart `files`, `userId`, optional `attemptId` | Attachment/job/form/progress state. |
 
-### Inbound message types (client → server)
+### Attachment processing
 
-| `type`            | Payload fields                                  | Purpose                                  |
-|-------------------|-------------------------------------------------|------------------------------------------|
-| `start_interview` | (client_state)                                  | Begin a fresh interview session.         |
-| `start_new_form`  | (client_state, optional flags)                  | Start a brand-new form for the user.     |
-| `load_form`       | `form_id`                                       | Resume an existing form.                 |
-| `text_input`      | `text`                                          | User typed message (instead of voice).   |
-| `audio_start`     | (signals upcoming chunks)                       | Beginning of streamed audio.             |
-| `audio_chunk`     | `data` (base64 PCM/webm bytes)                  | One chunk of streamed audio.             |
-| `audio_end`       | (none)                                          | Triggers Whisper transcription.          |
-| `end_session`     | (none)                                          | Clean shutdown.                          |
+The upload handler:
 
-### Outbound message types (server → client)
+1. resolves the exact user/form pair;
+2. enforces configured file-count, per-file, total-byte, file-signature,
+   extension/MIME, decoder, image-dimension, PDF-page, and total-page limits;
+3. validates the full batch before creating S3 objects;
+4. stores attachment metadata;
+5. enqueues a Mongo-backed report-summary job;
+6. returns before Bedrock processing completes.
 
-| `type`         | Fields                                                 | Sent when                                  |
-|----------------|--------------------------------------------------------|--------------------------------------------|
-| `text_message` | `text`, `message_id`                                   | Agent textual response.                    |
-| `transcription`| `text`, `timestamp`                                    | After Whisper finishes on `audio_end`.     |
-| `audio_start`  | `message_id`, `total_size`                             | TTS audio streaming begins.                |
-| `audio_chunk`  | `message_id`, `data` (base64), `chunk_index`           | One chunk of TTS audio.                    |
-| `form_loaded`  | (form payload)                                         | After `load_form` succeeds.                |
-| `report`       | (summary payload)                                      | Final interview summary / report.          |
-| `error`        | `text`                                                 | Any handler error path.                    |
+The latest valid job publishes the Bedrock summary into the form. Upload success
+therefore does not mean OCR/summary completion. There is not yet a dedicated job
+status endpoint; the client observes subsequent form state.
 
-## 3. `HealthAgent` public surface (`src/llm/functionalities.py`)
+Default application limits are five files, 15 MB per file, 25 MB combined, and
+five report pages combined. Deployment/proxy request limits may be stricter.
 
-After refactor, `HealthAgent` must keep these methods callable with the same
-signatures from `server.py`. Internals can move freely.
+## WebSocket endpoint
 
-```
-HealthAgent()                                    # ctor with no args
-HealthAgent.ensure_string(text) -> str
-HealthAgent.llm_complete(prompt) -> str
-HealthAgent.start_keyword_thread()
-HealthAgent.init_prompts()
-HealthAgent.init_chromadb()
-HealthAgent.init_health_info_index()
-HealthAgent.init_chat_components()
-HealthAgent.init_form()
-HealthAgent.check_for_keyword()
-HealthAgent.describe_action(text_chunk, threshold=0.5)
-HealthAgent.formatter(user_input, prompt_template)
-HealthAgent.extract_json_from_response(response)
-HealthAgent.classify_summary_response(user_input: str) -> dict
-HealthAgent.classify_reports_intent(user_input: str) -> dict
-HealthAgent.should_check_for_correction(user_input: str) -> bool
-HealthAgent.detect_correction(user_message, is_summary_mode=False)
-HealthAgent.generate_summary() -> str
-HealthAgent.apply_correction(correction_data, is_summary_mode=False)
-HealthAgent.validator(current_section=None)
-HealthAgent.all_ops()
-HealthAgent.save_progress()
-HealthAgent.talk_to_user(prompt_template)
-HealthAgent.invalid_index()
-HealthAgent.get_all_missing_fields()
-HealthAgent.make_template(mode, source=None, context=None)
-HealthAgent.main_processor(user_response)
+WebSocket endpoint: `/ws/{client_id}`.
+
+Connect to:
+
+```text
+/ws/{client_id}
 ```
 
-Private (`_` prefix) — internal, but should still keep behaviour:
-- `_is_semantically_compatible`
-- `_propagate_correction`
+`client_id` is used only for connection correlation and is not identity. After
+connecting, send authenticated `start_interview`; the verified claims, not the
+path or supplied patient ID alone, authorize the session.
 
-## 4. Module-level globals consumed across files
+### Client-to-server messages
 
-These globals exist in `server.py` and are read/written across handlers.
-They must remain accessible (or be replaced by an equivalent abstraction):
+Control messages are UTF-8 JSON. Recorded audio chunks are binary frames.
 
-- `health_agent: HealthAgent`        — singleton, initialized at boot
-- `model: whisper.Whisper`           — STT model
-- `mongo_client`, `users_collection`, `customer_info_collection`
-- `RATE` (16000), `SAMPLE_WIDTH` (2), `MAX_CHUNK_SIZE` (65536)
-- `ALLOWED_ATTACHMENT_TYPES`, `MAX_ATTACHMENT_SIZE_MB`, `UPLOAD_TRIGGER_PHRASE`
-- `MONGO_URI`, `MONGO_DB_NAME`, `MONGO_USERS_COLLECTION`,
-  `MONGO_CUSTOMER_INFO_COLLECTION`
+| Type | Fields | Behavior |
+|---|---|---|
+| `start_interview` | `accessToken` and `userId` required; `formId`/`attemptId` optional | Verifies signature, claims, scope, and patient binding before any database lookup, then starts/resumes the intake. |
+| `start_new_form` | `userId` required if not already associated | Clears all regular/PROM/graph session state and allocates a new opaque attempt ID without creating an empty database document. |
+| `load_form` | `formId` required; `attemptId` optional | Loads the exact attempt for the session user, or the latest matching attempt for an older client. |
+| `text_input` | `text`; optional `requestId`, `questionId`, `inputMode` | Processes one typed/transcribed answer. `inputMode: "structured_prom"` is accepted only when its validated metadata matches the active PROM question(s). |
+| `audio_start` | Timestamp is accepted but not trusted | Opens a server-timed, size-limited recording window. |
+| binary frame | Raw browser audio bytes | Appended only while recording; cumulative bytes and elapsed time are bounded. |
+| `audio_end` | Optional declared `duration` | Transcribes accumulated audio. The server sends the transcript but does not submit it as an interview answer automatically. |
+| `end_session` | Optional `userId` | Re-authorizes any supplied patient ID, saves current state, and sends confirmation. |
 
-## 5. External effects (do not change)
+`text_input.requestId` must contain 1–128 characters from
+`A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, or `-`. Reusing the same request ID and
+question returns a duplicate acknowledgement; reusing it for another question
+returns an error. This window is bounded and process-local.
 
-- Whisper model: `base`, CPU/CUDA auto-selected.
-- TTS: gTTS via `gtts` lib, cached under `tts_cache/`, 1.7× speed factor.
-- ChromaDB persisted at `$CHROMA_DB_PATH` (default `/app/db/vector/...`).
-- S3 uploads via `upload.s3_client` (presigned + bytes upload).
-- MongoDB collections: `users`, `customer-info`.
-- Filesystem writes (debug-only, will be flagged off in refactor):
-  - `audio_files/server_received_<ts>.{raw,wav}`
-  - `transcripts/transcript_<ts>.txt`
+### Server-to-client messages
+
+| Type | Important fields | Meaning |
+|---|---|---|
+| `text_message` | `text`, `session_id`, `interview_state`, `request_attachment`, optional `question_meta` | Primary assistant/welcome/question/summary response. |
+| `token` | `content` | Incremental display token where the graph path can provide it. Some paths synthesize tokens after a complete response, so this does not always indicate provider streaming. |
+| `thought_update` | `thoughts[]` containing `stage`, `detail`, `status` | UI progress labels for graph processing stages; not model chain-of-thought. |
+| `transcription` | `text`, `timestamp` | Gemini transcription or Google Speech fallback result after `audio_end`. |
+| `form_loaded` | `text`, `session_id`, `interview_state`, `form_data` | Confirmation/state sent by `load_form`; normally followed by `text_message`. |
+| `submission_ack` | `status: "duplicate"`, `requestId` | A retry was recognized and not processed again. |
+| `clinical_escalation` | `text`, `category`, `severity`, `policyVersion`, `stopInterview` | Deterministic urgent-risk response. The server then closes with code `4003`; clients must display the message, stop intake, and must not reconnect automatically. |
+| `error` | `text` or `message` | Validation/provider/processing failure. Both keys currently exist; clients must handle either until the protocol is normalized. |
+| `system` | `message` | Operational notice, currently used during graceful server shutdown. |
+
+`interview_state` currently contains:
+
+```json
+{
+  "section": "Present Complaint",
+  "progress": 25,
+  "missing_fields": [],
+  "attachments": [],
+  "formId": "FRM-01",
+  "attemptId": "ATT-70a7da1a-cb4d-4936-b6da-b82e094f280f",
+  "promSteps": null
+}
+```
+
+PROM `question_meta` can describe a single or batched input using `type`,
+`options`, `question_id`, `question_ids`, `questions`, `question_options`,
+`question_types`, and `question_scales`. Supported frontend presentation types
+include text, single/multiple choice, scale/rating, boolean, number, date/time,
+grid, upload, and `multi_answer` variants.
+
+Clinical PROM templates must provide a stable unique question ID and explicit
+response type/options for every item. Recognized `prom_*` items retain their
+source wording and recall window; they are not personalized. An optional
+`instrumentVersion` may be supplied by the question-bank record.
+
+## Main state and persistence behavior
+
+- A separate `HealthAgent` instance is constructed per WebSocket connection.
+- LangGraph is the primary interview path; `HealthAgent.main_processor` remains
+  the fallback.
+- MongoDB `customer-info` is persistent form storage.
+- `formId` identifies the questionnaire/template and `attemptId` identifies one
+  intake submission. Legacy records without an attempt ID remain readable and
+  updateable, while every explicit new intake receives an independent ID.
+- Forms transition monotonically through `draft`, `in_progress`, and
+  `completed`; ordinary saves cannot downgrade a completed record.
+- Only drafts receive `expiresAt` for TTL cleanup.
+- Report jobs use the `customer-agent-report-jobs` MongoDB collection.
+- Clinical safety events use `customer-agent-clinical-escalations`; events omit
+  the triggering answer and begin with status `detected`.
+- Session/checkpointer state, rate limiting, and request-id tracking are local to
+  one process.
+
+New clinical assessment records also contain `promSnapshot` schema version 1.
+It separates the exact administered definition from stable-question-ID
+responses and includes a content hash. Its scoring state remains
+`not_configured` until an approved instrument/version-specific scoring contract
+is implemented; consumers must not calculate or display a score from the legacy
+text-keyed `form_data` view.
+
+## External services
+
+- Gemini 2.5 Flash-Lite: general interview text by default.
+- Gemini 2.5 Flash: reasoning extraction and primary audio transcription by default.
+- Google Cloud Speech-to-Text v1: audio fallback.
+- Amazon S3: report objects.
+- Amazon Bedrock Nova: multimodal report summarization.
+- MongoDB: users, consent records, forms, and report jobs.
+- Prometheus: metadata-only operational metrics.
+- Langfuse/MCP: optional and disabled for patient content unless explicitly
+  configured and approved.
+
+Model IDs are validated centrally and may be changed only to approved registry
+values through environment configuration.

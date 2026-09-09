@@ -11,7 +11,8 @@ def route_by_phase(state: InterviewState) -> str:
     return state["phase"]
 
 
-def after_classify_intent(state: InterviewState) -> str:
+def after_extract(state: InterviewState) -> str:
+    """Route signals computed by the combined extraction/intent node."""
     if state.get("is_correction_turn"):
         return "detect_correction"
     # In PROM/tagged-question sessions, skip reports upload flow entirely —
