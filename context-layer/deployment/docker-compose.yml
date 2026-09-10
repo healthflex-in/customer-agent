@@ -1,0 +1,27 @@
+version: '3.8'
+
+# Standalone compose for the recommender. On the customer-agent EC2 you can
+# either run this alongside the existing stack, or paste this service block into
+# healthflex-agent/docker-compose.yml. Code is volume-mounted so update-fast-style
+# rsync + restart works without a rebuild.
+services:
+  assessment-recommender:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    container_name: assessment-recommender
+    ports:
+      - "8002:8002"
+    env_file:
+      - ../.env
+    volumes:
+      - ..:/app:rw
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M

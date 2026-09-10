@@ -1,0 +1,251 @@
+{
+  "version": 1,
+  "conditions": {
+    "knee_pain": {
+      "objectiveTests": [
+        "McMurray Test",
+        "Apley'S Test",
+        "Thessaly'S Test",
+        "Joint Line Tenderness",
+        "Lachmann'S Test",
+        "Anterior Drawer Test - Knee",
+        "Posterior Drawer",
+        "Lelli'S Test",
+        "Sag Sign",
+        "Valgus Stress",
+        "Varus Stress",
+        "Patellar Grind",
+        "Clarke'S Sign",
+        "Knee Flexion Range (Supine)",
+        "Knee Extension Range",
+        "Ober's Test",
+        "Noble Compression",
+        "Ely'S Test"
+      ],
+      "priorityByTest": {
+        "McMurray Test": 9,
+        "Lachmann'S Test": 9,
+        "Anterior Drawer Test - Knee": 8,
+        "Apley'S Test": 8,
+        "Thessaly'S Test": 8,
+        "Joint Line Tenderness": 7,
+        "Valgus Stress": 7,
+        "Varus Stress": 7,
+        "Patellar Grind": 7,
+        "Clarke'S Sign": 6,
+        "Knee Flexion Range (Supine)": 6,
+        "Knee Extension Range": 6,
+        "Posterior Drawer": 6,
+        "Lelli'S Test": 5,
+        "Sag Sign": 5,
+        "Ober's Test": 5,
+        "Noble Compression": 4,
+        "Ely'S Test": 4
+      },
+      "contraindications": ["acute_fracture_suspected"],
+      "advice": "Relative rest and activity modification. Apply ice for 15-20 minutes for acute pain or swelling. Avoid deep squatting, kneeling, and painful stairs. Keep the knee gently moving within a pain-free range.",
+      "plan": [
+        {"exercise": "Static Quadriceps Contraction", "comments": "10s holds, pain-free range"},
+        {"exercise": "Straight Leg Raise", "comments": "Progress repetitions as tolerated"},
+        {"exercise": "Heel Slides (Knee ROM)", "comments": "Within pain-free range"}
+      ],
+      "learnedTests": []
+    },
+    "shoulder_pain": {
+      "objectiveTests": [
+        "Hawkins-Kennedy Test",
+        "Neer'S Impingement Test",
+        "Empty Can Test",
+        "Full Can",
+        "Painful Arc",
+        "Drop Arm",
+        "Speed'S Test",
+        "O'Brien'S Test",
+        "Belly Press Test",
+        "Lift Off Test",
+        "Bear Hug Test",
+        "Sulcus Sign",
+        "Load And Shift",
+        "Shoulder Apprehension Test",
+        "External Rotation Lag Sign",
+        "Shoulder Flexion Range",
+        "Shoulder Abduction Range",
+        "Shoulder External Rotation Range",
+        "Shoulder Internal Rotation Range"
+      ],
+      "priorityByTest": {
+        "Hawkins-Kennedy Test": 9,
+        "Neer'S Impingement Test": 9,
+        "Empty Can Test": 8,
+        "Painful Arc": 8,
+        "Drop Arm": 7,
+        "O'Brien'S Test": 7,
+        "Speed'S Test": 7,
+        "Shoulder Apprehension Test": 7,
+        "Belly Press Test": 6,
+        "Lift Off Test": 6,
+        "Bear Hug Test": 6,
+        "Full Can": 6,
+        "Sulcus Sign": 5,
+        "Load And Shift": 5,
+        "External Rotation Lag Sign": 5,
+        "Shoulder Flexion Range": 6,
+        "Shoulder Abduction Range": 6,
+        "Shoulder External Rotation Range": 5,
+        "Shoulder Internal Rotation Range": 5
+      },
+      "contraindications": ["acute_fracture_suspected"],
+      "advice": "Avoid painful overhead activities and lifting. Use ice for acute pain. Maintain gentle pain-free shoulder movement to prevent stiffness. Correct posture during daily activities.",
+      "plan": [
+        {"exercise": "Pendulum Exercises", "comments": "Gentle, relaxed swings"},
+        {"exercise": "Scapular Setting", "comments": "Retract and depress, hold 10s"},
+        {"exercise": "Isometric External Rotation", "comments": "Pain-free effort"}
+      ],
+      "learnedTests": []
+    },
+    "low_back_pain": {
+      "objectiveTests": [
+        "SLR",
+        "SLUMP Test",
+        "FABER",
+        "FADIR",
+        "Gaenslen'S Test",
+        "Sacral Thrust",
+        "Thigh Thrust",
+        "Distraction Test",
+        "Compression",
+        "Piriformis Muscle Length",
+        "Trendelenburg Test",
+        "Lumbar Flexion Range",
+        "Lumbar Extension Range",
+        "Lumbar Side Flexion Range",
+        "Lumbar Quadrant test"
+      ],
+      "priorityByTest": {
+        "SLR": 9,
+        "SLUMP Test": 8,
+        "FABER": 7,
+        "FADIR": 7,
+        "Gaenslen'S Test": 6,
+        "Sacral Thrust": 6,
+        "Thigh Thrust": 6,
+        "Distraction Test": 6,
+        "Compression": 6,
+        "Piriformis Muscle Length": 5,
+        "Trendelenburg Test": 5,
+        "Lumbar Flexion Range": 7,
+        "Lumbar Extension Range": 7,
+        "Lumbar Side Flexion Range": 6,
+        "Lumbar Quadrant test": 6
+      },
+      "contraindications": ["acute_fracture_suspected"],
+      "advice": "Stay as active as pain allows and avoid prolonged bed rest. Avoid heavy lifting and prolonged sitting. Maintain good posture and use gentle movement to ease stiffness.",
+      "plan": [
+        {"exercise": "Pelvic Tilts", "comments": "Slow, controlled range"},
+        {"exercise": "Cat-Camel", "comments": "Gentle spinal mobility"},
+        {"exercise": "Core Activation (Abdominal Bracing)", "comments": "Hold 10s, breathe normally"}
+      ],
+      "learnedTests": []
+    },
+    "neck_pain": {
+      "objectiveTests": [
+        "Cervical Quadrant test",
+        "Distraction Test",
+        "Compression",
+        "SLUMP Test",
+        "Neurodynamic Test (Median Nerve)"
+      ],
+      "priorityByTest": {
+        "Cervical Quadrant test": 8,
+        "Distraction Test": 7,
+        "Compression": 7,
+        "SLUMP Test": 6,
+        "Neurodynamic Test (Median Nerve)": 6
+      },
+      "contraindications": ["acute_fracture_suspected"],
+      "advice": "Avoid prolonged static neck postures and screen time. Keep the neck gently mobile within a pain-free range. Use a supportive pillow and correct workstation ergonomics.",
+      "plan": [
+        {"exercise": "Chin Tucks", "comments": "Gentle, hold 5s"},
+        {"exercise": "Cervical Range of Motion", "comments": "Pain-free range, all directions"},
+        {"exercise": "Scapular Retraction", "comments": "Hold 10s"}
+      ],
+      "learnedTests": []
+    },
+    "ankle_pain": {
+      "objectiveTests": [
+        "Anterior Drawer Test - Ankle",
+        "Talar Tilt Test",
+        "Squeeze Test",
+        "External Rotation Stress Test",
+        "Cotton Test",
+        "Forced Plantarflexion Test",
+        "Df Lunge Test",
+        "Ankle Mobility",
+        "Ankle Plantarflexion Range",
+        "Ankle Inversion Range",
+        "Ankle Eversion Range",
+        "Paxino'S Test"
+      ],
+      "priorityByTest": {
+        "Anterior Drawer Test - Ankle": 9,
+        "Talar Tilt Test": 8,
+        "Squeeze Test": 7,
+        "External Rotation Stress Test": 7,
+        "Cotton Test": 6,
+        "Forced Plantarflexion Test": 6,
+        "Df Lunge Test": 6,
+        "Ankle Mobility": 6,
+        "Ankle Plantarflexion Range": 5,
+        "Ankle Inversion Range": 5,
+        "Ankle Eversion Range": 5,
+        "Paxino'S Test": 4
+      },
+      "contraindications": ["acute_fracture_suspected"],
+      "advice": "Follow relative rest, ice, compression, and elevation for acute swelling. Avoid uneven surfaces. Begin gentle pain-free ankle movement early to maintain mobility.",
+      "plan": [
+        {"exercise": "Ankle Alphabet (ROM)", "comments": "Pain-free range"},
+        {"exercise": "Isometric Ankle Eversion", "comments": "Against resistance, pain-free"},
+        {"exercise": "Calf Raises", "comments": "Progress as tolerated"}
+      ],
+      "learnedTests": []
+    },
+    "hip_pain": {
+      "objectiveTests": [
+        "FADIR",
+        "FABER",
+        "McCarthy'S Test",
+        "Hip Quadrant",
+        "Trendelenburg Test",
+        "Ober's Test",
+        "Adductor Sqeeze Test",
+        "Piriformis Muscle Length",
+        "Hip Flexor Muscle Length",
+        "Hip External Rotation Range",
+        "Hip Internal Rotation Range",
+        "Active Hip Extension Range"
+      ],
+      "priorityByTest": {
+        "FADIR": 9,
+        "FABER": 8,
+        "McCarthy'S Test": 7,
+        "Hip Quadrant": 7,
+        "Trendelenburg Test": 6,
+        "Ober's Test": 6,
+        "Adductor Sqeeze Test": 6,
+        "Piriformis Muscle Length": 5,
+        "Hip Flexor Muscle Length": 5,
+        "Hip External Rotation Range": 5,
+        "Hip Internal Rotation Range": 5,
+        "Active Hip Extension Range": 4
+      },
+      "contraindications": ["acute_fracture_suspected"],
+      "advice": "Avoid deep hip flexion, prolonged sitting, and high-impact activity where painful. Maintain gentle pain-free hip movement and address load management.",
+      "plan": [
+        {"exercise": "Glute Bridges", "comments": "Hold 5s, pain-free"},
+        {"exercise": "Clamshells", "comments": "Controlled range"},
+        {"exercise": "Hip Range of Motion", "comments": "Pain-free, all directions"}
+      ],
+      "learnedTests": []
+    }
+  }
+}
