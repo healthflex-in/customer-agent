@@ -1,4 +1,4 @@
-name: stance-customer-agent-dev-isolated
+version: "3.8"
 
 services:
   customer-agent-dev-isolated:
