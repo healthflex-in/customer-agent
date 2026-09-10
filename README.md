@@ -61,13 +61,10 @@ uncoordinated multi-worker scaling.
 
 ## Documentation
 
-- [Full project and optimization audit](DataHandling/docs/CODEBASE_OPTIMIZATION_AUDIT.md)
 - [Current REST and WebSocket contract](DataHandling/docs/PUBLIC_API.md)
 - [Local development and verification](DataHandling/docs/LOCAL_DEV.md)
-
-The optimization audit is the main project knowledge-transfer document. It
-contains the end-to-end flows, data model, dependencies, risks, legacy code,
-cost drivers, completed remediation, pending work, and client decisions.
+- [Deployment configuration and checks](DataHandling/docs/DEPLOYMENT.md)
+- [Isolated development deployment](DataHandling/docs/DEV_ISOLATED_DEPLOYMENT.md)
 
 ## Local start
 
@@ -102,14 +99,15 @@ npm run dev
 The frontend template defaults to backend HTTP `localhost:8000`, WebSocket
 `ws://localhost:8000`, and the Vite development server (normally port 8080).
 
-## Security and test-data warning
+## Access and test-data warning
 
-The backend now fails closed on patient-data routes unless a short-lived signed
-access token supplies the required scope and patient binding. Configure the
-local-only signing secret/issuer/audience and generate a synthetic-patient link
-as described in the local-development guide. Do not expose a local instance
-publicly or use a production patient database for development or automated
-tests; local authentication does not make production data safe for testing.
+The customer-agent currently relies on the existing external consent flow: the
+consent application performs its OTP process and writes the accepted consent
+record, and the frontend checks that record before enabling the interview. The
+customer-agent does not currently require its own access token. Do not expose a
+local instance publicly or use a production patient database for development or
+automated tests. A patient ID in a URL is not an independent authentication
+credential.
 
 Never commit `.env`, Google credential JSON, AWS secrets, MongoDB credentials,
 patient exports, reports, audio, transcripts, or observability content containing

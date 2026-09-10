@@ -1,0 +1,70 @@
+name: stance-customer-agent-dev-isolated
+
+services:
+  customer-agent-dev-isolated:
+    image: stance-customer-agent-dev-isolated:local
+    build:
+      context: .
+      dockerfile: DataHandling/deployment/Dockerfile
+    container_name: customer-agent-dev-isolated
+    ports:
+      # Existing server ports: prod=8000, admin=8001, recommender=8002,
+      # existing dev=8003. Bind this stack only to loopback on 8004 and expose
+      # it through a dedicated reverse-proxy hostname.
+      - "127.0.0.1:8004:8000"
+    env_file:
+      - ./DataHandling/.env.dev-isolated
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: config/google_key.json
+      CHROMA_DB_PATH: /app/db/vector/chroma_db_collective
+      PYTHONPATH: /app
+    volumes:
+      - dev-isolated-audio:/app/audio_files
+      - dev-isolated-transcripts:/app/transcripts
+      - dev-isolated-output:/app/output
+      - dev-isolated-received-audio:/app/received_audio
+      - dev-isolated-db:/app/db
+      - ./DataHandling/config/dev-isolated:/app/config:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    cpus: 2.0
+    mem_limit: 4g
+    mem_reservation: 1g
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - dev-isolated-network
+
+volumes:
+  dev-isolated-audio:
+    name: customer-agent-dev-isolated-audio
+  dev-isolated-transcripts:
+    name: customer-agent-dev-isolated-transcripts
+  dev-isolated-output:
+    name: customer-agent-dev-isolated-output
+  dev-isolated-received-audio:
+    name: customer-agent-dev-isolated-received-audio
+  dev-isolated-db:
+    name: customer-agent-dev-isolated-db
+
+networks:
+  dev-isolated-network:
+    name: customer-agent-dev-isolated-network
+    driver: bridge

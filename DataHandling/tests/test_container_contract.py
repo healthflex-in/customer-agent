@@ -91,6 +91,7 @@ class ContainerContractTests(unittest.TestCase):
     def test_compose_does_not_override_application_with_host_source(self):
         for path in (
             PROJECT_ROOT / "docker-compose.yml",
+            PROJECT_ROOT / "docker-compose.dev-isolated.yml",
             BACKEND_ROOT / "deployment" / "docker-compose.yml",
         ):
             compose = path.read_text(encoding="utf-8")
@@ -108,9 +109,30 @@ class ContainerContractTests(unittest.TestCase):
         self.assertNotIn("chromadb.AsyncHttpClient(", runtime_source)
         for compose_path in (
             PROJECT_ROOT / "docker-compose.yml",
+            PROJECT_ROOT / "docker-compose.dev-isolated.yml",
             BACKEND_ROOT / "deployment" / "docker-compose.yml",
         ):
             self.assertNotIn("chroma/chroma", compose_path.read_text(encoding="utf-8"))
+
+    def test_isolated_dev_compose_has_dedicated_resources(self):
+        compose = (PROJECT_ROOT / "docker-compose.dev-isolated.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("name: stance-customer-agent-dev-isolated", compose)
+        self.assertIn("container_name: customer-agent-dev-isolated", compose)
+        self.assertIn("image: stance-customer-agent-dev-isolated:local", compose)
+        self.assertIn('"127.0.0.1:8004:8000"', compose)
+        self.assertIn("./DataHandling/.env.dev-isolated", compose)
+        self.assertIn("./DataHandling/config/dev-isolated:/app/config:ro", compose)
+        self.assertIn("name: customer-agent-dev-isolated-network", compose)
+        for suffix in (
+            "audio",
+            "transcripts",
+            "output",
+            "received-audio",
+            "db",
+        ):
+            self.assertIn(f"name: customer-agent-dev-isolated-{suffix}", compose)
 
 
 if __name__ == "__main__":

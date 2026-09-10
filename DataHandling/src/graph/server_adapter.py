@@ -140,6 +140,7 @@ def build_graph_state(
         reports_intent=None,
         is_correction_turn=False,
         correction_data=None,
+        correction_applied=False,
         # Orchestrator
         orchestrator_question_id=client_state.get("current_question_id"),
         orchestrator_question_text=None,
@@ -361,7 +362,7 @@ def init_graph_state_in_client(
 
     Args:
         client_state: The per-connection WebSocket state dict (mutated in place).
-        user_id:      The authenticated application user ID.
+        user_id:      The application user ID selected for this session.
         form_id:      The form ID (typically DEFAULT_FORM_ID from app.config).
         form:         Optional pre-loaded form dict. When None a blank form template
                       is used (equivalent to a brand-new interview).

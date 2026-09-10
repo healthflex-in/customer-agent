@@ -1,9 +1,9 @@
 # Local Development
 
 Use non-production services and synthetic patient records only. The repository
-does not contain a test database, authenticated sandbox, or provider emulator.
-The API requires a signed access token whose claims authorize the supplied
-`userId`; use only locally issued test tokens and synthetic users.
+does not contain a test database or provider emulator. The customer-agent relies
+on the existing external consent/OTP flow and does not require its own access
+token. Use only synthetic users whose consent state is appropriate for the test.
 
 ## Repository layout
 
@@ -44,7 +44,6 @@ At minimum configure:
 
 - `MONGO_URI` for a non-production database;
 - `GEMINI_API_KEY`;
-- `AUTH_SIGNING_SECRET`, `AUTH_ISSUER`, and `AUTH_AUDIENCE` for local signed links;
 - `OBSERVABILITY_HASH_KEY` if pseudonymous cross-event correlation is required.
 
 For audio fallback, place an untracked Google service-account JSON file at
@@ -66,9 +65,6 @@ stable unique ID and explicit response type/options for every item. Recognized
 clinical `prom_*` questions are immutable. New records store a `promSnapshot`
 with the exact administered definition and stable-ID answers; scoring remains
 disabled until an approved instrument contract is supplied.
-
-Set a local-only authentication secret of at least 32 bytes plus the documented
-issuer and audience. Do not put this secret in any `VITE_*` variable.
 
 ## Start the backend
 
@@ -121,32 +117,17 @@ in them. The configuration validator requires pathless API/WebSocket bases,
 localhost endpoints for local mode, HTTPS/WSS in deployed modes, and rejects
 known cross-environment hosts.
 
-Generate a short-lived token from `DataHandling/` for a synthetic patient:
-
-```bash
-python3 -m scripts.generate_access_token \
-  --subject YOUR_SYNTHETIC_USER_ID \
-  --role patient \
-  --scope interview:write \
-  --scope forms:read \
-  --scope forms:write \
-  --scope consent:read \
-  --scope consent:write
-```
-
-The patient page requires a link shaped like the following. Put the token in
-the URL fragment so it is not sent in the HTTP request or referrer:
+The patient page uses the existing user/form link shape:
 
 ```text
-http://localhost:8080/{userId}/{formId}#access_token={token}
+http://localhost:8080/{userId}/{formId}
 ```
 
 Use only a synthetic user ID that exists in the configured non-production
 MongoDB database. `FRM-01` selects the standard intake; other form IDs attempt to
-load assigned PROM questions. The frontend consumes the fragment, removes it
-from the address bar, retains it for the tab in `sessionStorage`, adds it as a
-Bearer header to REST calls, and includes it only in the first WebSocket control
-message.
+load assigned PROM questions. The frontend checks consent through the backend;
+the external consent application is responsible for its OTP verification and
+stored consent record.
 
 ## Verification
 

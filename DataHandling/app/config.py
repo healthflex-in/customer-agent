@@ -30,14 +30,6 @@ MONGO_CLINICAL_ESCALATIONS_COLLECTION: str = os.getenv(
 MONGO_TLS_CA_FILE: str | None = os.getenv("MONGO_TLS_CA_FILE")
 
 
-# ── Authentication ────────────────────────────────────────────────────────
-AUTH_SIGNING_SECRET: str = os.getenv("AUTH_SIGNING_SECRET", "")
-AUTH_ISSUER: str = os.getenv("AUTH_ISSUER", "")
-AUTH_AUDIENCE: str = os.getenv("AUTH_AUDIENCE", "")
-AUTH_MAX_TOKEN_SECONDS: int = int(os.getenv("AUTH_MAX_TOKEN_SECONDS", "14400"))
-AUTH_CLOCK_SKEW_SECONDS: int = int(os.getenv("AUTH_CLOCK_SKEW_SECONDS", "30"))
-
-
 # ── Privacy / observability ────────────────────────────────────────────────
 # Optional secret used only to correlate pseudonymous subjects across events.
 OBSERVABILITY_HASH_KEY: str | None = os.getenv("OBSERVABILITY_HASH_KEY")

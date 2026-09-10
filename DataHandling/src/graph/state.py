@@ -46,6 +46,7 @@ class InterviewState(TypedDict):
     reports_intent: Optional[dict]
     is_correction_turn: bool
     correction_data: Optional[dict]
+    correction_applied: bool
 
     # ── Orchestrator question override ─────────────────────────
     orchestrator_question_id: Optional[str]
@@ -96,6 +97,7 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         reports_intent=None,
         is_correction_turn=False,
         correction_data=None,
+        correction_applied=False,
         orchestrator_question_id=None,
         orchestrator_question_text=None,
         pending_question=None,

@@ -7,10 +7,10 @@ active runtime.
 
 Start here:
 
-- [Codebase optimization audit and full project KT](CODEBASE_OPTIMIZATION_AUDIT.md)
 - [Current REST and WebSocket API](PUBLIC_API.md)
 - [Local development](LOCAL_DEV.md)
 - [Deployment artifact status](DEPLOYMENT.md)
+- [Isolated development deployment on a shared server](DEV_ISOLATED_DEPLOYMENT.md)
 
 The active application is a React patient interface backed by FastAPI,
 LangGraph, Gemini, MongoDB, optional Google Speech fallback, and an optional

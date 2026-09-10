@@ -24,7 +24,17 @@ def make_apply_correction_node(llm_complete):
         correction_data = state["correction_data"]
 
         if correction_data is None:
-            return {"response_text": "I couldn't identify what to change. Could you be more specific?"}
+            response_text = (
+                "I couldn't identify the exact change. Please tell me which information "
+                "is incorrect and what the correct information should be."
+            )
+            return {
+                "correction_applied": False,
+                "response_text": response_text,
+                "history": list(state["history"]) + [
+                    {"role": "agent", "message": response_text}
+                ],
+            }
 
         form = state["form"]
         history = list(state["history"])
@@ -35,6 +45,7 @@ def make_apply_correction_node(llm_complete):
 
         return {
             "form": updated_form,
+            "correction_applied": success,
             "response_text": message,
             "history": updated_history,
         }

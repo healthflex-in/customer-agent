@@ -44,6 +44,8 @@ def after_advance_section(state: InterviewState) -> str:
 
 
 def after_apply_correction(state: InterviewState) -> str:
+    if not state.get("correction_applied"):
+        return END
     if state.get("phase") == "summary":
         return "generate_summary"
     return "generate_question"
@@ -57,7 +59,9 @@ def after_handle_summary_response(state: InterviewState) -> str:
         # Patient revealed new health info — reopen interview, ask follow-ups
         return "generate_question"
     if intent == "request_change":
-        return "apply_correction"
+        if (state.get("summary_intent") or {}).get("correction_text"):
+            return "detect_correction"
+        return END
     if intent in ("has_reports", "no_reports"):
         return END
     return "generate_question"

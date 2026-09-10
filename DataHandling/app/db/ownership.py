@@ -1,6 +1,6 @@
-"""Ownership guards for database mutations.
+"""Exact-record ownership guards for database mutations.
 
-Keep authorization-sensitive query construction in a small, testable module so
+Keep ownership-sensitive query construction in a small, testable module so
 callers cannot accidentally fall back to broad identifiers such as ``formId``.
 """
 

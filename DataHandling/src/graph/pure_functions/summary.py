@@ -3,6 +3,7 @@ LLM-powered summary generation and intent classification.
 Extracted from HealthAgent — no self.* references.
 """
 import json
+import re
 import time as _time
 from typing import Callable, Optional
 
@@ -36,6 +37,7 @@ Write the summary as if you are explaining it to the patient in simple, everyday
 6. Use "- " for bullet points.
 7. End with exactly: "Is this information correct, or would you like to make any changes?"
 8. NEVER say "The form is complete" or any variation.
+9. Do not add, assume, or infer any detail that is not explicitly present in FORM DATA.
 
 CRITICAL — handle empty/negative field values honestly:
 - Fields with values like "None", "No specific goals", "Not mentioned", "Not applicable", "No past surgeries", "No goals mentioned", "nothing" → summarize as ABSENCE, not presence.
@@ -83,25 +85,54 @@ def classify_summary_response(
     Extracted from HealthAgent.classify_summary_response().
     Returns dict with keys: intent, correction_text, has_reports, wants_upload.
     """
+    normalized = re.sub(r"[^a-z0-9\s]", " ", user_input.lower())
+    normalized = " ".join(normalized.split())
+    vague_change_responses = {
+        "no", "nope", "incorrect", "wrong", "not correct", "not right",
+        "this is incorrect", "this is wrong", "this is not correct",
+        "that is incorrect", "that is wrong", "that is not correct",
+        "it is incorrect", "it is wrong", "it is not correct",
+        "i want to make changes", "i want some changes", "i want a change",
+        "want to make changes", "want some changes", "make changes",
+        "i would like to make changes", "i would like to make some changes",
+        "i would like to make any changes", "i need to change something",
+        "change something",
+    }
+    if normalized in vague_change_responses:
+        return {
+            "intent": "request_change",
+            "correction_text": None,
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
     prompt = f"""You are assisting with a medical intake interview. The patient has just been shown
 a summary and asked: "Is this information correct, or would you like to make any changes?"
+
+SUMMARY SHOWN TO THE PATIENT:
+{summary_text}
 
 The patient responded: "{user_input}"
 
 Classify their intent. Choose EXACTLY ONE intent from below:
 
 - "confirm": patient says YES — the summary is correct (e.g. "yes", "correct", "looks good", "that's right", "ok", "sure", "yep")
-- "new_complaint": patient reveals a NEW specific health issue, pain, or symptom that was NOT in the summary
+- "new_complaint": patient reveals an ADDITIONAL specific health issue, pain, or symptom that was NOT in the summary
   Use when: patient says "i have neck pain", "actually my knee hurts", "i forgot to mention my back", "i have a complaint", "wait i have pain" etc.
   This means they want to ADD new medical information, not correct existing data.
 - "request_change": patient wants to CORRECT or UPDATE something already stated in the summary
   CRITICAL: "no" in response to "Is this correct?" → request_change (no, it is NOT correct)
   Also: "not right", "wrong", "incorrect", "change X to Y", "actually it was X"
+  Set correction_text to null when the patient only says that something is wrong or asks to make
+  changes without identifying the information and its corrected value. Otherwise set it to the
+  patient's exact correction request.
 - "has_reports": patient mentions having diagnostic reports (MRI, X-ray, scans)
 - "no_reports": patient confirms they do NOT have reports
 - "question": patient is asking a question about the process
 
-Priority: if the patient mentions a body part or symptom (pain, neck, back, knee, shoulder, etc.) → "new_complaint" over "request_change".
+Priority: explicit replacement/correction language such as "not X, it is Y", "change X to Y",
+or "the left knee, not the right" → "request_change", even when it mentions a body part.
+Use "new_complaint" only when the information is additional rather than a replacement.
 
 Respond ONLY with compact JSON:
 {{

@@ -42,12 +42,11 @@ environment.
 - explicit S3 credentials, bucket, and regions plus Bedrock model/profile if
   report processing is enabled;
 - frontend HTTP/WSS/consent endpoints for the exact environment;
-- access-token signing secret (at least 32 bytes), issuer, audience, and a
-  trusted clinician-link issuance workflow;
 - observability hashing key, metrics scraper, pricing catalog, dashboards, and
   alerts;
 - proxy TLS, body-size, timeout, and WebSocket upgrade configuration;
-- staging validation of the implemented authentication/authorization contract;
+- staging validation of the external consent/OTP integration and upstream access
+  boundary;
 - an approved clinical escalation policy plus ownership, notification,
   acknowledgement/escalation SLA, and monitoring for the
   `MONGO_CLINICAL_ESCALATIONS_COLLECTION` work queue. The local deterministic

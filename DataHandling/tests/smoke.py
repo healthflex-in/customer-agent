@@ -46,17 +46,6 @@ def check_health() -> None:
     ok(f"200 OK — body: {r.text[:120]}")
 
 
-def check_users_endpoint() -> None:
-    step("GET /api/users — unauthenticated access boundary")
-    r = requests.get(f"{BASE_URL}/api/users", timeout=TIMEOUT)
-    # The endpoint contains patient data and must fail closed before attempting
-    # a database operation. Authenticated integration tests use a deliberately
-    # provisioned non-production identity and dataset instead of this smoke test.
-    if r.status_code != 401:
-        fail(f"expected 401, got {r.status_code}: {r.text[:200]}")
-    ok("401 Unauthorized — protected patient route fails closed")
-
-
 async def ws_protocol_check() -> None:
     """
     Verify the WS endpoint accepts a connection and validates input.
@@ -102,7 +91,6 @@ def main() -> None:
     if not parsed.netloc:
         fail("BASE_URL invalid")
     check_health()
-    check_users_endpoint()
     asyncio.run(ws_protocol_check())
     print("\nALL CHECKS PASSED")
 

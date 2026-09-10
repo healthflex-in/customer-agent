@@ -6,7 +6,6 @@ from fastapi import (
     UploadFile,
     File,
     Form,
-    Header,
 )
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -45,11 +44,6 @@ from app.config import (
     MONGO_REPORT_JOBS_COLLECTION,
     MONGO_CLINICAL_ESCALATIONS_COLLECTION,
     MONGO_TLS_CA_FILE,
-    AUTH_SIGNING_SECRET,
-    AUTH_ISSUER,
-    AUTH_AUDIENCE,
-    AUTH_MAX_TOKEN_SECONDS,
-    AUTH_CLOCK_SKEW_SECONDS,
     CORS_ALLOWED_ORIGINS,
     AUDIO_RATE as RATE,
     AUDIO_SAMPLE_WIDTH as SAMPLE_WIDTH,
@@ -116,16 +110,6 @@ from app.clinical.escalation import (
 )
 from app.ws.idempotency import RecentRequestWindow, RequestDecision
 from app.observability.privacy import env_flag, error_type, pseudonymous_id
-from app.security.access_tokens import (
-    AuthConfigurationError,
-    AuthContext,
-    AuthorizationError,
-    TokenValidationError,
-    authorize_directory,
-    authorize_patient,
-    decode_access_token,
-    extract_bearer_token,
-)
 # Pure stateless helpers. Aliased to legacy names used throughout this file.
 from app.db.serializers import (
     normalize_user_id,
@@ -198,51 +182,6 @@ class _RateLimiter:
 
 _rate_limiter = _RateLimiter(max_per_minute=30)
 _request_window = RecentRequestWindow(capacity=4096)
-
-
-def _decode_configured_access_token(token: str) -> AuthContext:
-    return decode_access_token(
-        token,
-        secret=AUTH_SIGNING_SECRET,
-        issuer=AUTH_ISSUER,
-        audience=AUTH_AUDIENCE,
-        max_lifetime_seconds=AUTH_MAX_TOKEN_SECONDS,
-        clock_skew_seconds=AUTH_CLOCK_SKEW_SECONDS,
-    )
-
-
-def _http_auth_context(authorization: Optional[str]) -> AuthContext:
-    try:
-        return _decode_configured_access_token(extract_bearer_token(authorization))
-    except AuthConfigurationError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Authentication is not configured.",
-        ) from exc
-    except TokenValidationError as exc:
-        raise HTTPException(
-            status_code=401,
-            detail="A valid bearer token is required.",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
-
-
-def _authorize_patient_http(
-    context: AuthContext,
-    patient_id: str,
-    scope: str,
-) -> None:
-    try:
-        authorize_patient(context, patient_id, scope)
-    except AuthorizationError as exc:
-        raise HTTPException(status_code=403, detail="Access denied.") from exc
-
-
-def _authorize_directory_http(context: AuthContext) -> None:
-    try:
-        authorize_directory(context)
-    except AuthorizationError as exc:
-        raise HTTPException(status_code=403, detail="Access denied.") from exc
 
 # ── Active connections tracker for graceful shutdown ─────────────────────────
 _active_ws_connections: set = set()
@@ -1955,13 +1894,6 @@ async def health_check():
             "mongodb": "ok" if customer_info_collection is not None else "degraded",
             "graph": "ok" if _interview_graph is not None else "degraded",
             "stt": "gemini-primary-google-cloud-speech-fallback",
-            "authentication": (
-                "ok"
-                if len(AUTH_SIGNING_SECRET.encode("utf-8")) >= 32
-                and AUTH_ISSUER
-                and AUTH_AUDIENCE
-                else "degraded"
-            ),
         },
         "ai_telemetry": {
             "metrics_endpoint": "/metrics" if _HAS_PROMETHEUS else None,
@@ -2021,7 +1953,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         "attempt_id": None,
         "prom_snapshot": None,
         "prom_source_doc_id": None,
-        "auth_context": None,
         "first_interaction": True,
         "is_recording": False,
         "received_audio_buffer": bytearray(),
@@ -2079,18 +2010,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     data = json.loads(message["text"])
                     msg_type = data.get("type", "")
 
-                    if msg_type != "start_interview" and client_state.get("auth_context") is None:
-                        await websocket.send_text(
-                            json.dumps(
-                                {
-                                    "type": "error",
-                                    "message": "Authentication is required before using this session.",
-                                }
-                            )
-                        )
-                        await websocket.close(code=1008, reason="Authentication required")
-                        break
-
                     if msg_type == "start_interview":
                         # Client is ready to start the interview (after login or page reload)
                         from src.prompts import WELCOME_PROMPT, READY_TO_START_PROMPT
@@ -2109,40 +2028,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 )
                             )
                             continue
-
-                        try:
-                            auth_context = _decode_configured_access_token(
-                                data.get("accessToken", "")
-                            )
-                            authorize_patient(
-                                auth_context,
-                                provided_user_id,
-                                "interview:write",
-                            )
-                        except AuthConfigurationError:
-                            await websocket.send_text(
-                                json.dumps(
-                                    {
-                                        "type": "error",
-                                        "message": "Authentication is not configured.",
-                                    }
-                                )
-                            )
-                            await websocket.close(code=1011, reason="Authentication unavailable")
-                            break
-                        except (TokenValidationError, AuthorizationError):
-                            await websocket.send_text(
-                                json.dumps(
-                                    {
-                                        "type": "error",
-                                        "message": "The consultation link is invalid or has expired.",
-                                    }
-                                )
-                            )
-                            await websocket.close(code=1008, reason="Access denied")
-                            break
-
-                        client_state["auth_context"] = auth_context
 
                         # Validate that the user exists in the database
                         if not await run_blocking(validate_user_exists, provided_user_id):
@@ -2830,21 +2715,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             continue
 
-                        try:
-                            authorize_patient(
-                                client_state["auth_context"],
-                                target_user_id,
-                                "interview:write",
-                            )
-                        except AuthorizationError:
-                            await websocket.send_text(
-                                json.dumps({"type": "error", "message": "Access denied."})
-                            )
-                            continue
-
                         if client_state.get("user_id") is None:
                             client_state["user_id"] = target_user_id
-                            print("[start_new_form] Associated authorized subject with session")
+                            print("[start_new_form] Associated user with session")
 
                         # Clear the old form_id from client_state to ensure a fresh start
                         client_state["form_id"] = None
@@ -3218,17 +3091,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     elif msg_type == "end_session":
                         provided_user_id = data.get("userId")
                         if provided_user_id:
-                            try:
-                                authorize_patient(
-                                    client_state["auth_context"],
-                                    provided_user_id,
-                                    "interview:write",
-                                )
-                            except AuthorizationError:
-                                await websocket.send_text(
-                                    json.dumps({"type": "error", "message": "Access denied."})
-                                )
-                                continue
                             client_state["user_id"] = provided_user_id
 
                         try:
@@ -4369,12 +4231,9 @@ def _fetch_users_sync(collection: Collection, mongo_query: dict, limit: int) -> 
 async def get_users(
     search: str = Query(default="", description="Optional search term"),
     limit: int = Query(default=50, ge=1, le=500),
-    authorization: Optional[str] = Header(None),
 ):
     """Return up-to-date list of users for the selector."""
     try:
-        context = _http_auth_context(authorization)
-        _authorize_directory_http(context)
         collection = await run_blocking(ensure_users_collection)
 
         mongo_query = {}
@@ -4408,7 +4267,6 @@ async def get_users(
 @app.get("/api/users/{user_id}/consent")
 async def get_consent_status(
     user_id: str,
-    authorization: Optional[str] = Header(None),
 ):
     """
     Check whether a user has accepted the consent policy.
@@ -4417,8 +4275,6 @@ async def get_consent_status(
     2. consentrecords collection (written by consent.stance.health via recordConsent GraphQL mutation)
     """
     try:
-        context = _http_auth_context(authorization)
-        _authorize_patient_http(context, user_id, "consent:read")
         from app.config import MONGO_DB_NAME
         users_col = await run_blocking(ensure_users_collection)
         user_oid = ObjectId(user_id)
@@ -4469,12 +4325,9 @@ async def get_consent_status(
 @app.post("/api/users/{user_id}/consent")
 async def accept_consent(
     user_id: str,
-    authorization: Optional[str] = Header(None),
 ):
     """Record that a user has accepted the consent policy."""
     try:
-        context = _http_auth_context(authorization)
-        _authorize_patient_http(context, user_id, "consent:write")
         from datetime import datetime, timezone
         collection = await run_blocking(ensure_users_collection)
         user_oid = ObjectId(user_id)
@@ -4499,12 +4352,9 @@ async def accept_consent(
 @app.get("/api/users/{user_id}/forms")
 async def get_user_forms_endpoint(
     user_id: str,
-    authorization: Optional[str] = Header(None),
 ):
     """Return all forms for a specific user."""
     try:
-        context = _http_auth_context(authorization)
-        _authorize_patient_http(context, user_id, "forms:read")
         forms = await run_blocking(fetch_user_forms, user_id)
         return {"forms": forms}
     except HTTPException:
@@ -4520,12 +4370,9 @@ async def get_form_endpoint(
     form_id: str,
     userId: str = Query(..., description="User ID (required)"),
     attemptId: Optional[str] = Query(None, description="Form attempt ID"),
-    authorization: Optional[str] = Header(None),
 ):
     """Return a specific form by form_id and userId."""
     try:
-        context = _http_auth_context(authorization)
-        _authorize_patient_http(context, userId, "forms:read")
         form = await run_blocking(fetch_form_by_id, form_id, userId, attemptId)
         if form is None:
             raise HTTPException(status_code=404, detail="Form not found")
@@ -4543,15 +4390,12 @@ async def get_form_progress_endpoint(
     form_id: str,
     userId: str = Query(..., description="User ID (required)"),
     attemptId: Optional[str] = Query(None, description="Form attempt ID"),
-    authorization: Optional[str] = Header(None),
 ):
     """
     Return section completion status for a form.
     Sections are ordered with completed sections first, incomplete sections at the bottom.
     """
     try:
-        context = _http_auth_context(authorization)
-        _authorize_patient_http(context, userId, "forms:read")
         form = await run_blocking(fetch_form_by_id, form_id, userId, attemptId)
         if form is None:
             raise HTTPException(status_code=404, detail="Form not found")
@@ -4574,12 +4418,8 @@ async def upload_form_attachment(
     files: List[UploadFile] = File(...),
     userId: str = Form(...),
     attemptId: Optional[str] = Form(None),
-    authorization: Optional[str] = Header(None),
 ):
     """Upload multiple scans/reports to S3, generate combined summary, and auto-fill Reports section."""
-    context = _http_auth_context(authorization)
-    _authorize_patient_http(context, userId, "forms:write")
-
     if not is_s3_configured():
         raise HTTPException(
             status_code=500,

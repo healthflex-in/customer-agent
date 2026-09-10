@@ -135,6 +135,7 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
         "apply_correction",
         after_apply_correction,
         {
+            END: END,
             "generate_summary": "generate_summary",
             "generate_question": "generate_question",
         },
@@ -145,7 +146,7 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
         after_handle_summary_response,
         {
             END: END,
-            "apply_correction": "apply_correction",
+            "detect_correction": "detect_correction",
             "generate_summary": "generate_summary",
             "generate_question": "generate_question",
         },

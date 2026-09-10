@@ -9,7 +9,7 @@ from typing import Callable, Optional
 
 from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
-from src.prompts import TEMPLATE_PROMPT, CORRECTION_DETECTION_PROMPT, CORRECTION_APPLY_PROMPT
+from src.prompts import TEMPLATE_PROMPT, CORRECTION_DETECTION_PROMPT
 
 
 def _llm_check_no_prior_consultations(user_input: str, llm_complete: Callable[[str], str] = None) -> bool:
@@ -343,7 +343,6 @@ def apply_form_correction(
     updated_form = copy.deepcopy(form)
     field_name = correction_data.get("field_name", "")
     section_name = correction_data.get("section_name", "")
-    old_value = correction_data.get("old_value", "")
     new_value = correction_data.get("new_value", "")
 
     if correction_data.get("needs_clarification", False):
@@ -353,29 +352,20 @@ def apply_form_correction(
     if not field_name or not section_name:
         return updated_form, False, "I'm not sure which field to update. Could you specify what you'd like to change?"
 
-    if section_name not in updated_form or field_name not in updated_form[section_name]:
+    if (
+        section_name not in updated_form
+        or not isinstance(updated_form[section_name], dict)
+        or field_name not in updated_form[section_name]
+    ):
         return updated_form, False, f"I couldn't find '{field_name}' in '{section_name}'. Could you clarify?"
 
-    try:
-        prompt = CORRECTION_APPLY_PROMPT.format(
-            field_name, section_name, old_value, new_value,
-            json.dumps(updated_form, indent=2),
-            section_name, field_name, new_value,
-        )
-        raw = llm_complete(prompt)
-        json_str = extract_json_from_response(raw)
-        if json_str:
-            new_form = json.loads(json_str)
-            if section_name in new_form and field_name in new_form[section_name]:
-                if new_form[section_name][field_name] != new_value:
-                    new_form[section_name][field_name] = new_value
-                updated_form = new_form
-            else:
-                updated_form[section_name][field_name] = new_value
-        else:
-            updated_form[section_name][field_name] = new_value
-    except Exception:
-        updated_form[section_name][field_name] = new_value
+    if new_value is None or (isinstance(new_value, str) and not new_value.strip()):
+        return updated_form, False, "What should the correct information be?"
 
+    # The detection step has already selected one validated form field. Apply
+    # only that value locally; accepting an LLM-generated copy of the complete
+    # form could alter unrelated clinical information.
+    old_value = updated_form[section_name][field_name]
+    updated_form[section_name][field_name] = new_value
     msg = f"I've updated '{field_name}' from '{old_value or '(empty)'}' to '{new_value}'."
     return updated_form, True, msg

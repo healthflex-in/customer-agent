@@ -98,8 +98,19 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             # response_text stays empty — edges will route to generate_summary to re-show
 
         elif intent == "request_change":
-            # response_text stays empty — edges will route to apply_correction
-            pass
+            # A general rejection ("this is wrong", "I want changes") does not
+            # contain enough information to update a clinical record safely.
+            # Stop this turn and ask for the exact correction. A specific reply
+            # on the next turn will be detected and applied.
+            if not summary_intent.get("correction_text"):
+                response_text = (
+                    "Of course. Which information would you like to change, "
+                    "and what should the correct information be?"
+                )
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [
+                    {"role": "agent", "message": response_text}
+                ]
 
         elif intent == "question":
             response_text = (

@@ -4,23 +4,19 @@ Verified against `server.py` and the frontend `useWebSocket` consumer on
 3 September 2026. This describes the current implementation, including known
 limitations; it is not a promise that unsafe behavior must be preserved.
 
-## Security boundary
+## Access boundary
 
-Every patient-data HTTP route requires an `Authorization: Bearer <token>`
-header. The first WebSocket `start_interview` message requires the same signed
-token in `accessToken`; unauthenticated control/audio messages are rejected and
-the socket is closed with policy code `1008`. `/health`, framework API docs,
-and metadata-only metrics remain public.
+The customer-agent does not currently require a separate Bearer/JWT access
+token. It relies on the existing consent application to perform OTP verification
+and store an active consent record. The frontend checks consent before enabling
+the interview. The backend REST and WebSocket interfaces accept the application
+`userId` without an additional customer-agent token.
 
-Tokens are short-lived HS256 JWTs with strict `iss`, `aud`, `sub`, `role`,
-`scope`, `iat`, and `exp` validation. Patient tokens can access only the patient
-whose ID equals `sub`. Clinician tokens require an explicit `patients` allow-
-list, while admin tokens can address any patient but still require the operation
-scope. The user directory additionally requires clinician/admin role plus
-`users:read`. The server rejects missing/short signing secrets, unsupported
-algorithms/roles, invalid signatures, future/expired/excessively long tokens,
-and wrong issuer/audience values. There is deliberately no public token-
-issuance endpoint.
+This restores the pre-token integration contract requested by the product owner.
+It also means that a patient ID in a URL is not independently authenticated by
+this service. Deployment must keep the service behind the approved upstream
+access boundary and must not describe consent alone as record-level
+authentication.
 
 The API has no question/category administration routes. It cannot add, edit,
 publish, categorise, or delete clinical questions.
@@ -33,13 +29,13 @@ When Prometheus dependencies are installed, metrics are mounted at `/metrics`.
 | Method | Path | Input | Successful response |
 |---|---|---|---|
 | `GET` | `/health` | None | Service/component state and AI telemetry pricing version. This is liveness/configuration state, not an external-provider probe. |
-| `GET` | `/api/users` | Bearer token with clinician/admin `users:read`; query `search`, `limit` | `{ "users": [...] }`, sorted by `updatedAt` descending. |
-| `GET` | `/api/users/{user_id}/consent` | Patient-bound Bearer token with `consent:read` | Consent state from `users.profileData` or active `consentrecords`. |
-| `POST` | `/api/users/{user_id}/consent` | Patient-bound Bearer token with `consent:write` | Marks consent accepted with policy version `1.1.0`. |
-| `GET` | `/api/users/{user_id}/forms` | Patient-bound Bearer token with `forms:read` | `{ "forms": [...] }`. |
-| `GET` | `/api/forms/{form_id}` | Patient-bound `forms:read`; required `userId`, optional `attemptId` | `{ "form": {...} }` for the exact/latest attempt. |
-| `GET` | `/api/forms/{form_id}/progress` | Patient-bound `forms:read`; required `userId`, optional `attemptId` | Completion state for the selected/latest attempt. |
-| `POST` | `/api/forms/{form_id}/attachments` | Patient-bound `forms:write`; multipart `files`, `userId`, optional `attemptId` | Attachment/job/form/progress state. |
+| `GET` | `/api/users` | Optional query `search`, `limit` | `{ "users": [...] }`, sorted by `updatedAt` descending. |
+| `GET` | `/api/users/{user_id}/consent` | Path `user_id` | Consent state from `users.profileData` or active `consentrecords`. |
+| `POST` | `/api/users/{user_id}/consent` | Path `user_id` | Marks consent accepted with policy version `1.1.0`. |
+| `GET` | `/api/users/{user_id}/forms` | Path `user_id` | `{ "forms": [...] }`. |
+| `GET` | `/api/forms/{form_id}` | Required `userId`, optional `attemptId` | `{ "form": {...} }` for the exact/latest attempt. |
+| `GET` | `/api/forms/{form_id}/progress` | Required `userId`, optional `attemptId` | Completion state for the selected/latest attempt. |
+| `POST` | `/api/forms/{form_id}/attachments` | Multipart `files`, `userId`, optional `attemptId` | Attachment/job/form/progress state. |
 
 ### Attachment processing
 
@@ -70,9 +66,8 @@ Connect to:
 /ws/{client_id}
 ```
 
-`client_id` is used only for connection correlation and is not identity. After
-connecting, send authenticated `start_interview`; the verified claims, not the
-path or supplied patient ID alone, authorize the session.
+`client_id` is used only for connection correlation. After connecting, the
+frontend sends `start_interview` with the selected application `userId`.
 
 ### Client-to-server messages
 
@@ -80,14 +75,14 @@ Control messages are UTF-8 JSON. Recorded audio chunks are binary frames.
 
 | Type | Fields | Behavior |
 |---|---|---|
-| `start_interview` | `accessToken` and `userId` required; `formId`/`attemptId` optional | Verifies signature, claims, scope, and patient binding before any database lookup, then starts/resumes the intake. |
+| `start_interview` | `userId` required; `formId`/`attemptId` optional | Validates that the user exists, then starts or resumes the intake. |
 | `start_new_form` | `userId` required if not already associated | Clears all regular/PROM/graph session state and allocates a new opaque attempt ID without creating an empty database document. |
 | `load_form` | `formId` required; `attemptId` optional | Loads the exact attempt for the session user, or the latest matching attempt for an older client. |
 | `text_input` | `text`; optional `requestId`, `questionId`, `inputMode` | Processes one typed/transcribed answer. `inputMode: "structured_prom"` is accepted only when its validated metadata matches the active PROM question(s). |
 | `audio_start` | Timestamp is accepted but not trusted | Opens a server-timed, size-limited recording window. |
 | binary frame | Raw browser audio bytes | Appended only while recording; cumulative bytes and elapsed time are bounded. |
 | `audio_end` | Optional declared `duration` | Transcribes accumulated audio. The server sends the transcript but does not submit it as an interview answer automatically. |
-| `end_session` | Optional `userId` | Re-authorizes any supplied patient ID, saves current state, and sends confirmation. |
+| `end_session` | Optional `userId` | Uses any supplied patient ID, saves current state, and sends confirmation. |
 
 `text_input.requestId` must contain 1–128 characters from
 `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, or `-`. Reusing the same request ID and
