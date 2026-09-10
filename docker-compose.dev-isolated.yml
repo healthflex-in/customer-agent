@@ -9,9 +9,10 @@ services:
     container_name: customer-agent-dev-isolated
     ports:
       # Existing server ports: prod=8000, admin=8001, recommender=8002,
-      # existing dev=8003. Bind this stack only to loopback on 8004 and expose
-      # it through a dedicated reverse-proxy hostname.
-      - "127.0.0.1:8004:8000"
+      # existing dev=8003. The bind address is temporarily public for direct
+      # IP-based UAT. Restrict inbound TCP/8004 to trusted tester IPs in the
+      # server firewall/security group, then restore 127.0.0.1 before release.
+      - "0.0.0.0:8004:8000"
     env_file:
       - ./DataHandling/.env.dev-isolated
     environment:
