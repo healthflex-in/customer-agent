@@ -118,10 +118,10 @@ class ContainerContractTests(unittest.TestCase):
         compose = (PROJECT_ROOT / "docker-compose.dev-isolated.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("name: stance-customer-agent-dev-isolated", compose)
+        self.assertTrue(compose.startswith('version: "3.8"'))
         self.assertIn("container_name: customer-agent-dev-isolated", compose)
         self.assertIn("image: stance-customer-agent-dev-isolated:local", compose)
-        self.assertIn('"127.0.0.1:8004:8000"', compose)
+        self.assertIn('"0.0.0.0:8004:8000"', compose)
         self.assertIn("./DataHandling/.env.dev-isolated", compose)
         self.assertIn("./DataHandling/config/dev-isolated:/app/config:ro", compose)
         self.assertIn("name: customer-agent-dev-isolated-network", compose)

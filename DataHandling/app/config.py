@@ -36,7 +36,7 @@ OBSERVABILITY_HASH_KEY: str | None = os.getenv("OBSERVABILITY_HASH_KEY")
 
 
 # ── HTTP / CORS ────────────────────────────────────────────────────────────
-CORS_ALLOWED_ORIGINS: list[str] = [
+_DEFAULT_CORS_ALLOWED_ORIGINS = [
     "https://customerai.stance.health",
     "https://customer-agent-mu.vercel.app",
     "http://localhost:3000",
@@ -44,6 +44,14 @@ CORS_ALLOWED_ORIGINS: list[str] = [
     "http://localhost:8000",
     "http://localhost:8081",
 ]
+_extra_cors_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_EXTRA_ORIGINS", "").split(",")
+    if origin.strip()
+]
+CORS_ALLOWED_ORIGINS: list[str] = list(
+    dict.fromkeys([*_DEFAULT_CORS_ALLOWED_ORIGINS, *_extra_cors_origins])
+)
 
 
 # ── Audio streaming ────────────────────────────────────────────────────────
