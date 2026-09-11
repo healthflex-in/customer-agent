@@ -4098,14 +4098,6 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
 
             # Handle binary messages (audio data)
             elif "bytes" in message:
-                if client_state.get("auth_context") is None:
-                    await websocket.send_text(
-                        json.dumps(
-                            {"type": "error", "message": "Authentication is required."}
-                        )
-                    )
-                    await websocket.close(code=1008, reason="Authentication required")
-                    break
                 if client_state["is_recording"]:
                     # Accumulate audio chunks
                     audio_chunk = message["bytes"]
