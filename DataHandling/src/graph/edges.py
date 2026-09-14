@@ -13,8 +13,6 @@ def route_by_phase(state: InterviewState) -> str:
 
 def after_extract(state: InterviewState) -> str:
     """Route signals computed by the combined extraction/intent node."""
-    if state.get("is_correction_turn"):
-        return "detect_correction"
     # In PROM/tagged-question sessions, skip reports upload flow entirely —
     # "yes" answers are about clinical scores, not document uploads
     if state.get("tagged_turns"):

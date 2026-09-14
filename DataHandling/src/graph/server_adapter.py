@@ -138,7 +138,6 @@ def build_graph_state(
         missing_fields=[],
         summary_intent=None,
         reports_intent=None,
-        is_correction_turn=False,
         correction_data=None,
         correction_applied=False,
         # Orchestrator

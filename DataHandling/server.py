@@ -67,6 +67,10 @@ from app.db.connection import create_verified_mongo_client
 from app.ai.models import MODEL_REGISTRY
 from app.observability.ai_usage import PRICING_VERSION, gemini_usage, tracked_ai_call
 from app.audio.limits import audio_limit_error
+from app.content_safety import (
+    contains_internal_transcription_prompt,
+    scrub_internal_transcription_prompts,
+)
 from app.runtime.blocking import run_blocking
 from app.uploads.policy import validate_upload_quotas
 from app.uploads.reading import read_upload_bounded
@@ -1217,7 +1221,15 @@ def save_customer_info(
         
         # CRITICAL: Deep copy form_data to prevent shared references
         # This ensures each form has its own independent copy of the data
-        form_data_copy = copy.deepcopy(form_data)
+        form_data_copy, removed_prompt_values = scrub_internal_transcription_prompts(
+            copy.deepcopy(form_data)
+        )
+        if removed_prompt_values:
+            _log.warning(
+                "internal_prompt_content_removed_before_persistence",
+                removed_values=removed_prompt_values,
+                subject=pseudonymous_id(user_id),
+            )
         
         # Deterministic title generation avoids an external model request on
         # every save while preserving the existing empty-form lifecycle marker.
@@ -1346,6 +1358,13 @@ def fetch_user_forms(user_id: str) -> list:
         
         formatted_forms = []
         for form in forms:
+            form, removed_prompt_values = scrub_internal_transcription_prompts(form)
+            if removed_prompt_values:
+                _log.warning(
+                    "internal_prompt_content_removed_during_form_list_read",
+                    removed_values=removed_prompt_values,
+                    subject=pseudonymous_id(user_id),
+                )
             formatted_forms.append({
                 "formId": form.get("formId", ""),
                 "attemptId": form.get("attemptId"),
@@ -1385,6 +1404,13 @@ def fetch_latest_form_for_user(user_id: str) -> dict:
             sort=[("updatedAt", -1), ("createdAt", -1)],
         )
         if form:
+            form, removed_prompt_values = scrub_internal_transcription_prompts(form)
+            if removed_prompt_values:
+                _log.warning(
+                    "internal_prompt_content_removed_during_latest_form_read",
+                    removed_values=removed_prompt_values,
+                    subject=pseudonymous_id(user_id),
+                )
             form["timestamp"] = _serialize_datetime(form.get("timestamp"))
             form["createdAt"] = _serialize_datetime(form.get("createdAt"))
             form["updatedAt"] = _serialize_datetime(form.get("updatedAt"))
@@ -1448,6 +1474,13 @@ def fetch_form_by_id(
             sort=[("updatedAt", -1), ("createdAt", -1)],
         )
         if form:
+            form, removed_prompt_values = scrub_internal_transcription_prompts(form)
+            if removed_prompt_values:
+                _log.warning(
+                    "internal_prompt_content_removed_during_form_read",
+                    removed_values=removed_prompt_values,
+                    subject=pseudonymous_id(user_id),
+                )
             form["_id"] = str(form.get("_id", ""))
             form["timestamp"] = _serialize_datetime(form.get("timestamp"))
             form["createdAt"] = _serialize_datetime(form.get("createdAt"))
@@ -3134,6 +3167,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         text_input = data.get("text", "").strip()
                         if not text_input:
                             continue
+                        if contains_internal_transcription_prompt(text_input):
+                            _log.warning(
+                                "internal_prompt_content_rejected_from_text_input",
+                                subject=pseudonymous_id(client_state.get("user_id")),
+                            )
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "text": "The transcription could not be processed safely. Please record it again or type your response.",
+                            }))
+                            continue
 
                         try:
                             _request_decision = _request_window.register(
@@ -4027,7 +4070,8 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                         # 'transcription' WS message; the debug .raw write was removed.
                         timestamp = int(time.time())
 
-                        # Transcribe via Google Cloud Speech-to-Text
+                        # Transcribe through the configured STT service (Gemini with
+                        # an independent Google Cloud Speech fallback).
                         try:
                             from app.audio.stt import transcribe_audio_bytes, is_hallucination, clean_transcript
 
@@ -4037,6 +4081,17 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                             )
                             t_stt_ms = (time.perf_counter() - t_stt_start) * 1000
                             print(f"[audio] STT latency={t_stt_ms:.0f}ms transcript_chars={len(transcription)}")
+
+                            if contains_internal_transcription_prompt(transcription):
+                                _log.warning(
+                                    "internal_prompt_content_rejected_before_transcription_delivery",
+                                    subject=pseudonymous_id(client_state.get("user_id")),
+                                )
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "text": "The transcription could not be processed safely. Please record it again or type your response.",
+                                }))
+                                continue
 
                             if is_hallucination(transcription):
                                 print("[audio] Hallucination detected — discarding transcription")

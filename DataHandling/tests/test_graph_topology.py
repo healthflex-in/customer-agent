@@ -37,13 +37,13 @@ class ExtractRoutingCharacterizationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.edges = _load_edges_without_langgraph()
 
-    def test_correction_has_highest_precedence(self):
+    def test_interview_extraction_never_routes_to_correction_subgraph(self):
         state = {
             "is_correction_turn": True,
             "tagged_turns": ["question"],
             "awaiting_report_upload": True,
         }
-        self.assertEqual(self.edges.after_extract(state), "detect_correction")
+        self.assertNotEqual(self.edges.after_extract(state), "detect_correction")
 
     def test_tagged_prom_bypasses_report_upload_routing(self):
         state = {
@@ -105,6 +105,11 @@ class GraphTopologyContractTests(unittest.TestCase):
         self.assertIn("extract_form_data", conditional_sources)
         self.assertNotIn(("extract_form_data", "classify_intent"), linear_edges)
 
+        extract_source = (
+            BACKEND_ROOT / "src" / "graph" / "nodes" / "extract.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("should_check_for_correction", extract_source)
+
     def test_removed_state_and_thought_label_do_not_return(self):
         files = (
             BACKEND_ROOT / "src" / "graph" / "state.py",
@@ -116,6 +121,7 @@ class GraphTopologyContractTests(unittest.TestCase):
             )
         fresh = get_fresh_interview_state()
         self.assertNotIn("tagged_cleanup_done", fresh)
+        self.assertNotIn("is_correction_turn", fresh)
         server = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
         self.assertNotIn('"classify_intent": {', server)
 

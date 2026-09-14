@@ -107,7 +107,6 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
         "extract_form_data",
         after_extract,
         {
-            "detect_correction": "detect_correction",
             "handle_upload_response": "handle_upload_response",
             "validate_section": "validate_section",
         },

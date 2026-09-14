@@ -44,7 +44,6 @@ class InterviewState(TypedDict):
     missing_fields: list
     summary_intent: Optional[dict]
     reports_intent: Optional[dict]
-    is_correction_turn: bool
     correction_data: Optional[dict]
     correction_applied: bool
 
@@ -95,7 +94,6 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         missing_fields=[],
         summary_intent=None,
         reports_intent=None,
-        is_correction_turn=False,
         correction_data=None,
         correction_applied=False,
         orchestrator_question_id=None,

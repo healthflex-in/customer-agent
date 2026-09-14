@@ -20,6 +20,7 @@ import sys
 import logging
 
 from app.ai.models import MODEL_REGISTRY
+from app.content_safety import contains_internal_transcription_prompt
 from app.observability.ai_usage import AIUsage, gemini_usage, tracked_ai_call
 from app.observability.privacy import error_type
 
@@ -125,10 +126,12 @@ def _transcribe_with_gemini(raw_audio_bytes: bytes) -> str:
         operation="audio_transcription",
         call=lambda: client.models.generate_content(
             model=MODEL_REGISTRY.audio,
-            contents=[
-                _types.Part.from_bytes(data=raw_audio_bytes, mime_type=mime_type),
-                _GEMINI_STT_PROMPT,
-            ],
+            contents=[_types.Part.from_bytes(data=raw_audio_bytes, mime_type=mime_type)],
+            config=_types.GenerateContentConfig(
+                system_instruction=_GEMINI_STT_PROMPT,
+                temperature=0,
+                thinking_config=_types.ThinkingConfig(thinking_budget=0),
+            ),
         ),
         usage_extractor=gemini_usage,
     )
@@ -287,17 +290,23 @@ def transcribe_audio_bytes(raw_audio_bytes: bytes) -> str:
 
     try:
         text = _transcribe_with_gemini(raw_audio_bytes)
-        if text and len(text.strip()) > 1:
+        if contains_internal_transcription_prompt(text):
+            sys.stderr.write("[stt] Gemini response rejected by internal-content guard; using gcloud fallback\n")
+            sys.stderr.flush()
+        elif text and len(text.strip()) > 1:
             sys.stderr.write(f"[timing] stt_total={(_time.perf_counter() - _t0) * 1000:.0f}ms source=gemini\n")
             sys.stderr.flush()
             return text
-        sys.stderr.write("[stt] Gemini returned empty — falling back to Google Cloud STT\n")
-        sys.stderr.flush()
+        else:
+            sys.stderr.write("[stt] Gemini returned empty — falling back to Google Cloud STT\n")
+            sys.stderr.flush()
     except Exception as e:
         sys.stderr.write(f"[stt] Gemini failed ({error_type(e)}) — falling back to gcloud\n")
         sys.stderr.flush()
 
     text = _transcribe_with_gcloud(raw_audio_bytes)
+    if contains_internal_transcription_prompt(text):
+        raise ValueError("Transcription rejected by internal-content guard")
     sys.stderr.write(f"[timing] stt_total={(_time.perf_counter() - _t0) * 1000:.0f}ms source=gcloud\n")
     sys.stderr.flush()
     return text

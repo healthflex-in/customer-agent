@@ -204,7 +204,6 @@ def _classify_visit_context(user_input: str, llm_complete) -> str:
 
 from src.graph.pure_functions.form_extraction import extract_form_data_from_text
 from src.graph.pure_functions.form_validation import validate_section
-from src.graph.pure_functions.intent_detection import should_check_for_correction
 from src.graph.pure_functions.summary import classify_reports_intent
 from src.prompts import FORMAT_PROMPT
 
@@ -220,7 +219,6 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
     Updates:
       - form                (extracted + gap-filled)
       - history             (user turn appended)
-      - is_correction_turn
       - reports_intent
     """
     def extract_form_data_node(state: InterviewState) -> dict:
@@ -260,20 +258,9 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 return {
                     "history": new_history,
                     "response_text": brand_answer,
-                    "is_correction_turn": False,
                     "reports_intent": {},
                     "pending_question": None,
                 }
-
-        # ── Fast heuristic — if it's a correction, skip extraction LLM entirely ──
-        if should_check_for_correction(user_input, awaiting_confirmation=False):
-            new_history = history + [{"role": "user", "message": user_input}]
-            return {
-                "history": new_history,
-                "is_correction_turn": True,
-                "reports_intent": None,
-                "pending_question": None,
-            }
 
         # ── Visit context classification (fallback only) ──────────────────────
         _visit_context_update = {}
@@ -686,7 +673,6 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
         result = {
             "form": updated_form,
             "history": new_history,
-            "is_correction_turn": False,
             "reports_intent": reports_intent,
             "pending_question": pending_q,
         }
