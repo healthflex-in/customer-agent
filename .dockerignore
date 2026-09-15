@@ -29,12 +29,14 @@ docker-compose*.yml
 *.md
 !README.md
 
-# Keys (will be mounted as volumes)
-*.pem
-
-# Local development files
-.env.local
-.env.*.local
+# Secrets and credentials (provided at runtime, never copied into an image)
+**/.env
+**/.env.*
+**/config/
+**/*.pem
+**/*.key
+**/google_key.json
+**/gemini_key.json
 
 # OS
 .DS_Store
@@ -43,12 +45,23 @@ Thumbs.db
 # Logs
 *.log
 
+# Local test/tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
 # Test files
 test_*.py
 *_test.py
 
 # Legacy code
 legacy/
+
+# Deployment tooling is not application runtime code
+DataHandling/deployment/
 
 # Large audio/cache files (will be mounted as volumes)
 audio_files/
@@ -62,5 +75,4 @@ db/
 # Temporary files
 *.tmp
 *.temp
-
-
+*.ses

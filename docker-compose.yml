@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   healthflex-agent:
     build:
@@ -7,26 +5,24 @@ services:
       dockerfile: DataHandling/deployment/Dockerfile
     container_name: healthflex-customer-agent
     ports:
-      - "8000:8000"
+      # Local development entry point. Keep production-connected testing off
+      # external interfaces on the developer machine.
+      - "127.0.0.1:8000:8000"
     env_file:
       - ./DataHandling/.env
     environment:
-      # Google Cloud Credentials paths (not in .env)
+      # Google Cloud Speech fallback credentials path (secret is not in Git)
       - GOOGLE_APPLICATION_CREDENTIALS=config/google_key.json
-      - GEMINI_LLM_SERVICE_CREDENTIALS=config/gemini_key.json
       
       # Database paths
       - CHROMA_DB_PATH=/app/db/vector/chroma_db_collective
+      - LANGFUSE_CAPTURE_CONTENT=${LANGFUSE_CAPTURE_CONTENT:-false}
+      - OBSERVABILITY_HASH_KEY=${OBSERVABILITY_HASH_KEY:-}
     
     volumes:
-      # Mount code directory for instant updates (no rebuild needed for code changes)
-      # This allows update-fast.sh to work without rebuilding the image
-      - ./DataHandling:/app:rw
-      
       # Persist audio files, transcripts, and cache
       - ./DataHandling/audio_files:/app/audio_files
       - ./DataHandling/transcripts:/app/transcripts
-      - ./DataHandling/tts_cache:/app/tts_cache
       - ./DataHandling/output:/app/output
       - ./DataHandling/received_audio:/app/received_audio
       
@@ -54,4 +50,3 @@ services:
 networks:
   healthflex-network:
     driver: bridge
-

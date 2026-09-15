@@ -3,14 +3,28 @@ import io
 import json
 import re
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 from urllib.parse import urlparse
 
 import requests
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_bytes
 from PIL import Image
 
+from app.config import (
+    MAX_ATTACHMENT_TOTAL_MB,
+    MAX_BEDROCK_IMAGE_BYTES,
+    MAX_REPORT_IMAGE_DIMENSION,
+    MAX_REPORT_IMAGE_PIXELS,
+    MAX_REPORT_PAGES_PER_FILE,
+    MAX_REPORT_TOTAL_PAGES,
+)
+from app.uploads.policy import (
+    UploadIdentity,
+    validate_document_complexity,
+    validate_upload_identity,
+)
 from docscanner.client import query_bedrock
 from docscanner.prompts import SUMMARY_PROMPT
 
@@ -18,16 +32,78 @@ from docscanner.prompts import SUMMARY_PROMPT
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
 
+@dataclass(frozen=True)
+class ReportInspection:
+    identity: UploadIdentity
+    page_count: int
+
+
+def inspect_report_upload(
+    file_bytes: bytes,
+    filename: str,
+    declared_content_type: str | None,
+) -> ReportInspection:
+    """Validate real content and decoding complexity before storage."""
+
+    identity = validate_upload_identity(
+        file_bytes,
+        filename,
+        declared_content_type,
+    )
+    if identity.kind == "pdf":
+        info = pdfinfo_from_bytes(file_bytes, timeout=15)
+        try:
+            page_count = int(info.get("Pages", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("PDF page count could not be determined") from exc
+        validate_document_complexity(
+            page_count=page_count,
+            pixel_count=None,
+            longest_side=None,
+            max_pages=MAX_REPORT_PAGES_PER_FILE,
+            max_pixels=MAX_REPORT_IMAGE_PIXELS,
+            max_dimension=MAX_REPORT_IMAGE_DIMENSION,
+        )
+        return ReportInspection(identity=identity, page_count=page_count)
+
+    with Image.open(io.BytesIO(file_bytes)) as image:
+        width, height = image.size
+        validate_document_complexity(
+            page_count=1,
+            pixel_count=width * height,
+            longest_side=max(width, height),
+            max_pages=MAX_REPORT_PAGES_PER_FILE,
+            max_pixels=MAX_REPORT_IMAGE_PIXELS,
+            max_dimension=MAX_REPORT_IMAGE_DIMENSION,
+        )
+        image.verify()
+    return ReportInspection(identity=identity, page_count=1)
+
+
 def _encode_pil_image(image: Image.Image) -> str:
+    width, height = image.size
+    validate_document_complexity(
+        page_count=1,
+        pixel_count=width * height,
+        longest_side=max(width, height),
+        max_pages=MAX_REPORT_PAGES_PER_FILE,
+        max_pixels=MAX_REPORT_IMAGE_PIXELS,
+        max_dimension=MAX_REPORT_IMAGE_DIMENSION,
+    )
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    encoded_bytes = buffer.getvalue()
+    if len(encoded_bytes) > MAX_BEDROCK_IMAGE_BYTES:
+        buffer.close()
+        raise ValueError("Rendered report page exceeds the Bedrock image-byte limit")
+    encoded = base64.b64encode(encoded_bytes).decode("utf-8")
     buffer.close()
     return encoded
 
 
 def _images_from_bytes(file_bytes: bytes, suffix: str) -> List[str]:
     suffix = suffix.lower()
+    inspection = inspect_report_upload(file_bytes, f"report{suffix}", None)
     if suffix in SUPPORTED_IMAGE_SUFFIXES:
         image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
         return [_encode_pil_image(image)]
@@ -36,7 +112,12 @@ def _images_from_bytes(file_bytes: bytes, suffix: str) -> List[str]:
         with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_file:
             tmp_file.write(file_bytes)
             tmp_file.flush()
-            images = convert_from_path(tmp_file.name)
+            images = convert_from_path(
+                tmp_file.name,
+                first_page=1,
+                last_page=inspection.page_count,
+                timeout=60,
+            )
         if not images:
             raise ValueError("PDF did not contain any pages.")
         return [_encode_pil_image(img.convert("RGB")) for img in images]
@@ -112,11 +193,17 @@ def summarize_report_from_path(path: Path) -> dict:
 
 
 def summarize_report_from_url(file_url: str) -> dict:
-    response = requests.get(file_url, timeout=60)
-    response.raise_for_status()
+    max_bytes = MAX_ATTACHMENT_TOTAL_MB * 1024 * 1024
+    with requests.get(file_url, timeout=60, stream=True) as response:
+        response.raise_for_status()
+        data = bytearray()
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise ValueError("Remote report exceeds the download size limit")
     parsed_url = urlparse(file_url)
     filename = Path(parsed_url.path).name or "report.pdf"
-    return summarize_report_from_bytes(response.content, filename)
+    return summarize_report_from_bytes(bytes(data), filename)
 
 
 def summarize_multiple_reports(file_data_list: List[Tuple[bytes, str]]) -> dict:
@@ -136,6 +223,10 @@ def summarize_multiple_reports(file_data_list: List[Tuple[bytes, str]]) -> dict:
         suffix = Path(filename).suffix or ".pdf"
         try:
             images = _images_from_bytes(file_bytes, suffix)
+            if len(all_images_b64) + len(images) > MAX_REPORT_TOTAL_PAGES:
+                raise ValueError(
+                    f"Combined reports exceed the {MAX_REPORT_TOTAL_PAGES}-page limit"
+                )
             all_images_b64.extend(images)
             file_info.append({"filename": filename, "pages": len(images)})
         except Exception as e:
@@ -167,4 +258,3 @@ If there are conflicting or duplicate findings across documents, note them clear
     parsed["total_documents"] = len(file_data_list)
     
     return parsed
-

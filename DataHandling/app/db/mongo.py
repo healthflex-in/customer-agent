@@ -6,6 +6,9 @@ from pymongo.collection import Collection
 
 # Re-export serializers for convenience
 from app.db.serializers import serialize_datetime, normalize_user_id
+from app.db.connection import create_verified_mongo_client
+from app.forms.lifecycle import ensure_form_lifecycle_ttl_index
+from app.forms.attempts import ensure_form_attempt_index
 
 _client: Optional[MongoClient] = None
 _users_collection: Optional[Collection] = None
@@ -15,6 +18,7 @@ MONGO_URI = os.environ.get("MONGO_URI", "")
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "stance-dashboard")
 MONGO_USERS_COLLECTION = os.environ.get("MONGO_USERS_COLLECTION", "users")
 MONGO_CUSTOMER_INFO_COLLECTION = os.environ.get("MONGO_CUSTOMER_INFO_COLLECTION", "customer-info")
+MONGO_TLS_CA_FILE = os.environ.get("MONGO_TLS_CA_FILE")
 
 def init_mongo() -> bool:
     global _client, _users_collection, _customer_info_collection
@@ -22,20 +26,16 @@ def init_mongo() -> bool:
         print("MONGO_URI not set — MongoDB disabled")
         return False
     try:
-        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        _client = create_verified_mongo_client(
+            MONGO_URI,
+            ca_file=MONGO_TLS_CA_FILE,
+        )
         _client.admin.command("ping")
         db = _client[MONGO_DB_NAME]
         _users_collection = db[MONGO_USERS_COLLECTION]
         _customer_info_collection = db[MONGO_CUSTOMER_INFO_COLLECTION]
-        # Unique index to prevent duplicate forms per user
-        _customer_info_collection.create_index(
-            [("userId", 1), ("formId", 1)], unique=True, name="unique_user_form"
-        )
-        # TTL: auto-delete abandoned empty forms after 7 days
-        _customer_info_collection.create_index(
-            [("createdAt", 1)], expireAfterSeconds=7*24*3600,
-            partialFilterExpression={"title": "New Form"}, name="ttl_abandoned_forms"
-        )
+        ensure_form_attempt_index(_customer_info_collection)
+        ensure_form_lifecycle_ttl_index(_customer_info_collection)
         print(f"[mongo] Connected to {MONGO_DB_NAME}.{MONGO_USERS_COLLECTION}, {MONGO_DB_NAME}.{MONGO_CUSTOMER_INFO_COLLECTION}")
         return True
     except Exception as e:

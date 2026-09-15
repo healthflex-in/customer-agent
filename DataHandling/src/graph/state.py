@@ -44,8 +44,8 @@ class InterviewState(TypedDict):
     missing_fields: list
     summary_intent: Optional[dict]
     reports_intent: Optional[dict]
-    is_correction_turn: bool
     correction_data: Optional[dict]
+    correction_applied: bool
 
     # ── Orchestrator question override ─────────────────────────
     orchestrator_question_id: Optional[str]
@@ -61,7 +61,6 @@ class InterviewState(TypedDict):
     tagged_turns: Optional[list]        # list of pre-batched question strings
     tagged_turn_metas: Optional[list]   # parallel list of {type, options, question_id} dicts
     tagged_turn_index: int              # next turn to use (incremented by generate_question)
-    tagged_cleanup_done: bool           # True after the cleanup pass (now unused)
     tagged_form_template: Optional[dict]  # scale → {question: ""}
     tagged_question_meta: Optional[dict]  # scratch: meta for the current turn's question
 
@@ -95,8 +94,8 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         missing_fields=[],
         summary_intent=None,
         reports_intent=None,
-        is_correction_turn=False,
         correction_data=None,
+        correction_applied=False,
         orchestrator_question_id=None,
         orchestrator_question_text=None,
         pending_question=None,
@@ -104,7 +103,6 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         tagged_turns=None,
         tagged_turn_metas=None,
         tagged_turn_index=0,
-        tagged_cleanup_done=False,
         tagged_form_template=None,
         tagged_question_meta=None,
         response_text="",

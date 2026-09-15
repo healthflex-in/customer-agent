@@ -11,9 +11,8 @@ def route_by_phase(state: InterviewState) -> str:
     return state["phase"]
 
 
-def after_classify_intent(state: InterviewState) -> str:
-    if state.get("is_correction_turn"):
-        return "detect_correction"
+def after_extract(state: InterviewState) -> str:
+    """Route signals computed by the combined extraction/intent node."""
     # In PROM/tagged-question sessions, skip reports upload flow entirely —
     # "yes" answers are about clinical scores, not document uploads
     if state.get("tagged_turns"):
@@ -43,6 +42,8 @@ def after_advance_section(state: InterviewState) -> str:
 
 
 def after_apply_correction(state: InterviewState) -> str:
+    if not state.get("correction_applied"):
+        return END
     if state.get("phase") == "summary":
         return "generate_summary"
     return "generate_question"
@@ -56,7 +57,9 @@ def after_handle_summary_response(state: InterviewState) -> str:
         # Patient revealed new health info — reopen interview, ask follow-ups
         return "generate_question"
     if intent == "request_change":
-        return "apply_correction"
+        if (state.get("summary_intent") or {}).get("correction_text"):
+            return "detect_correction"
+        return END
     if intent in ("has_reports", "no_reports"):
         return END
     return "generate_question"

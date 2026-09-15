@@ -5,6 +5,7 @@ Uses the LLM as a conductor: reads the patient's opening message, reasons about
 their visit intent, and generates the appropriate first question — no keyword lists.
 """
 import json
+from app.observability.privacy import error_type
 from src.graph.state import InterviewState
 from src.prompts import FIRST_TURN_CONDUCTOR_PROMPT
 
@@ -51,7 +52,7 @@ def make_handle_first_turn_node(llm_complete, welcome_prompt, reasoning_llm=None
             _question_start = -1
             for _i, _line in enumerate(_lines):
                 if _line.startswith("THINKING:"):
-                    print(f"[first_turn] thinking: {_line[9:].strip()}")
+                    print("[first_turn] Model supplied internal reasoning metadata")
                 elif _line.startswith("VISIT_CONTEXT:"):
                     vc = _line[14:].strip().lower().rstrip(".")
                     if vc in ("specific_complaint", "general_assessment", "clinic_inquiry", "unknown"):
@@ -71,9 +72,9 @@ def make_handle_first_turn_node(llm_complete, welcome_prompt, reasoning_llm=None
                 if _extra_text:
                     response = (response + "\n" + _extra_text).strip()
 
-            print(f"[first_turn] visit_context={visit_context}, response={response[:60] if response else 'EMPTY'}")
+            print(f"[first_turn] visit_context={visit_context}, response_chars={len(response or '')}")
         except Exception as e:
-            print(f"[first_turn] conductor LLM failed ({e})")
+            print(f"[first_turn] Conductor failed: {error_type(e)}")
 
         # Fallback: if LLM failed or returned empty, generate a simple open question
         # Don't use the hardcoded Q1 — it asks about pain/complaints even for general visits
@@ -125,7 +126,7 @@ def make_handle_first_turn_node(llm_complete, welcome_prompt, reasoning_llm=None
                                  for v in sec.values() if v and str(v).strip())
                     print(f"[first_turn] Reasoning extraction filled {_count} fields from first message")
             except Exception as _e:
-                print(f"[first_turn] Reasoning extraction failed (non-fatal): {_e}")
+                print(f"[first_turn] Reasoning extraction failed: {error_type(_e)}")
 
         # For general visits, immediately fill the irrelevant sections so they
         # never appear as missing to the conductor and the progress bar is accurate.

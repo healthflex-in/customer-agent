@@ -1,9 +1,6 @@
 import json
 import os
-import time
-import random
 import re
-from threading import Thread
 from datetime import datetime
 
 try:
@@ -14,7 +11,6 @@ except ImportError:
 
 from typing import Optional, Dict, Any, List
 from llama_index.core import Settings
-from llama_index.core.schema import QueryBundle
 from llama_index.core import VectorStoreIndex
 from llama_index.core import Document
 from llama_index.core.llms import ChatMessage, MessageRole
@@ -45,6 +41,9 @@ except ImportError:
         from llm.utils import load_gemini_key, init_llm, final_form_filling
 
 from src.enums import ENUMS
+from app.ai.models import MODEL_REGISTRY
+from app.observability.ai_usage import gemini_usage, tracked_ai_call
+from app.observability.privacy import error_type
 from src.prompts import (
     WELCOME_PROMPT,
     SYSTEM_PROMPT,
@@ -124,7 +123,7 @@ class HealthAgent:
             self.gemini_api_key = load_gemini_key()
             self.llm = init_llm(self.gemini_api_key)
         except Exception as e:
-            print(f"Error initializing LLM: {e}")
+            print(f"LLM initialization failed: {error_type(e)}")
             self.llm = None
 
         # Initialize paths and configs
@@ -149,7 +148,7 @@ class HealthAgent:
             try:
                 self.embed_model = HuggingFaceEmbedding(model_name=self.model_name)
             except Exception as e:
-                print(f"[init] HuggingFace embedding unavailable (non-fatal): {e}")
+                print(f"[init] HuggingFace embedding unavailable: {error_type(e)}")
 
         # Initialize chromadb, health index, and chat components (skipped if vector store unavailable)
         self.health_relevancy_retriever = None
@@ -160,19 +159,10 @@ class HealthAgent:
                 self.init_health_info_index()
                 self.init_chat_components()
             except Exception as e:
-                print(f"[init] Vector store unavailable (non-fatal): {e}")
+                print(f"[init] Vector store unavailable: {error_type(e)}")
 
         # Initialize form and tracking variables
         self.init_form()
-
-        # Continuous tracking
-        self.stop_flag = False
-        self.info = []
-        self.relevancy_action = "Listen"
-        self.check_interval = 10
-
-        # Start keyword checking thread
-        self.start_keyword_thread()
 
     def ensure_string(self, text):
         return _ensure_string(text)
@@ -186,12 +176,7 @@ class HealthAgent:
             raise ValueError("LLM not initialized")
 
         # Model rotation: rotate fast under load — shorter delays, more fallbacks
-        _MODEL_ROTATION = [
-            "gemini-2.5-flash-lite",   # primary — fast and cheap
-            "gemini-2.5-flash",        # fallback 1 — full model, usually available
-            "gemini-2.0-flash",        # fallback 2 — older stable model
-            "gemini-1.5-flash",        # fallback 3 — last resort, very stable
-        ]
+        _MODEL_ROTATION = MODEL_REGISTRY.rotation
         _RETRY_DELAYS = [0.5, 1, 3]    # shorter waits: rotate fast under heavy load
 
         _api_key = getattr(self.llm, "api_key", None) or os.environ.get("GEMINI_API_KEY", "")
@@ -203,79 +188,20 @@ class HealthAgent:
                     rotated_llm = _GoogleGenAI(model=model_name, api_key=_api_key)
                     print(f"[llm] Rotating to fallback model: {model_name} (attempt {attempt + 1})")
                 except Exception as _init_err:
-                    print(f"[llm] Could not init fallback model {model_name}: {_init_err}")
+                    print(f"[llm] Fallback model {model_name} failed to initialize: {error_type(_init_err)}")
                     continue
             else:
                 rotated_llm = self.llm
 
             try:
-                t0 = _time.perf_counter()
-                response = rotated_llm.complete(prompt)
-                elapsed_ms = (_time.perf_counter() - t0) * 1000
-
-                # Best-effort token-count logging.
-                active_model_name = getattr(rotated_llm, "model", model_name)
-                in_tok = out_tok = None
-                try:
-                    raw = getattr(response, "raw", None)
-                    usage = None
-                    if isinstance(raw, dict):
-                        usage = raw.get("usage_metadata")
-                    elif raw is not None:
-                        usage = getattr(raw, "usage_metadata", None)
-                    if usage:
-                        if isinstance(usage, dict):
-                            in_tok = usage.get("prompt_token_count")
-                            out_tok = usage.get("candidates_token_count")
-                        else:
-                            in_tok = getattr(usage, "prompt_token_count", None)
-                            out_tok = getattr(usage, "candidates_token_count", None)
-                except Exception:
-                    pass
-
+                response = tracked_ai_call(
+                    provider="google_genai",
+                    model=model_name,
+                    operation="interview_text",
+                    call=lambda: rotated_llm.complete(prompt),
+                    usage_extractor=gemini_usage,
+                )
                 result_text = self.ensure_string(response)
-
-                if in_tok is not None and out_tok is not None:
-                    # Rough $ estimate: Gemini 2.5 Flash $0.15/$0.60 per 1M tokens
-                    cost_usd = (in_tok * 0.15 + out_tok * 0.60) / 1_000_000
-                    print(
-                        f"[llm] model={active_model_name} in={in_tok} out={out_tok} "
-                        f"latency={elapsed_ms:.0f}ms est_cost=${cost_usd:.6f}"
-                    )
-
-                    # Push token counts + user context into the current Langfuse span
-                    try:
-                        import langfuse as _lf_mod
-                        _lf_client = _lf_mod.get_client()
-                        _lf_client.update_current_observation(
-                            model=active_model_name,
-                            usage={
-                                "input": in_tok,
-                                "output": out_tok,
-                                "unit": "TOKENS",
-                            },
-                            metadata={
-                                "latency_ms": round(elapsed_ms),
-                                "est_cost_usd": round(cost_usd, 6),
-                            },
-                        )
-                        # Attach user/session to the root trace
-                        _user_id = getattr(self, "_langfuse_user_id", None)
-                        _session_id = getattr(self, "_langfuse_session_id", None)
-                        if _user_id or _session_id:
-                            _lf_client.update_current_trace(
-                                name="interview-turn",
-                                user_id=_user_id or "",
-                                session_id=_session_id or "",
-                            )
-                    except Exception:
-                        pass
-                else:
-                    print(
-                        f"[llm] model={active_model_name} latency={elapsed_ms:.0f}ms "
-                        f"(token count unavailable)"
-                    )
-
                 return result_text
 
             except Exception as e:
@@ -291,16 +217,8 @@ class HealthAgent:
                     print(f"[llm] {model_name} unavailable (503/429) — waiting {delay}s then trying {next_model}")
                     _time.sleep(delay)
                     continue  # loop increments attempt → next model
-                print(f"Error in LLM completion (model={model_name}): {e}")
+                print(f"LLM completion failed (model={model_name}): {error_type(e)}")
                 raise
-
-    def start_keyword_thread(self):
-        """Start the background thread for keyword checking."""
-        try:
-            keyword_thread = Thread(target=self.check_for_keyword, daemon=True)
-            keyword_thread.start()
-        except Exception as e:
-            print(f"Error starting keyword thread: {e}")
 
     def init_prompts(self):
         """Initialize all prompts and templates."""
@@ -327,7 +245,7 @@ class HealthAgent:
                 vector_store, embed_model=self.embed_model
             )
         except Exception as e:
-            print(f"Error initializing ChromaDB: {e}")
+            print(f"ChromaDB initialization failed: {error_type(e)}")
             self.index = None
 
     def init_health_info_index(self):
@@ -340,7 +258,7 @@ class HealthAgent:
             )
             self.health_relevancy_retriever = self.health_relevancy_index.as_retriever()
         except Exception as e:
-            print(f"Error initializing health info index: {e}")
+            print(f"Health-info index initialization failed: {error_type(e)}")
             if self.index:
                 self.health_relevancy_retriever = self.index.as_retriever()
             else:
@@ -361,7 +279,7 @@ class HealthAgent:
                 raise ValueError("Index or LLM not properly initialized")
 
         except Exception as e:
-            print(f"Error initializing chat components: {e}")
+            print(f"Chat-component initialization failed: {error_type(e)}")
 
     def init_form(self):
         """Initialize form and tracking variables."""
@@ -399,50 +317,7 @@ class HealthAgent:
                 os.remove(self.medical_form_path)
                 print(f"Cleared old JSON file: {self.medical_form_path}")
         except Exception as e:
-            print(f"Error clearing JSON file (not critical): {e}")
-
-    def check_for_keyword(self):
-        """
-        Check for health-related keywords in transcriptions every check_interval seconds.
-        Runs in a separate thread.
-        """
-        while not self.stop_flag:
-            try:
-                if self.info and self.health_relevancy_retriever:
-                    self.relevancy_action = self.describe_action(self.info)
-                time.sleep(self.check_interval)
-            except Exception as e:
-                print(f"Error in keyword checking: {e}")
-                time.sleep(self.check_interval)
-
-    def describe_action(self, text_chunk, threshold=0.5):
-        """
-        Determine action based on relevance of text to health topics.
-
-        Args:
-            text_chunk: Text to analyze
-            threshold: Confidence threshold
-
-        Returns:
-            Action to take: "Silent", "Nod", or "Nudge"
-        """
-        if not text_chunk or not self.health_relevancy_retriever:
-            return "Listen"
-
-        try:
-            # Create query bundle for retrieval
-            query = QueryBundle(query_str=str(text_chunk))
-            selected_nodes = self.health_relevancy_retriever.retrieve(query)
-
-            # Check relevance scores
-            for node_info in selected_nodes:
-                score = getattr(node_info, "score", 0)
-                if score is not None and score > threshold:
-                    return random.choice(["Silent", "Nod"])
-            return "Nudge"
-        except Exception as e:
-            print(f"Error in describe_action: {e}")
-            return "Listen"
+            print(f"Legacy JSON cleanup failed: {error_type(e)}")
 
     def formatter(self, user_input, prompt_template):
         """
@@ -476,7 +351,7 @@ class HealthAgent:
 
             # Get structured response from LLM
             llm_response = self.llm_complete(enhanced_prompt)
-            print("LLM FORMATTING RESPONSE:\n", llm_response)
+            print(f"[formatter] LLM response received ({len(llm_response)} chars)")
 
             # Extract JSON from response
             json_str = self.extract_json_from_response(llm_response)
@@ -545,7 +420,7 @@ class HealthAgent:
                         # If so, it shouldn't be in Previous Consultations at all
                         if "worse" in status_value.lower() or "better" in status_value.lower() or "same" in status_value.lower():
                             # This is likely describing current complaint status, not previous consultation status
-                            print(f"[formatter] POST-PROCESSING: Status '{status_value}' appears to be about current complaint, not previous consultations. Clearing.")
+                            print("[formatter] Clearing misplaced previous-consultation status")
                             self.form["Previous Consultations"][status_field] = ""
 
                     # Case 2: user explicitly says they have NO previous consultations
@@ -561,7 +436,7 @@ class HealthAgent:
                             # In this scenario, any auto-filled status like "Same" is misleading.
                             # Either leave it empty or mark explicitly as not applicable.
                             if status_value:
-                                print(f"[formatter] POST-PROCESSING: Clearing status '{status_value}' because user has no previous consultations.")
+                                print("[formatter] Clearing inapplicable previous-consultation status")
                             self.form["Previous Consultations"][status_field] = "Not applicable (no previous consultations for this issue)"
 
                 # POST-PROCESSING: History & Diagnostics negative vs. missing values
@@ -595,9 +470,7 @@ class HealthAgent:
                         if reports_value.lower() in placeholder_values and not any(
                             ind in user_lower for ind in no_reports_indicators
                         ):
-                            print(
-                                f"[formatter] POST-PROCESSING: Clearing placeholder Reports value '{reports_value}' (no explicit 'no reports' in user input)."
-                            )
+                            print("[formatter] Clearing unsubstantiated reports placeholder")
                             self.form["History & Diagnostics"][reports_field_name] = ""
 
                     # 2) Systemic Illness and Surgical History: clear placeholders unless user clearly says "no"
@@ -626,9 +499,7 @@ class HealthAgent:
                         and sys_hist_value.lower() in placeholder_history_values
                         and not any(ind in user_lower for ind in explicit_no_history_indicators)
                     ):
-                        print(
-                            f"[formatter] POST-PROCESSING: Clearing placeholder Systemic Illness and Surgical History value '{sys_hist_value}' (no explicit negative in user input)."
-                        )
+                        print("[formatter] Clearing unsubstantiated medical-history placeholder")
                         self.form["History & Diagnostics"][sys_hist_field] = ""
 
                 # POST-PROCESSING: Clean up Referral.Source field if LLM filled it with non-informative or wrong values
@@ -690,23 +561,25 @@ class HealthAgent:
                                 should_clear = True
 
                         if should_clear:
-                            print(f"[formatter] POST-PROCESSING: Clearing incorrect Referral.Source value '{referral_source}'")
+                            print("[formatter] Clearing incorrectly extracted referral source")
                             self.form["Referral"]["Source"] = ""
 
-                print("Updated form sections after formatting:")
-                for section, fields in self.form.items():
-                    non_empty = {k: v for k, v in fields.items() if v}
-                    if non_empty:
-                        print(f"{section}: {non_empty}")
+                filled_count = sum(
+                    1
+                    for fields in self.form.values()
+                    for value in fields.values()
+                    if value
+                )
+                print(f"[formatter] Updated form ({filled_count} filled fields)")
 
                 return self.form
             except json.JSONDecodeError as e:
-                print(f"JSON decode error: {e}")
-                print(f"Problematic JSON string: {json_str}")
+                print(f"JSON decoding failed: {error_type(e)}")
+                print(f"[formatter] Invalid JSON response ({len(json_str)} chars)")
                 return self.form
 
         except Exception as e:
-            print(f"Error in formatter: {e}")
+            print(f"Formatter failed: {error_type(e)}")
             return self.form
 
     def extract_json_from_response(self, response):
@@ -794,7 +667,7 @@ Rules:
             }
             return result
         except Exception as e:
-            print(f"[classify_summary_response] Error classifying summary response: {e}")
+            print(f"[classify_summary_response] Failed: {error_type(e)}")
             return {}
 
     def classify_reports_intent(self, user_input: str) -> dict:
@@ -931,7 +804,7 @@ IMPORTANT: Do NOT set "has_reports": true just because they mention medical term
                 "wants_upload": wants_upload,
             }
         except Exception as e:
-            print(f"[classify_reports_intent] Error classifying reports intent: {e}")
+            print(f"[classify_reports_intent] Failed: {error_type(e)}")
             return {}
 
         # Handle regular code block
@@ -948,9 +821,9 @@ IMPORTANT: Do NOT set "has_reports": true just because they mention medical term
         awaiting = self.conversation_state.get('awaiting_confirmation', False)
         result = _should_check_correction(user_input, awaiting_confirmation=awaiting)
         if result:
-            print(f"[should_check_for_correction] Correction language detected: '{user_input}'")
+            print("[should_check_for_correction] Correction language detected")
         else:
-            print(f"[should_check_for_correction] Skipping correction detection: '{user_input}'")
+            print("[should_check_for_correction] Correction language not detected")
         return result
 
     def detect_correction(self, user_message, is_summary_mode=False):
@@ -1041,7 +914,7 @@ If you cannot identify which field to update with confidence, set needs_clarific
             
             # Get LLM response
             llm_response = self.llm_complete(prompt)
-            print(f"[detect_correction] LLM Response: {llm_response}")
+            print(f"[detect_correction] LLM response received ({len(llm_response)} chars)")
             
             # Extract JSON from response
             json_str = self.extract_json_from_response(llm_response)
@@ -1052,11 +925,11 @@ If you cannot identify which field to update with confidence, set needs_clarific
             
             # Parse the correction details
             correction_data = json.loads(json_str)
-            print(f"[detect_correction] Parsed correction data: {correction_data}")
+            print("[detect_correction] Parsed correction response")
             
             # Return correction data if it's actually a correction
             if correction_data.get("is_correction", False):
-                print(f"[detect_correction] ✓ Correction detected successfully: {correction_data}")
+                print("[detect_correction] Correction detected successfully")
                 return correction_data
             else:
                 print(f"[detect_correction] ✗ Not detected as correction (is_correction=False)")
@@ -1064,7 +937,7 @@ If you cannot identify which field to update with confidence, set needs_clarific
             return None
             
         except Exception as e:
-            print(f"[detect_correction] Error detecting correction: {e}")
+            print(f"[detect_correction] Failed: {error_type(e)}")
             return None
 
     def generate_summary(self) -> str:
@@ -1212,7 +1085,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
             return summary_text
             
         except Exception as e:
-            print(f"[generate_summary] Error generating summary: {e}")
+            print(f"[generate_summary] Failed: {error_type(e)}")
             # Fallback to simple structured format if LLM fails
             summary_parts = []
             summary_parts.append("Here's a summary of the information you've provided:\n")
@@ -1378,7 +1251,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                         # CRITICAL: Check semantic compatibility before propagating
                         # Don't propagate if values are incompatible (e.g., duration -> status)
                         if not self._is_semantically_compatible(old_value, new_value, field_name):
-                            print(f"[_propagate_correction] Skipping {section_name}.{field_name} - semantic incompatibility: '{old_value}' -> '{new_value}'")
+                            print(f"[_propagate_correction] Skipping semantically incompatible field {section_name}.{field_name}")
                             continue
                         
                         # Try to replace using core terms first
@@ -1397,14 +1270,12 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                         if new_field_value != field_value_str:
                             self.form[section_name][field_name] = new_field_value
                             updated_fields.append(f"{section_name}.{field_name}")
-                            print(f"[_propagate_correction] Updated {section_name}.{field_name}: '{field_value_str}' -> '{new_field_value}'")
+                            print(f"[_propagate_correction] Updated {section_name}.{field_name}")
             
             return updated_fields
             
         except Exception as e:
-            print(f"[_propagate_correction] Error propagating correction: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[_propagate_correction] Failed: {error_type(e)}")
             return updated_fields
 
     def apply_correction(self, correction_data, is_summary_mode=False):
@@ -1456,7 +1327,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
             )
             
             llm_response = self.llm_complete(prompt)
-            print(f"[apply_correction] LLM Response: {llm_response[:500]}...")
+            print(f"[apply_correction] LLM response received ({len(llm_response)} chars)")
             json_str = self.extract_json_from_response(llm_response)
             
             if json_str:
@@ -1466,14 +1337,14 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                 # VALIDATION: Verify the correct field was updated
                 if section_name in updated_form and field_name in updated_form[section_name]:
                     actual_new_value = updated_form[section_name][field_name]
-                    print(f"[apply_correction] Field {section_name}.{field_name} updated from '{old_value}' to '{actual_new_value}' (requested: '{new_value}')")
+                    print(f"[apply_correction] Updated {section_name}.{field_name}")
                     
                     # Check if the field was actually updated to the new value
                     if actual_new_value != new_value:
-                        print(f"[apply_correction] WARNING: LLM updated field to '{actual_new_value}' instead of '{new_value}'")
+                        print("[apply_correction] WARNING: LLM returned an unexpected corrected value")
                         print(f"[apply_correction] Forcing correct value...")
                         updated_form[section_name][field_name] = new_value
-                        print(f"[apply_correction] ✓ Value corrected to '{new_value}'")
+                        print("[apply_correction] Forced requested corrected value")
                     
                     # Additional check: Make sure old_value wasn't moved to another field
                     if old_value and str(old_value).strip():
@@ -1482,11 +1353,11 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                                 for fld_name, fld_value in sec_fields.items():
                                     # If we find the old value in a different field, that's wrong
                                     if (sec_name != section_name or fld_name != field_name) and str(fld_value) == str(old_value):
-                                        print(f"[apply_correction] ERROR: Found old value '{old_value}' in wrong field {sec_name}.{fld_name}")
+                                        print(f"[apply_correction] ERROR: previous value also present in {sec_name}.{fld_name}")
                                         print(f"[apply_correction] This should have been cleared. Fixing...")
                                         # Don't clear it - it might be legitimately there
                                         # Just log the warning
-                                        print(f"[apply_correction] WARNING: '{old_value}' exists in {sec_name}.{fld_name} - may need manual review")
+                                        print(f"[apply_correction] WARNING: {sec_name}.{fld_name} may need manual review")
                     
                     self.form = updated_form
                     
@@ -1496,7 +1367,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                     if old_value and str(old_value).strip() and new_value:
                         fields_updated = self._propagate_correction(old_value, new_value, section_name, field_name)
                         if fields_updated:
-                            print(f"[apply_correction] Propagated correction to {len(fields_updated)} additional fields: {fields_updated}")
+                            print(f"[apply_correction] Propagated correction to {len(fields_updated)} additional fields")
                     
                     # Generate confirmation message
                     if is_summary_mode:
@@ -1512,7 +1383,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                         self.conversation_state['awaiting_confirmation'] = True
                         self.conversation_state['last_message_type'] = 'confirmation_request'
                     
-                    print(f"[apply_correction] Successfully updated {section_name}.{field_name} to '{new_value}'")
+                    print(f"[apply_correction] Successfully updated {section_name}.{field_name}")
                     return (True, confirmation_msg)
                 else:
                     print(f"[apply_correction] ERROR: Field {section_name}.{field_name} not found in LLM response")
@@ -1523,7 +1394,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                     if old_value and str(old_value).strip() and new_value:
                         fields_updated = self._propagate_correction(old_value, new_value, section_name, field_name)
                         if fields_updated:
-                            print(f"[apply_correction] Propagated correction to {len(fields_updated)} additional fields: {fields_updated}")
+                            print(f"[apply_correction] Propagated correction to {len(fields_updated)} additional fields")
                     
                     if is_summary_mode:
                         confirmation_msg = f"I've updated '{field_name}' to '{new_value}'."
@@ -1543,7 +1414,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                 if old_value and str(old_value).strip() and new_value:
                     fields_updated = self._propagate_correction(old_value, new_value, section_name, field_name)
                     if fields_updated:
-                        print(f"[apply_correction] Propagated correction to {len(fields_updated)} additional fields: {fields_updated}")
+                        print(f"[apply_correction] Propagated correction to {len(fields_updated)} additional fields")
                 
                 if is_summary_mode:
                     confirmation_msg = f"I've updated '{field_name}' to '{new_value}'."
@@ -1557,13 +1428,13 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                 return (True, confirmation_msg)
                 
         except Exception as e:
-            print(f"[apply_correction] Error applying correction: {e}")
+            print(f"[apply_correction] Failed: {error_type(e)}")
             return (False, "I encountered an error while trying to apply your correction. Could you please try again?")
 
     def validator(self, current_section=None):
         section = current_section or self.current_section
         self.missing_fields = _validate_section(self.form, section)
-        print(f"Missing fields in {section}: {self.missing_fields}")
+        print(f"[validator] {len(self.missing_fields)} fields remain in current section")
         return len(self.missing_fields) == 0
 
     def all_ops(self):
@@ -1621,7 +1492,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                 # Extract the actual question and use it as-is to preserve formatting
                 response = prompt_template.replace("DIRECT_QUESTION:", "", 1)
                 print(f"[talk_to_user] Using direct question without LLM processing to preserve formatting")
-                print(f"[talk_to_user] Question preview: {response[:100]}...")
+                print(f"[talk_to_user] Direct question selected ({len(response)} chars)")
             elif "You're a medical professional" not in prompt_template and \
                "Extract medical information" not in prompt_template and \
                len(prompt_template) < 1000:  # Direct questions are usually shorter
@@ -1869,7 +1740,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
             return response
 
         except Exception as e:
-            print(f"Error generating response: {e}")
+            print(f"Response generation failed: {error_type(e)}")
             # Use predefined question as fallback
             if self.idx < len(self.predefined_questions):
                 return self.predefined_questions[self.idx][1]
@@ -2116,7 +1987,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
             # If form has ANY data, use LLM to check what's filled and generate appropriate question
             if is_section_empty and is_first_question:
                 print(f"[make_template] Section '{self.current_section}' is empty AND form is completely empty, returning predefined question directly to preserve bullet points")
-                print(f"[make_template] Question preview: {question[:150]}...")
+                print(f"[make_template] Generated question ({len(question)} chars)")
                 # Return with a marker so talk_to_user knows not to process it
                 return f"DIRECT_QUESTION:{question}"
             elif is_section_empty and not is_first_question:
@@ -2448,7 +2319,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                     )
                     
                     if total_filled == 0 and user_input_lower in confirmation_words:
-                        print(f"[main_processor] User confirmed readiness with '{user_response}', immediately asking comprehensive first question")
+                        print("[main_processor] User confirmed readiness; asking first question")
                         # Add confirmation to history
                         self.history.append({"role": "user", "message": user_response})
                         # Ask the comprehensive first question
@@ -2562,7 +2433,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                                 print(f"[main_processor] Summary mode (LLM): correction applied, showing updated summary")
                                 return summary  # Return just the summary, not the message + summary
                             else:
-                                print(f"[main_processor] Summary mode (LLM): correction application failed: {message}")
+                                print("[main_processor] Summary-mode correction application failed")
                                 return message
                         else:
                             # No specific correction detected via detect_correction
@@ -2586,7 +2457,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                                             new_value = str(self.form[section_name].get(field_name, "") or "").strip()
                                             if old_value != new_value and new_value:
                                                 fields_updated = True
-                                                print(f"[main_processor] Summary mode (LLM): Field updated - {section_name}.{field_name}: '{old_value}' -> '{new_value}'")
+                                                print(f"[main_processor] Summary mode updated {section_name}.{field_name}")
                                                 break
                                         if fields_updated:
                                             break
@@ -2601,9 +2472,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                                 else:
                                     print(f"[main_processor] Summary mode (LLM): formatter did not update any fields")
                             except Exception as e:
-                                print(f"[main_processor] Summary mode (LLM): error formatting user response: {e}")
-                                import traceback
-                                traceback.print_exc()
+                                print(f"[main_processor] Summary-mode formatting failed: {error_type(e)}")
                             
                             # If formatting also failed, ask user what they want to change
                             clarification_msg = (
@@ -2762,7 +2631,7 @@ Respond ONLY with a JSON object:
                         if isinstance(data_missing, dict):
                             missing_info_intent = data_missing
                 except Exception as e:
-                    print(f"[main_processor] Error in missing-info intent classification: {e}")
+                    print(f"[main_processor] Missing-info classification failed: {error_type(e)}")
                 
                 if missing_info_intent.get("is_question_about_missing_info"):
                     # User is asking if information is needed - check what fields are missing
@@ -3140,769 +3009,10 @@ Respond ONLY with a JSON object:
             return "Please provide your response to continue the interview."
 
         except Exception as e:
-            print(f"Error in main_processor: {e}")
+            print(f"Main processor failed: {error_type(e)}")
             # Fall back to predefined questions if there's an error
             if self.idx < len(self.predefined_questions):
                 return self.predefined_questions[self.idx][1]
             return (
                 "I apologize, there was an error. Could you please repeat your answer?"
             )
-
-# experimental code
-# import json
-# import os
-# import time
-# import random
-# from threading import Thread
-# from datetime import datetime
-# import GPUtil
-
-# from typing import Optional, Dict, Any, List
-# from llama_index.core import Settings
-# from llama_index.vector_stores.chroma import ChromaVectorStore
-# from llama_index.core.schema import QueryBundle
-# from llama_index.core import VectorStoreIndex
-# from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-# from llama_index.core import Document
-# from llama_index.core.llms import ChatMessage, MessageRole
-# from llama_index.core.storage.chat_store import SimpleChatStore
-# from llama_index.core.memory import ChatMemoryBuffer
-# import chromadb
-
-# # Import database connector if available
-# try:
-#     from db import MedicalInterviewDB
-
-#     has_db = True
-# except ImportError:
-#     has_db = False
-
-# # Fix import paths based on project structure
-# try:
-#     from src.llm.utils import load_gemini_key, init_llm, final_form_filling
-# except ImportError:
-#     try:
-#         from src.llm.utils import load_gemini_key, init_llm, final_form_filling
-#     except ImportError:
-#         from llm.utils import load_gemini_key, init_llm, final_form_filling
-
-# from src.enums import ENUMS
-# from src.prompts import (
-#     WELCOME_PROMPT,
-#     SYSTEM_PROMPT,
-#     TEMPLATE_PROMPT,
-#     QUERY_TASK_PROMPT,
-#     FORMAT_PROMPT,
-#     PREDEFINED_QUESTIONS,
-#     MEDICAL_FORM_TEMPLATE,
-#     FINAL_FORM_FILL_PROMPT,
-#     DEFAULT_ANSWER,
-#     READY_TO_START_PROMPT,
-#     INTERVIEW_DECLINED_PROMPT,
-# )
-
-# # Additional prompt to prevent making assumptions
-# NO_ASSUMPTIONS_PROMPT = """
-# IMPORTANT GUIDELINES FOR THIS MEDICAL INTERVIEW:
-
-# 1. Do NOT make assumptions about the patient's situation that are not directly stated by them.
-# 2. Only ask questions based on facts they have provided or standard medical interview protocol.
-# 3. Do NOT assume connections between symptoms and lifestyle unless explicitly stated by the patient.
-# 4. Do NOT bring up topics or facts that the patient hasn't mentioned themselves.
-# 5. Your role is to gather information neutrally, not to suggest or assume details about the patient's life or circumstances.
-# 6. If you need more information, ask direct questions without implying assumptions.
-# 7. Avoid phrases like "your coach" or "your trainer" unless the patient has specifically mentioned having one.
-# 8. Focus only on the medical facts relevant to the current section of the interview.
-# 9. Do not add speculative context to your questions.
-# """
-
-# enums_obj = ENUMS()
-
-
-# class HealthAgent:
-#     def __init__(self, db_instance=None, user_id=None, interview_id=None):
-#         """
-#         Initialize the HealthAgent with all necessary components
-#         for conducting a medical interview.
-
-#         Args:
-#             db_instance: Optional MedicalInterviewDB instance for database interactions
-#             user_id: Optional user ID for database tracking
-#             interview_id: Optional interview ID for database tracking
-#         """
-#         # Initialize database connection if provided
-#         self.db = db_instance
-#         self.user_id = user_id
-#         self.interview_id = interview_id
-
-#         # Initialize predefined questions and prompts
-#         self.init_prompts()
-
-#         # Initialize history for conversation tracking
-#         self.history = []
-#         self.history.append({"role": "agent", "message": self.welcome_prompt})
-
-#         try:
-#             # Initialize LLM
-#             self.gemini_api_key = load_gemini_key()
-#             self.llm = init_llm(self.gemini_api_key)
-#         except Exception as e:
-#             print(f"Error initializing LLM: {e}")
-#             self.llm = None
-
-#         # Initialize paths and configs
-#         self.model_name = enums_obj.embedding_model_name
-#         self.chat_store_path = enums_obj.chat_history_json_path
-#         self.medical_form_path = enums_obj.medical_interview_history_json_path
-#         self.chroma_db_path = enums_obj.git_db_path
-#         self.collection_name = enums_obj.git_collection_name
-
-#         # Check device availability
-#         try:
-#             self.devices = GPUtil.getAvailable()
-#             self.device = self.devices[0] if len(self.devices) else "cpu"
-#         except:
-#             self.device = "cpu"
-
-#         try:
-#             # Initialize embedding model
-#             self.embed_model = HuggingFaceEmbedding(model_name=self.model_name)
-#         except Exception as e:
-#             print(f"Error initializing embedding model: {e}")
-#             self.embed_model = None
-
-#         # Initialize chromadb, health index, and chat components
-#         try:
-#             self.init_chromadb()
-#             self.init_health_info_index()
-#             self.init_chat_components()
-#         except Exception as e:
-#             print(f"Error initializing database components: {e}")
-#             self.health_relevancy_retriever = None
-#             self.index = None
-
-#         # Initialize form and tracking variables
-#         self.init_form()
-
-#         # Continuous tracking
-#         self.stop_flag = False
-#         self.info = []
-#         self.relevancy_action = "Listen"
-#         self.check_interval = 10
-
-#         # Start keyword checking thread
-#         self.start_keyword_thread()
-
-#     def ensure_string(self, text):
-#         """Ensure the text is a string and not some other object"""
-#         if hasattr(text, "text"):  # Some API responses might have a .text attribute
-#             return text.text
-#         elif hasattr(text, "__str__"):  # Convert to string if possible
-#             return str(text)
-#         else:
-#             return "Response could not be processed"
-
-#     def llm_complete(self, prompt):
-#         """Call LLM with appropriate error handling"""
-#         try:
-#             if self.llm is None:
-#                 raise ValueError("LLM not initialized")
-
-#             # Use the correct method for the LLM type
-#             response = self.llm.complete(prompt)
-#             # Convert response to string
-#             return self.ensure_string(response)
-#         except Exception as e:
-#             print(f"Error in LLM completion: {e}")
-#             raise
-
-#     def start_keyword_thread(self):
-#         """Start the background thread for keyword checking."""
-#         try:
-#             keyword_thread = Thread(target=self.check_for_keyword, daemon=True)
-#             keyword_thread.start()
-#         except Exception as e:
-#             print(f"Error starting keyword thread: {e}")
-
-#     def init_prompts(self):
-#         """Initialize all prompts and templates."""
-#         self.welcome_prompt = WELCOME_PROMPT
-#         # Combine system prompt with no assumptions prompt
-#         self.system_prompt = SYSTEM_PROMPT + "\n" + NO_ASSUMPTIONS_PROMPT
-#         self.query_task_prompt = QUERY_TASK_PROMPT
-#         self.format_prompt = FORMAT_PROMPT
-#         self.predefined_questions = PREDEFINED_QUESTIONS
-#         self.final_form_fill_prompt = FINAL_FORM_FILL_PROMPT
-#         self.default_answer = DEFAULT_ANSWER
-#         self.ready_to_start_message = READY_TO_START_PROMPT
-#         self.interview_declined_message = INTERVIEW_DECLINED_PROMPT
-
-#     def init_chromadb(self):
-#         """Initialize chromadb connection and vector store."""
-#         try:
-#             self.db_client = chromadb.PersistentClient(path=self.chroma_db_path)
-#             collection = self.db_client.get_collection(self.collection_name)
-#             vector_store = ChromaVectorStore(chroma_collection=collection)
-#             self.index = VectorStoreIndex.from_vector_store(
-#                 vector_store, embed_model=self.embed_model
-#             )
-#         except Exception as e:
-#             print(f"Error initializing ChromaDB: {e}")
-#             self.index = VectorStoreIndex([Document(text="Fallback document")])
-
-#     def init_health_info_index(self):
-#         """Initialize health information vector index."""
-#         try:
-#             collection = self.db_client.get_collection(self.collection_name)
-#             vector_store = ChromaVectorStore(chroma_collection=collection)
-#             self.health_relevancy_index = VectorStoreIndex.from_vector_store(
-#                 vector_store, embed_model=self.embed_model
-#             )
-#             self.health_relevancy_retriever = self.health_relevancy_index.as_retriever()
-#         except Exception as e:
-#             print(f"Error initializing health info index: {e}")
-#             if self.index:
-#                 self.health_relevancy_retriever = self.index.as_retriever()
-#             else:
-#                 self.health_relevancy_retriever = None
-
-#     def init_chat_components(self):
-#         """Initialize chat store and memory components."""
-#         try:
-#             # Initialize with an empty list for message history
-#             self.messages_history = []
-
-#             # Initialize chat engine with the LLM
-#             if self.index and self.llm:
-#                 self.chat_engine = self.index.as_chat_engine(
-#                     llm=self.llm, chat_mode="condense_question"
-#                 )
-#             else:
-#                 raise ValueError("Index or LLM not properly initialized")
-
-#         except Exception as e:
-#             print(f"Error initializing chat components: {e}")
-
-#     def init_form(self, load_from_db=False):
-#         """
-#         Initialize form and tracking variables.
-
-#         Args:
-#             load_from_db: Whether to attempt loading the form from database
-#         """
-#         self.idx = 0
-#         self.form = MEDICAL_FORM_TEMPLATE.copy()
-#         self.final_filled_form = MEDICAL_FORM_TEMPLATE.copy()
-#         self.form_sections = list(self.form.keys())
-#         self.current_section = self.form_sections[0]
-#         self.missing_fields = []
-#         self.conversation_state = {
-#             "last_question": None,
-#             "attempts": 0,
-#             "max_attempts": 3,
-#         }
-#         self.talk_mode = "START"
-
-#         # If we have database connection and interview_id, try to load existing form
-#         if load_from_db and has_db and self.db and self.interview_id:
-#             try:
-#                 interview = self.db.get_interview(self.interview_id)
-#                 if interview and interview.get("form_data"):
-#                     self.form = interview["form_data"]
-#                     self.current_section = interview.get(
-#                         "current_section", self.current_section
-#                     )
-#                     self.idx = self.form_sections.index(self.current_section)
-#                     print(
-#                         f"Loaded form data from database for interview {self.interview_id}"
-#                     )
-#             except Exception as e:
-#                 print(f"Error loading form from database: {e}")
-
-#     def check_for_keyword(self):
-#         """
-#         Check for health-related keywords in transcriptions every check_interval seconds.
-#         Runs in a separate thread.
-#         """
-#         while not self.stop_flag:
-#             try:
-#                 if self.info and self.health_relevancy_retriever:
-#                     self.relevancy_action = self.describe_action(self.info)
-#                 time.sleep(self.check_interval)
-#             except Exception as e:
-#                 print(f"Error in keyword checking: {e}")
-#                 time.sleep(self.check_interval)
-
-#     def describe_action(self, text_chunk, threshold=0.5):
-#         """
-#         Determine action based on relevance of text to health topics.
-
-#         Args:
-#             text_chunk: Text to analyze
-#             threshold: Confidence threshold
-
-#         Returns:
-#             Action to take: "Silent", "Nod", or "Nudge"
-#         """
-#         if not text_chunk or not self.health_relevancy_retriever:
-#             return "Listen"
-
-#         try:
-#             # Create query bundle for retrieval
-#             query = QueryBundle(query_str=str(text_chunk))
-#             selected_nodes = self.health_relevancy_retriever.retrieve(query)
-
-#             # Check relevance scores
-#             for node_info in selected_nodes:
-#                 score = getattr(node_info, "score", 0)
-#                 if score is not None and score > threshold:
-#                     return random.choice(["Silent", "Nod"])
-#             return "Nudge"
-#         except Exception as e:
-#             print(f"Error in describe_action: {e}")
-#             return "Listen"
-
-#     def formatter(self, user_input, prompt_template):
-#         """
-#         Format user input into structured data for the current section.
-#         Uses LLM to extract structured data from user responses.
-
-#         Args:
-#             user_input: The user's response text
-#             prompt_template: The prompt to use for formatting
-
-#         Returns:
-#             Formatted form data
-#         """
-#         example_output = """{"Patient Information": {"Age": "35", "Gender": "male"}}"""
-
-#         try:
-#             # Prepare enhanced prompt for LLM to get better structured extraction
-#             enhanced_prompt = TEMPLATE_PROMPT.format(
-#                 prompt_template, json.dumps(self.form, indent=2), example_output
-#             )
-
-#             # Add more specific guidance to improve extraction quality
-#             enhanced_prompt += """
-#             IMPORTANT GUIDELINES:
-#             1. Extract ALL relevant medical information from the response
-#             2. Map information to the correct fields in the form
-#             3. Make reasonable inferences about fields based on the patient's language
-#             4. Preserve the exact structure of the form template
-#             5. Return only valid JSON that can be parsed directly
-#             6. Do NOT invent or assume information not explicitly stated by the patient
-#             7. If uncertain about a field, leave it blank rather than guessing
-#             """
-
-#             # Get structured response from LLM
-#             llm_response = self.llm_complete(enhanced_prompt)
-#             print("LLM FORMATTING RESPONSE:\n", llm_response)
-
-#             # Extract JSON from response
-#             json_str = self.extract_json_from_response(llm_response)
-
-#             if not json_str:
-#                 # If no JSON found, try again with a simpler prompt
-#                 fallback_prompt = f"""
-#                 Convert this patient response to a JSON object matching the form structure:
-
-#                 PATIENT RESPONSE: {user_input}
-#                 FORM STRUCTURE: {json.dumps(self.form, indent=2)}
-
-#                 Respond ONLY with valid JSON.
-#                 """
-#                 llm_response = self.llm_complete(fallback_prompt)
-#                 json_str = self.extract_json_from_response(llm_response)
-
-#                 if not json_str:
-#                     print("No valid JSON found in LLM response after retry")
-#                     return self.form
-
-#             # Parse the JSON response
-#             try:
-#                 formatted_data = json.loads(json_str)
-
-#                 # Update the form with extracted information
-#                 for section, fields in self.form.items():
-#                     if section in formatted_data:
-#                         for key in fields:
-#                             # Only update if there's new information
-#                             new_value = formatted_data.get(section, {}).get(key, "")
-#                             if new_value:
-#                                 self.form[section][key] = new_value
-
-#                 print("Updated form sections after formatting:")
-#                 for section, fields in self.form.items():
-#                     non_empty = {k: v for k, v in fields.items() if v}
-#                     if non_empty:
-#                         print(f"{section}: {non_empty}")
-
-#                 # If we have database connection, update form in database
-#                 if has_db and self.db and self.interview_id:
-#                     progress = 0
-#                     try:
-#                         section_index = self.form_sections.index(self.current_section)
-#                         progress = (section_index / len(self.form_sections)) * 100
-#                     except:
-#                         pass
-
-#                     try:
-#                         self.db.update_interview_form(
-#                             interview_id=self.interview_id,
-#                             form_data=self.form,
-#                             current_section=self.current_section,
-#                             progress=progress,
-#                         )
-#                     except Exception as e:
-#                         print(f"Error updating form in database: {e}")
-
-#                 return self.form
-#             except json.JSONDecodeError as e:
-#                 print(f"JSON decode error: {e}")
-#                 print(f"Problematic JSON string: {json_str}")
-#                 return self.form
-
-#         except Exception as e:
-#             print(f"Error in formatter: {e}")
-#             return self.form
-
-#     def extract_json_from_response(self, response):
-#         """Extract valid JSON from an LLM response"""
-#         if not response:
-#             return None
-
-#         # Check if the entire response is JSON
-#         response = response.strip()
-#         if response.startswith("{") and response.endswith("}"):
-#             return response
-
-#         # Try to find JSON within the response
-#         start = response.find("{")
-#         end = response.rfind("}")
-
-#         if start != -1 and end != -1 and start < end:
-#             return response[start : end + 1]
-
-#         # Handle code block format
-#         if "```json" in response:
-#             parts = response.split("```json")
-#             if len(parts) > 1:
-#                 code_part = parts[1].split("```")[0].strip()
-#                 if code_part.startswith("{") and code_part.endswith("}"):
-#                     return code_part
-
-#         # Handle regular code block
-#         if "```" in response:
-#             parts = response.split("```")
-#             if len(parts) > 1:
-#                 code_part = parts[1].strip()
-#                 if code_part.startswith("{") and code_part.endswith("}"):
-#                     return code_part
-
-#         return None
-
-#     def validator(self, current_section=None):
-#         """
-#         Validate the form data for the current section.
-
-#         Args:
-#             current_section: Section to validate (defaults to self.current_section)
-
-#         Returns:
-#             Boolean indicating if all required fields are filled
-#         """
-#         section = current_section or self.current_section
-
-#         # Reset missing fields
-#         self.missing_fields = []
-
-#         # Check each required field in the current section
-#         for field, value in self.form[section].items():
-#             if not value:
-#                 self.missing_fields.append(field)
-
-#         print(f"Missing fields in {section}: {self.missing_fields}")
-
-#         # If there are missing fields, return False
-#         return len(self.missing_fields) == 0
-
-#     def all_ops(self):
-#         """
-#         Perform all operations after successful validation of a section.
-#         """
-#         # Save current progress to file
-#         self.save_progress()
-
-#         # Move to next section if available
-#         current_index = self.form_sections.index(self.current_section)
-#         if current_index < len(self.form_sections) - 1:
-#             self.current_section = self.form_sections[current_index + 1]
-#             self.conversation_state["attempts"] = 0
-#             self.conversation_state["last_question"] = None
-#             print(f"Moving to next section: {self.current_section}")
-
-#     def save_progress(self):
-#         """
-#         Save the current form state to a file and database if available.
-#         """
-#         try:
-#             # Create a save data structure
-#             save_data = {
-#                 "timestamp": datetime.now().isoformat(),
-#                 "form_data": self.form,
-#                 "current_section": self.current_section,
-#             }
-
-#             # Create the directory if it doesn't exist
-#             os.makedirs(os.path.dirname(self.medical_form_path), exist_ok=True)
-
-#             # Save to file
-#             with open(self.medical_form_path, "w") as f:
-#                 json.dump(save_data, f, indent=4)
-
-#             print(f"Progress saved to {self.medical_form_path}")
-
-#             # Save to database if available
-#             if has_db and self.db and self.interview_id:
-#                 try:
-#                     progress = 0
-#                     section_index = self.form_sections.index(self.current_section)
-#                     total_sections = len(self.form_sections)
-#                     progress = (section_index / total_sections) * 100
-
-#                     self.db.update_interview_form(
-#                         interview_id=self.interview_id,
-#                         form_data=self.form,
-#                         current_section=self.current_section,
-#                         progress=progress,
-#                     )
-#                     print(
-#                         f"Progress saved to database for interview {self.interview_id}"
-#                     )
-#                 except Exception as e:
-#                     print(f"Error saving progress to database: {e}")
-
-#         except Exception as e:
-#             print(f"Error saving progress: {e}")
-
-#     def talk_to_user(self, prompt_template):
-#         """
-#         Generate appropriate response based on the conversation state.
-
-#         Args:
-#             prompt_template: The prompt to use for generating the response
-
-#         Returns:
-#             Response text to present to the user
-#         """
-#         # Update conversation state
-#         self.conversation_state["attempts"] += 1
-
-#         try:
-#             # Enhance prompt to avoid making assumptions
-#             prompt = (
-#                 f"{self.system_prompt}\n\n{NO_ASSUMPTIONS_PROMPT}\n\n{prompt_template}"
-#             )
-
-#             # Add reminder about existing information
-#             prompt += f"\n\nINFORMATION I ALREADY KNOW:\n{json.dumps(self.form, indent=2)}\n\n"
-#             prompt += "Remember to ONLY use facts the patient has explicitly told you. DO NOT make any assumptions."
-
-#             # Generate response using direct LLM call
-#             response = self.llm_complete(prompt)
-
-#             # Store last question
-#             self.conversation_state["last_question"] = response
-
-#             # Update talk mode
-#             self.talk_mode = "USER"
-
-#             return response
-
-#         except Exception as e:
-#             print(f"Error generating response: {e}")
-#             # Use predefined question as fallback
-#             if self.idx < len(self.predefined_questions):
-#                 return self.predefined_questions[self.idx][1]
-#             return "Could you please tell me more about your medical condition?"
-
-#     def invalid_index(self):
-#         """
-#         Check if we've completed all sections.
-
-#         Returns:
-#             Boolean indicating if all sections are complete
-#         """
-#         return self.idx >= len(self.predefined_questions)
-
-#     def make_template(self, mode, source=None, context=None):
-#         """
-#         Create appropriate prompts based on the mode and context.
-
-#         Args:
-#             mode: The type of prompt to create ("query", "requery", "format")
-#             source: The user input text (for format mode)
-#             context: Additional context for the prompt
-
-#         Returns:
-#             Prompt text for the LLM
-#         """
-#         if mode == "query":
-#             # Generate a question based on the current section and predefined questions
-#             if self.idx < len(self.predefined_questions):
-#                 question = self.predefined_questions[self.idx][1]
-#             else:
-#                 return "Thank you for completing the medical interview."
-
-#             prompt = f"""
-#             You're a medical professional conducting an interview.
-
-#             The current section you're asking about is: {self.current_section}
-
-#             The standard question for this section is: "{question}"
-
-#             The current status of this section in the form is:
-#             {json.dumps(self.form[self.current_section], indent=2)}
-
-#             Based on what's already filled in, formulate an appropriate question that focuses on getting the missing information.
-#             If the section is completely empty, you can use the standard question.
-            
-#             IMPORTANT: Do NOT make assumptions about the patient. Only reference information they have explicitly provided.
-#             Do NOT suggest connections between symptoms and activities unless the patient has stated them.
-            
-#             Reply ONLY with the final question to ask the patient. Do not include any explanations or additional text.
-#             """
-#             return prompt
-
-#         elif mode == "requery":
-#             # Create a prompt that specifically asks for missing information
-#             missing_fields_str = ", ".join(
-#                 self.missing_fields[:3]
-#             )  # Limit to 3 fields at once
-
-#             prompt = f"""
-#             You're a medical professional conducting an interview.
-
-#             The patient hasn't provided complete information about: {missing_fields_str}
-
-#             These fields are part of the '{self.current_section}' section.
-
-#             Ask a friendly, conversational follow-up question to get this specific information.
-            
-#             IMPORTANT: Do NOT make assumptions about the patient. Only reference information they have explicitly provided.
-#             Do NOT suggest connections between symptoms and activities unless the patient has stated them.
-            
-#             Reply ONLY with the final question to ask the patient. Do not include any explanations or additional text.
-#             """
-#             return prompt
-
-#         elif mode == "format":
-#             if not source:
-#                 print("No input provided for formatting.")
-#                 return "No input provided for formatting."
-
-#             # Create a prompt for extracting structured data from user input
-#             prompt = f"""
-#             Extract medical information from the patient's response and update the appropriate fields in the form.
-
-#             PATIENT RESPONSE: {source}
-
-#             CURRENT FORM:
-#             {json.dumps(self.form, indent=2)}
-
-#             Please update the form with any relevant information from the patient's response.
-#             The response might contain information relevant to multiple sections, not just the current section ({self.current_section}).
-            
-#             IMPORTANT: Do NOT invent or assume information not explicitly stated by the patient.
-#             If uncertain about any field, leave it blank rather than guessing.
-
-#             Return the complete updated form as a valid JSON object matching the structure of the current form.
-#             Only output the JSON object without any additional explanations.
-#             """
-#             return prompt
-
-#         return source if source else "No template available."
-
-#     def main_processor(self, user_response):
-#         """
-#         Process the user's response and determine the next action.
-
-#         Args:
-#             user_response: The user's response text
-
-#         Returns:
-#             The next question or response to present to the user
-#         """
-#         try:
-#             # Check if interview is complete
-#             if self.invalid_index():
-#                 return "Thank you for completing the medical interview. All required information has been collected."
-
-#             # Initial question
-#             if self.talk_mode == "START":
-#                 # Create first question prompt
-#                 prompt_template = self.make_template(mode="query")
-#                 first_question = self.talk_to_user(prompt_template)
-#                 self.talk_mode = "USER"
-#                 return first_question
-
-#             # Process user's response
-#             elif user_response:
-#                 # Format user's response into structured data
-#                 prompt_template = self.make_template(
-#                     mode="format", source=user_response
-#                 )
-#                 # Call formatter to update the form
-#                 self.formatter(user_response, prompt_template)
-
-#                 # Validate if all fields in current section are filled
-#                 is_section_complete = self.validator()
-
-#                 if is_section_complete:
-#                     # Move to next section
-#                     self.all_ops()
-#                     self.idx += 1
-
-#                     if not self.invalid_index():
-#                         # Prepare next question
-#                         prompt_template = self.make_template(mode="query")
-#                         next_question = self.talk_to_user(prompt_template)
-#                         return f"Thank you for that information. {next_question}"
-#                     else:
-#                         # Interview complete
-#                         self.save_progress()
-
-#                         # If we have database connection, mark interview as complete
-#                         if has_db and self.db and self.interview_id:
-#                             try:
-#                                 self.db.complete_interview(
-#                                     interview_id=self.interview_id, form_data=self.form
-#                                 )
-#                                 print(
-#                                     f"Interview {self.interview_id} marked as complete in database"
-#                                 )
-#                             except Exception as e:
-#                                 print(
-#                                     f"Error marking interview as complete in database: {e}"
-#                                 )
-
-#                         return "Thank you for completing all questions. Your medical information has been recorded."
-#                 else:
-#                     # Ask for missing information
-#                     prompt_template = self.make_template(mode="requery")
-#                     follow_up_question = self.talk_to_user(prompt_template)
-#                     return follow_up_question
-
-#             # Default response if something goes wrong
-#             return (
-#                 "I'm sorry, I didn't catch that. Could you please repeat your answer?"
-#             )
-
-#         except Exception as e:
-#             print(f"Error in main_processor: {e}")
-#             # Fall back to predefined questions if there's an error
-#             if self.idx < len(self.predefined_questions):
-#                 return self.predefined_questions[self.idx][1]
-#             return (
-#                 "I apologize, there was an error. Could you please repeat your answer?"
-#             )

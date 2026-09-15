@@ -142,7 +142,7 @@ def _generate_intelligent_question(
     content_lines = [l.strip() for l in lines
                      if l.strip() and not l.strip().startswith(("THINKING:", "QUESTION:", "VISIT_CONTEXT:"))]
     if content_lines:
-        print(f"[generate] format fallback: {content_lines[0][:60]}")
+        print("[generate] Applied output-format fallback")
         return "\n".join(content_lines)
     return raw
 
