@@ -5,7 +5,7 @@ then handle the result (confirm, change, reports, etc.).
 from typing import Callable
 
 from src.graph.state import InterviewState
-from src.graph.pure_functions.summary import classify_summary_response
+from src.graph.pure_functions.summary import classify_summary_response, _fallback_summary
 from src.graph.nodes.generate import required_response_before_summary
 
 
@@ -13,15 +13,15 @@ def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
     def classify_summary_intent_node(state: InterviewState) -> dict:
         user_input = state["user_input"]
 
-        # Find the last agent summary message (contains the "Is this information correct" phrase)
-        summary_text = ""
-        for entry in reversed(state["history"]):
-            if entry.get("role") == "agent" and "Is this information correct" in entry.get("message", ""):
-                summary_text = entry["message"]
-                break
+        # Historical summaries describe the record before later corrections.
+        # Classify against current structured facts, so old key points cannot
+        # steer a subsequent correction or approval back to outdated details.
+        summary_text = _fallback_summary(state["form"])
 
         result = classify_summary_response(user_input, summary_text, llm_complete)
-        return {"summary_intent": result}
+        history = list(state["history"])
+        history.append({"role": "user", "message": user_input})
+        return {"summary_intent": result, "history": history}
 
     return classify_summary_intent_node
 

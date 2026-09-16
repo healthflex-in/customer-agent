@@ -26,6 +26,48 @@ def _load_edges_without_langgraph():
 
 
 class SummaryCorrectionFlowTests(unittest.TestCase):
+    def test_summary_classification_uses_current_facts_after_correction(self):
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+        prompts = []
+        def llm(prompt):
+            prompts.append(prompt)
+            return '{"intent": "question", "correction_text": null}'
+        state = {
+            "form": {"Pain Assessment": {"Primary Location of Pain": "Head only"}},
+            "user_input": "What have you recorded now?",
+            "history": [{"role": "agent", "message": "Key points: resolve leg and arm pain. Is this information correct?"}],
+        }
+        result = make_classify_summary_intent_node(llm)(state)
+        self.assertIn("Head only", prompts[0])
+        self.assertNotIn("resolve leg and arm pain", prompts[0])
+        self.assertEqual(result["history"][-1], {"role": "user", "message": state["user_input"]})
+
+    def test_head_correction_then_approval_requires_cleared_answer(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.pure_functions.form_extraction import detect_form_correction
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state["phase"] = "summary"
+        for fields in state["form"].values():
+            for field in fields:
+                fields[field] = "Patient provided answer"
+        state["form"]["Present Complaint"]["Primary Complaint"] = "Leg and arm pain"
+        state["form"]["Pain Assessment"]["Primary Location of Pain"] = "Leg and arm"
+        state["form"]["Pain Assessment"]["Aggravating Factors"] = "Moving my hand and leg"
+        state["form"]["Treatment Goals"]["Short-Term Goals (within 3 months)"] = "Resolve leg and arm pain"
+        state["user_input"] = "And I dont have any pain in my legs and arms. I have pain in my head only."
+        state["correction_data"] = detect_form_correction(state["user_input"], state["form"], True, lambda _: "unused")
+        update = make_apply_correction_node(lambda _: "unused")(state)
+        self.assertTrue(update["correction_applied"])
+        self.assertIn("update anything else", update["response_text"])
+        self.assertNotIn("Key points", update["response_text"])
+        self.assertEqual(self.edges.after_apply_correction({**state, **update}), "__end__")
+        corrected = {**state, **update, "summary_intent": {"intent": "confirm"}, "user_input": "ok done"}
+        approval = make_handle_summary_response_node(lambda _: "unused")(corrected)
+        self.assertEqual(approval["phase"], "interviewing")
+        self.assertNotIn("recorded", approval["response_text"])
+        self.assertIn("Aggravating Factors", approval["missing_fields"])
+        self.assertNotIn("leg", corrected["form"]["Treatment Goals"]["Short-Term Goals (within 3 months)"].lower())
+
     @classmethod
     def setUpClass(cls):
         cls.edges = _load_edges_without_langgraph()
