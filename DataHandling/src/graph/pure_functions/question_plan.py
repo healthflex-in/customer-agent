@@ -52,3 +52,12 @@ def question_for_missing_fields(
     if len(prompts) == 1:
         return prompts[0]
     return "Could you also tell me:\n" + "\n".join(f"- {prompt}" for prompt in prompts)
+
+
+def contextual_resume_question(form: dict, missing: list[tuple[str, str]], field_labels: dict[str, str]) -> str:
+    """Briefly anchor resumed questions in saved facts, without an AI recap."""
+    complaint = str(form.get("Present Complaint", {}).get("Primary Complaint", "") or "").strip()
+    introduction = "Welcome back. Your previous answers for this assessment are saved."
+    if complaint:
+        introduction += f" You previously described: {complaint}"
+    return introduction + "\n\nLet's continue with the information still needed.\n\n" + question_for_missing_fields(missing, field_labels)

@@ -76,7 +76,7 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
 
         self.assertNotIn("health_agent.generate_summary", resume_flow)
         self.assertNotIn("health_agent.talk_to_user", resume_flow)
-        self.assertIn("question_for_missing_fields", resume_flow)
+        self.assertIn("contextual_resume_question", resume_flow)
 
     def test_short_clinical_first_reply_is_not_treated_as_confirmation(self):
         source = (

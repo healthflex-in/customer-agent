@@ -2694,9 +2694,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         "Please ask your clinician to review the assessment."
                                     )
                                 else:
-                                    from src.graph.pure_functions.question_plan import question_for_missing_fields
+                                    from src.graph.pure_functions.question_plan import contextual_resume_question
                                     from src.forms.loader import load_form as _load_resume_form
-                                    resume_message = question_for_missing_fields(
+                                    resume_message = contextual_resume_question(
+                                        form_data,
                                         _required_missing,
                                         _load_resume_form("FRM-01").field_labels,
                                     )

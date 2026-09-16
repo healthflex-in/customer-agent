@@ -13,6 +13,17 @@ from src.graph.pure_functions.form_validation import (
 
 
 class RequiredIntakeCoverageTests(unittest.TestCase):
+    def test_resume_anchors_question_in_saved_complaint_without_reasking_it(self):
+        from src.graph.pure_functions.question_plan import contextual_resume_question
+        form = {"Present Complaint": {"Primary Complaint": "Right knee pain", "Onset (Gradual or Sudden)": "Sudden"}}
+        missing = [("Present Complaint", "Duration of the Issue")]
+        response = contextual_resume_question(form, missing, {})
+        self.assertIn("Welcome back", response)
+        self.assertIn("Right knee pain", response)
+        self.assertIn("How long", response)
+        self.assertNotIn("Did it start", response)
+        self.assertNotIn("Is this information correct", response)
+
     def setUp(self):
         self.definition = load_form("FRM-01")
 
