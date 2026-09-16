@@ -61,6 +61,7 @@ from app.config import (
     REPORT_JOB_MAX_BACKLOG,
     REPORT_JOB_RETRY_BASE_SECONDS,
     REPORT_JOB_RETRY_MAX_SECONDS,
+    GEMINI_REQUEST_TIMEOUT_MS,
     UPLOAD_TRIGGER_PHRASE,
 )
 from app.db.connection import create_verified_mongo_client
@@ -93,6 +94,8 @@ from app.forms.lifecycle import (
     COMPLETED as FORM_COMPLETED,
     build_lifecycle_update_filter,
     ensure_form_lifecycle_ttl_index,
+    has_meaningful_form_data,
+    is_completed_form,
     resolve_form_lifecycle,
 )
 from app.forms.attempts import (
@@ -112,6 +115,7 @@ from app.clinical.escalation import (
     ensure_escalation_indexes,
     record_escalation,
 )
+from app.clinical.scope import assess_msk_intake_scope
 from app.ws.idempotency import RecentRequestWindow, RequestDecision
 from app.observability.privacy import env_flag, error_type, pseudonymous_id
 # Pure stateless helpers. Aliased to legacy names used throughout this file.
@@ -434,7 +438,17 @@ try:
             try:
                 from google import genai as _genai_r
                 from google.genai import types as _genai_r_types
-                _r_client = _genai_r.Client(api_key=_api_key)
+                # The extraction request runs in parallel with question
+                # generation.  Bound its network wait so one unavailable
+                # provider connection cannot keep a patient response pending
+                # forever; reasoning_extract then falls back to the normal
+                # interview model's extraction path.
+                _r_client = _genai_r.Client(
+                    api_key=_api_key,
+                    http_options=_genai_r_types.HttpOptions(
+                        timeout=GEMINI_REQUEST_TIMEOUT_MS,
+                    ),
+                )
                 _r_model_name = MODEL_REGISTRY.reasoning
                 _r_gen_config = _genai_r_types.GenerateContentConfig(
                     temperature=0.1,
@@ -1533,19 +1547,18 @@ def fetch_form_attachments(
 def create_placeholder_form(
     user_id: str,
     client_state: dict,
-    force_new: bool = False,
+    preferred_attempt_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Return the form_id for this user WITHOUT creating a MongoDB document.
+    """Resolve or durably reserve the first intake attempt for a patient.
 
-    We no longer eagerly insert empty 'New Form' documents — that was creating
-    one empty doc per connected user, polluting the collection. Instead we just
-    assign the well-known DEFAULT_FORM_ID to client_state. The actual MongoDB
-    document is created (via upsert) only when the first real data is saved.
-    On ordinary connection, the latest attempt is resumed. ``force_new=True``
-    assigns a fresh attempt without writing an empty MongoDB document.
+    A newly allocated identity is persisted as an empty ``draft`` immediately.
+    Draft TTL cleanup prevents abandoned reservations from accumulating, while
+    persistence guarantees that a browser refresh can safely resume the same
+    attempt. Repeat intakes are still never allocated here; they must be
+    assigned by the consultant workflow.
     """
     # Check if a form already exists — if so, reuse its exact attempt.
-    existing = None if force_new else fetch_latest_form_for_user(user_id)
+    existing = None if preferred_attempt_id else fetch_latest_form_for_user(user_id)
     if existing:
         existing_id = existing.get("formId", DEFAULT_FORM_ID)
         client_state["form_id"] = existing_id
@@ -1553,15 +1566,27 @@ def create_placeholder_form(
         print("[create_placeholder_form] Reusing existing form")
         return existing_id
 
-    # No existing form, or an explicit new intake: allocate an attempt ID
-    # without writing a placeholder document.
-    # The document will be created when the first interview answer is saved.
+    # No existing form: allocate (or recover) the first attempt and persist an
+    # expiring draft so the identity remains valid across reloads.
     client_state["form_id"] = DEFAULT_FORM_ID
-    client_state["attempt_id"] = resolve_form_attempt_id(
-        existing,
-        force_new=force_new,
+    client_state["attempt_id"] = (
+        str(preferred_attempt_id).strip()
+        if preferred_attempt_id
+        else resolve_form_attempt_id(existing)
     )
-    print("[create_placeholder_form] Assigned default form type; no database write")
+    if not client_state["attempt_id"]:
+        raise ValueError("Attempt ID cannot be empty")
+
+    saved_form_id = save_customer_info(
+        user_id=user_id,
+        form_data={},
+        current_section="Present Complaint",
+        form_id=DEFAULT_FORM_ID,
+        attempt_id=client_state["attempt_id"],
+    )
+    if not saved_form_id:
+        raise RuntimeError("Unable to reserve the new assessment attempt")
+    print("[create_placeholder_form] Persisted expiring draft attempt")
     return DEFAULT_FORM_ID
 
 
@@ -1879,6 +1904,58 @@ async def send_text_message(
     await websocket.send_text(json.dumps(payload))
 
 
+COMPLETED_FORM_MESSAGE = (
+    "This assessment has already been completed and is now read-only. "
+    "If another assessment is needed, your clinician will send you a new assessment link."
+)
+
+
+def build_completed_form_payload(client_state: dict, form: dict) -> dict:
+    """Build the deterministic, zero-AI response for a terminal attempt."""
+
+    form_id = form.get("formId") or client_state.get("form_id")
+    attempt_id = form.get("attemptId") or client_state.get("attempt_id")
+    return {
+        "type": "form_completed",
+        "text": COMPLETED_FORM_MESSAGE,
+        "session_id": client_state["session_id"],
+        "formId": form_id,
+        "attemptId": attempt_id,
+        "status": FORM_COMPLETED,
+        "completedAt": _serialize_datetime(form.get("completedAt")),
+        "interview_state": {
+            "section": "Completed",
+            "progress": 100.0,
+            "missing_fields": [],
+            "attachments": [],
+            "formId": form_id,
+            "attemptId": attempt_id,
+            "sectionProgress": [],
+            "promSteps": None,
+            "status": FORM_COMPLETED,
+            "locked": True,
+        },
+    }
+
+
+async def send_completed_form(websocket: WebSocket, client_state: dict, form: dict) -> None:
+    """Lock a completed attempt in-session and notify the patient without AI."""
+
+    client_state["form_id"] = form.get("formId") or client_state.get("form_id")
+    client_state["attempt_id"] = form.get("attemptId") or client_state.get("attempt_id")
+    client_state["attempt_locked"] = True
+    client_state["locked_form"] = {
+        "formId": client_state.get("form_id"),
+        "attemptId": client_state.get("attempt_id"),
+        "status": FORM_COMPLETED,
+        "completedAt": form.get("completedAt"),
+    }
+    client_state["is_recording"] = False
+    client_state["received_audio_buffer"].clear()
+    client_state["recording_start_time"] = None
+    await websocket.send_text(json.dumps(build_completed_form_payload(client_state, form)))
+
+
 def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, agent=None):
     """
     Reset the per-connection HealthAgent for a new interview.
@@ -1984,6 +2061,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         "interview_id": None,
         "form_id": None,
         "attempt_id": None,
+        # Terminal attempts are read-only. This server-side flag blocks text,
+        # audio, end-session saves, and patient-created replacement attempts.
+        "attempt_locked": False,
+        "locked_form": None,
         "prom_snapshot": None,
         "prom_source_doc_id": None,
         "first_interaction": True,
@@ -2043,12 +2124,42 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     data = json.loads(message["text"])
                     msg_type = data.get("type", "")
 
+                    # A completed attempt remains read-only even if an outdated
+                    # or modified client tries to send input after receiving the
+                    # lock response. Starting/loading a clinician-assigned attempt
+                    # remains possible on the same socket.
+                    if (
+                        client_state.get("attempt_locked")
+                        and msg_type not in {"start_interview", "load_form"}
+                    ):
+                        await send_completed_form(
+                            websocket,
+                            client_state,
+                            client_state.get("locked_form") or {},
+                        )
+                        continue
+
                     if msg_type == "start_interview":
                         # Client is ready to start the interview (after login or page reload)
-                        from src.prompts import WELCOME_PROMPT, READY_TO_START_PROMPT
+                        from src.prompts import (
+                            INITIAL_INTAKE_PROMPT,
+                        )
 
                         # Get user_id from the message if provided
                         provided_user_id = data.get("userId")
+                        # Both automatic startup and the UI retry can arrive on
+                        # the same socket. A successful startup is emitted once;
+                        # a new socket has fresh client_state and can resume.
+                        if (
+                            client_state.get("startup_sent")
+                            and provided_user_id == client_state.get("user_id")
+                            and (data.get("formId") or DEFAULT_FORM_ID) == client_state.get("form_id")
+                            and (
+                                not data.get("attemptId")
+                                or data.get("attemptId") == client_state.get("attempt_id")
+                            )
+                        ):
+                            continue
                         if not provided_user_id:
                             # Frontend must always send a real application user ID.
                             # Without it, we cannot safely tie forms/attachments to users.
@@ -2086,11 +2197,38 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         client_state["form_id"] = provided_form_id
                         provided_attempt_id = data.get("attemptId")
                         client_state["attempt_id"] = provided_attempt_id
+                        client_state["attempt_locked"] = False
+                        client_state["locked_form"] = None
                         client_state["prom_snapshot"] = None
                         client_state["prom_source_doc_id"] = None
                         # Initialize form_data early so it's always defined regardless of
                         # resume vs new-interview path (avoids UnboundLocalError).
                         form_data = {}
+
+                        # Resolve and lock a terminal attempt before loading PROM
+                        # definitions, personalizing questions, generating a summary,
+                        # or making any other billable AI/provider call. With no
+                        # attemptId, this resolves the latest attempt for this exact
+                        # patient + form template. A clinician-assigned draft therefore
+                        # resumes, while a completed latest attempt remains locked.
+                        _start_existing_form = await run_blocking(
+                            fetch_form_by_id,
+                            provided_form_id,
+                            provided_user_id,
+                            provided_attempt_id,
+                        )
+                        if is_completed_form(_start_existing_form):
+                            _log.info(
+                                "completed_form_reopen_blocked",
+                                subject=pseudonymous_id(provided_user_id),
+                                form_id=provided_form_id,
+                            )
+                            await send_completed_form(
+                                websocket,
+                                client_state,
+                                _start_existing_form,
+                            )
+                            continue
 
                         # Fetch tagged questions + build PROM form template
                         # Only for non-default forms (FRM-02+); FRM-01 always uses the standard intake flow
@@ -2363,30 +2501,31 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             existing_form = None
                             print("[start_interview] PROM mode starting fresh")
                         else:
-                            existing_form = (
-                                await run_blocking(
-                                    fetch_form_by_id,
-                                    provided_form_id,
-                                    provided_user_id,
-                                    provided_attempt_id,
-                                )
-                                if provided_attempt_id
-                                else await run_blocking(
-                                    fetch_latest_form_for_user,
-                                    provided_user_id,
-                                )
-                            )
+                            existing_form = _start_existing_form
 
                         if provided_attempt_id and not existing_form:
-                            await websocket.send_text(
-                                json.dumps(
-                                    {
-                                        "type": "error",
-                                        "message": "The requested form attempt was not found.",
-                                    }
-                                )
+                            # Recover IDs generated by the old frontend but not
+                            # persisted by the old backend, only for a patient's
+                            # first-ever form. If any form already exists, an unknown
+                            # attempt remains invalid and cannot bypass consultant
+                            # assignment or completed-form locking.
+                            _any_existing_attempt = await run_blocking(
+                                fetch_form_by_id,
+                                provided_form_id,
+                                provided_user_id,
+                                None,
                             )
-                            continue
+                            if _any_existing_attempt:
+                                await websocket.send_text(
+                                    json.dumps(
+                                        {
+                                            "type": "error",
+                                            "code": "ATTEMPT_NOT_FOUND",
+                                            "message": "The requested form attempt was not found.",
+                                        }
+                                    )
+                                )
+                                continue
 
                         # Check if user already has a form (resume mode)
                         if existing_form:
@@ -2431,7 +2570,49 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 # Load the form data — store ONLY in client_state, NEVER in
                                 # health_agent.form (global singleton, shared across all users).
                                 form_data = existing_form.get("form_data", {})
+                                if provided_form_id == DEFAULT_FORM_ID:
+                                    from src.forms.loader import load_form as _load_resume_form
+                                    _resume_template = _load_resume_form("FRM-01").empty_form()
+                                    for _section, _fields in _resume_template.items():
+                                        _stored_fields = form_data.get(_section, {})
+                                        if isinstance(_stored_fields, dict):
+                                            _fields.update(_stored_fields)
+                                    form_data = _resume_template
                                 current_section = existing_form.get("current_section", "Present Complaint")
+
+                                # Legacy drafts may have been populated by the old
+                                # free-form flow before the MSK scope boundary
+                                # existed. Validate saved content before showing a
+                                # welcome, summary, or next MSK question; otherwise
+                                # a fever/cold draft can be re-presented as an MSK
+                                # interview after every reconnect.
+                                _saved_patient_content = "\n".join(
+                                    str(value)
+                                    for section in form_data.values()
+                                    if isinstance(section, dict)
+                                    for value in section.values()
+                                    if value and str(value).strip()
+                                )
+                                _saved_scope = assess_msk_intake_scope(_saved_patient_content)
+                                if _saved_scope is not None:
+                                    _log.info(
+                                        "stored_form_scope_redirected",
+                                        subject=pseudonymous_id(provided_user_id),
+                                        category=_saved_scope.category,
+                                        policy_version=_saved_scope.policy_version,
+                                    )
+                                    await websocket.send_text(json.dumps({
+                                        "type": "clinical_escalation",
+                                        "text": _saved_scope.patient_message,
+                                        "category": _saved_scope.category,
+                                        "severity": "non_emergency",
+                                        "policyVersion": _saved_scope.policy_version,
+                                        "stopInterview": _saved_scope.stop_interview,
+                                    }))
+                                    await websocket.close(
+                                        code=4003, reason="Outside MSK intake scope"
+                                    )
+                                    break
 
                                 # Validate sections using the stateless LangGraph helper
                                 # (takes form as a parameter — no global state risk).
@@ -2470,15 +2651,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                                 _resume_section = first_incomplete()
 
-                                # Set health_agent ONLY to enable talk_to_user/generate_summary below.
-                                # These assignments happen atomically just before use — minimising
-                                # the window where another concurrent user can overwrite them.
-                                # health_agent is still a global, but this is the only place we write it.
-                                health_agent.form = form_data
-                                health_agent.current_section = _resume_section
-                                health_agent.idx = _resume_idx
-                                health_agent.talk_mode = "USER"
-
                                 # Always resume into interviewing phase so the graph never
                                 # re-runs the welcome/first-turn logic on reconnect.
                                 if client_state.get("graph_phase") is not None:
@@ -2490,54 +2662,43 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 # for any key that is None — without these lines every redeploy
                                 # wipes the patient's data on their first message.
                                 client_state["graph_form"] = form_data
-                                client_state["graph_current_section"] = health_agent.current_section
+                                client_state["graph_current_section"] = _resume_section
 
                                 # Derive the correct question_round from section completion so the
                                 # graph asks questions at the right depth (not restarting from round 0).
-                                _idx = health_agent.idx  # 0/1/2/3 set just above
+                                _idx = _resume_idx
                                 client_state["graph_question_round"] = _idx if _idx < 3 else 2
+                                client_state["graph_referral_asked"] = referral_complete
 
                                 # Derive the ordered form_sections list
                                 from src.prompts import get_medical_form_template as _get_tmpl
                                 client_state["graph_form_sections"] = list(_get_tmpl().keys())
 
+                                print(f"[start_interview] Loaded form at section index {_resume_idx}")
 
-                                print(f"[start_interview] Loaded form at section index {health_agent.idx}")
-                                
-                                # Decide whether we have enough information to show a full summary
-                                filled_field_count = 0
-                                for section, fields in form_data.items():
-                                    if isinstance(fields, dict):
-                                        for _, value in fields.items():
-                                            if value and str(value).strip():
-                                                filled_field_count += 1
-
-                                summary_text = None
-                                MIN_FIELDS_FOR_SUMMARY = 5  # require a bit of data before showing a full summary
-
-                                if filled_field_count >= MIN_FIELDS_FOR_SUMMARY:
-                                    # Generate a summary of information collected so far
-                                    try:
-                                        summary_text = await run_blocking(
-                                            health_agent.generate_summary
-                                        )
-                                    except Exception as e:
-                                        print(f"[start_interview] Resume summary failed: {error_type(e)}")
-                                        summary_text = None
-
-
-                                # Build resume message + next question to ask immediately.
-                                from src.prompts import PREDEFINED_QUESTIONS
-                                if summary_text:
+                                # Resume must be deterministic. Do not call the
+                                # legacy HealthAgent summary/question path here:
+                                # it can invent facts and duplicate a summary on
+                                # every reconnect. Use the same required-field
+                                # plan as a live LangGraph turn.
+                                _required_missing = [
+                                    (section, field)
+                                    for section in client_state["graph_form_sections"]
+                                    for field in _vs(form_data, section)
+                                ]
+                                if not _saved_patient_content:
+                                    resume_message = INITIAL_INTAKE_PROMPT
+                                elif not _required_missing:
                                     resume_message = (
-                                        "Welcome back! Here's a quick summary of what I've noted so far:\n\n"
-                                        f"{summary_text}\n\n"
-                                        "Let's continue from where we left off."
+                                        "All required answers for this assessment are already saved. "
+                                        "Please ask your clinician to review the assessment."
                                     )
                                 else:
-                                    resume_message = (
-                                        "Welcome back. We haven't collected much information yet — "
-                                        "let's continue right away."
+                                    from src.graph.pure_functions.question_plan import question_for_missing_fields
+                                    from src.forms.loader import load_form as _load_resume_form
+                                    resume_message = question_for_missing_fields(
+                                        _required_missing,
+                                        _load_resume_form("FRM-01").field_labels,
                                     )
 
                                 await send_text_message(
@@ -2547,36 +2708,20 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     await build_interview_state_async(client_state),
                                     user_response=None
                                 )
+                                client_state["startup_sent"] = True
 
-                                # Send the next question immediately so the user sees what to answer.
-                                # If tagged turns exist, use the first turn; otherwise use standard flow.
-                                from src.prompts import PREDEFINED_QUESTIONS
-                                _tagged_turns = client_state.get("tagged_turns")
-                                if _tagged_turns:
-                                    next_q_text = _tagged_turns[0]
-                                    client_state["tagged_turn_index"] = 1
-                                elif filled_field_count < 3:
-                                    # Too little data — ask the comprehensive opening question
-                                    next_q_text = PREDEFINED_QUESTIONS[0][1]
-                                else:
-                                    try:
-                                        prompt_template = health_agent.make_template(mode="query")
-                                        next_q_text = await run_blocking(
-                                            health_agent.talk_to_user,
-                                            prompt_template,
-                                        )
-                                    except Exception as _qe:
-                                        print(f"[start_interview] Could not generate next question: {_qe}")
-                                        next_q_text = PREDEFINED_QUESTIONS[0][1]
-
-                                await send_text_message(
-                                    websocket,
-                                    client_state,
-                                    next_q_text,
-                                    await build_interview_state_async(client_state),
-                                    user_response=None
-                                )
-
+                                # Keep graph history/phase aligned with messages
+                                # emitted by this resume path outside LangGraph.
+                                client_state["graph_history"] = [
+                                    {"role": "agent", "message": resume_message}
+                                ]
+                                if not _saved_patient_content and not client_state.get("tagged_turns"):
+                                    # This reserved-but-empty attempt is clinically
+                                    # a brand-new FRM-01 interview.  The one opening
+                                    # question above is all the patient should see;
+                                    # their reply goes through normal extraction.
+                                    client_state["graph_phase"] = "interviewing"
+                                    continue
                                 continue
                             else:
                                 print("[start_interview] Requested form not found; starting a new interview")
@@ -2611,6 +2756,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     create_placeholder_form,
                                     client_state["user_id"],
                                     client_state,
+                                    provided_attempt_id,
                                 )
                             else:
                                 form_id = provided_form_id
@@ -2640,23 +2786,18 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     else:
                                         print("[start_interview] ERROR: placeholder contains existing data")
 
-                            # CRITICAL: Ensure health_agent.form is still empty before proceeding
-                            # Check if health_agent.form has been contaminated after placeholder creation
-                            form_has_data = False
-                            for section, fields in form_data.items():
-                                if isinstance(fields, dict):
-                                    for field, value in fields.items():
-                                        if value and str(value).strip():
-                                            form_has_data = True
-                            print(f"[start_interview] WARNING: agent state contains data at {section}.{field}")
-                            
+                            # A brand-new attempt legitimately has an empty dict.
+                            # Do not reference loop variables after scanning it:
+                            # they do not exist when the dict is empty, which used
+                            # to abort startup before welcome/question delivery.
+                            form_has_data = has_meaningful_form_data(form_data)
                             if form_has_data:
-                                print(f"[start_interview] CRITICAL: health_agent.form was contaminated! Resetting again...")
+                                print("[start_interview] Agent form contained unexpected data; resetting")
                                 health_agent.init_form()
 
-                        # For new interviews: send a warm welcome, then immediately
-                        # follow with the comprehensive first question.
-                        from src.prompts import PREDEFINED_QUESTIONS, WELCOME_PROMPT
+                        # For a new FRM-01 interview, send one open question only.
+                        # PROM forms retain their assessment-specific introduction
+                        # and first structured question.
                         _tagged_turns = client_state.get("tagged_turns")
                         _tagged_turn_metas = client_state.get("tagged_turn_metas") or []
                         # All PROM scales already answered → show completion, don't fall through to FRM-01
@@ -2689,9 +2830,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 user_response=None,
                             )
                             continue
-                        else:
-                            first_question = PREDEFINED_QUESTIONS[0][1]
-                            _first_q_meta = None
                         if client_state.get("graph_phase") is not None:
                             client_state["graph_phase"] = "interviewing"
 
@@ -2706,7 +2844,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 "Please answer as honestly as you can — there are no right or wrong answers."
                             )
                         else:
-                            _welcome_text = WELCOME_PROMPT.strip()
+                            _welcome_text = INITIAL_INTAKE_PROMPT
+                            client_state["graph_history"] = [
+                                {"role": "agent", "message": _welcome_text}
+                            ]
                         await send_text_message(
                             websocket,
                             client_state,
@@ -2717,121 +2858,35 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             user_response=None
                         )
 
-                        # First question immediately after
-                        await send_text_message(
-                            websocket,
-                            client_state,
-                            first_question,
-                            await build_interview_state_async(
-                                client_state, progress_override=progress, use_db_form=True
-                            ),
-                            user_response=None,
-                            question_meta=_first_q_meta,
-                        )
+                        client_state["startup_sent"] = True
+                        if _tagged_turns:
+                            # PROM assessments are already clinician-selected and
+                            # can show their first structured question immediately.
+                            await send_text_message(
+                                websocket,
+                                client_state,
+                                first_question,
+                                await build_interview_state_async(
+                                    client_state, progress_override=progress, use_db_form=True
+                                ),
+                                user_response=None,
+                                question_meta=_first_q_meta,
+                            )
 
                     elif msg_type == "start_new_form":
-                        # User wants to start a new form
-                        from src.prompts import WELCOME_PROMPT, READY_TO_START_PROMPT
-                        
-                        # Ensure we have a valid user_id (may be provided in this message)
-                        provided_user_id = data.get("userId")
-                        target_user_id = client_state.get("user_id") or provided_user_id
-
-                        if target_user_id is None:
-                            await websocket.send_text(
-                                json.dumps(
-                                    {
-                                        "type": "error",
-                                        "message": "Cannot start new form without a userId. Please log in again.",
-                                    }
-                                )
-                            )
-                            continue
-
-                        if client_state.get("user_id") is None:
-                            client_state["user_id"] = target_user_id
-                            print("[start_new_form] Associated user with session")
-
-                        # Clear the old form_id from client_state to ensure a fresh start
-                        client_state["form_id"] = None
-                        client_state["attempt_id"] = None
-                        
-                        # Reset the health agent for a new form (this clears form data)
-                        reset_health_agent_for_new_interview(client_state, client_state["user_id"], agent=health_agent)
-                        health_agent.talk_mode = "START"
-                        
-                        # Create a new placeholder form with fresh form_id
-                        new_form_id = await run_blocking(
-                            create_placeholder_form,
-                            client_state["user_id"],
-                            client_state,
-                            True,
-                        )
-                        client_state["tagged_turns"] = None
-                        client_state["tagged_turn_metas"] = None
-                        client_state["tagged_turn_index"] = 0
-                        client_state["tagged_form_template"] = None
-                        client_state["prom_existing_data"] = {}
-                        client_state["prom_snapshot"] = None
-                        client_state["prom_source_doc_id"] = None
-                        if _interview_graph is not None and new_form_id:
-                            init_graph_state_in_client(
-                                client_state,
-                                user_id=client_state["user_id"],
-                                form_id=new_form_id,
-                            )
-                            client_state["graph_phase"] = "welcome"
-                        
-                        print("[start_new_form] Form state reset requested")
-                        print(f"[start_new_form] health_agent.form after reset - keys: {list(health_agent.form.keys())}")
-                        
-                        # Verify the new form is empty
-                        if new_form_id:
-                            form_check = await run_blocking(
-                                fetch_form_by_id,
-                                new_form_id,
-                                client_state["user_id"],
-                                client_state.get("attempt_id"),
-                            )
-                            if form_check:
-                                form_data_check = form_check.get("form_data", {})
-                                has_data = any(
-                                    v and str(v).strip() if not isinstance(v, dict) 
-                                    else any(val and str(val).strip() for val in v.values())
-                                    for v in form_data_check.values()
-                                )
-                                if has_data:
-                                    print("[start_new_form] ERROR: new form state contains data")
-                                else:
-                                    print("[start_new_form] New form state verified empty")
-                        
-                        welcome_text = WELCOME_PROMPT.strip()
-                        welcome_text += "\n\n" + READY_TO_START_PROMPT.strip()
-                        
-                        # Use database form for progress (should be 0% for new empty form)
-                        if new_form_id:
-                            form_from_db = await run_blocking(
-                                fetch_form_by_id,
-                                new_form_id,
-                                client_state["user_id"],
-                                client_state.get("attempt_id"),
-                            )
-                            if form_from_db and form_from_db.get("form_data"):
-                                progress = calculate_form_progress(form_from_db["form_data"])
-                            else:
-                                progress = calculate_form_progress(health_agent.form)
-                        else:
-                            progress = calculate_form_progress(health_agent.form)
-                        
-                        await send_text_message(
-                            websocket,
-                            client_state,
-                            welcome_text,
-                            await build_interview_state_async(
-                                client_state, progress_override=progress
+                        # The public patient socket must never allocate a new
+                        # assessment. A consultant/dashboard assignment creates
+                        # the attempt first; the patient can then open that exact
+                        # attempt through start_interview.
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "text": (
+                                "A new assessment must be assigned by your clinician. "
+                                "Please use the new assessment link they provide."
                             ),
-                            user_response=None
-                        )
+                            "code": "CLINICIAN_ASSIGNMENT_REQUIRED",
+                        }))
+                        continue
 
                     elif msg_type == "load_form":
                         # User wants to load an existing form
@@ -2948,6 +3003,22 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             print("[load_form] Security check failed: form ownership mismatch")
                             continue
+
+                        # Loading a completed record is a read-only operation. Do
+                        # not hydrate it into the interview agent or regenerate a
+                        # summary, because either action would reopen the terminal
+                        # attempt and incur unnecessary AI usage.
+                        if is_completed_form(form):
+                            _log.info(
+                                "completed_form_load_blocked",
+                                subject=pseudonymous_id(current_user_id),
+                                form_id=form_id,
+                            )
+                            await send_completed_form(websocket, client_state, form)
+                            continue
+
+                        client_state["attempt_locked"] = False
+                        client_state["locked_form"] = None
                         
                         # CRITICAL: Initialize/reset health_agent BEFORE loading form data to prevent data leakage
                         # This ensures no previous user's data contaminates this form load
@@ -3268,6 +3339,32 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 "stopInterview": _escalation.stop_interview,
                             }))
                             await websocket.close(code=4003, reason="Clinical escalation")
+                            break
+
+                        # Scope boundary: a clear non-MSK presentation must not
+                        # be extracted into the MSK form or summarized as an MSK
+                        # assessment.  This comes after urgent-risk detection so
+                        # emergency handling always takes priority.
+                        _scope_decision = assess_msk_intake_scope(text_input)
+                        if _scope_decision is not None:
+                            _log.info(
+                                "clinical_scope_redirected",
+                                subject=pseudonymous_id(client_state.get("user_id")),
+                                category=_scope_decision.category,
+                                policy_version=_scope_decision.policy_version,
+                            )
+                            await websocket.send_text(json.dumps({
+                                # Reuse the established frontend safety-message
+                                # contract. The category distinguishes this
+                                # non-emergency redirect from urgent escalation.
+                                "type": "clinical_escalation",
+                                "text": _scope_decision.patient_message,
+                                "category": _scope_decision.category,
+                                "severity": "non_emergency",
+                                "policyVersion": _scope_decision.policy_version,
+                                "stopInterview": _scope_decision.stop_interview,
+                            }))
+                            await websocket.close(code=4003, reason="Outside MSK intake scope")
                             break
 
                         # ── Off-topic question shortcut — answer WITHOUT touching the graph ──
@@ -4483,6 +4580,15 @@ async def upload_form_attachment(
         raise HTTPException(
             status_code=403,
             detail="Form does not belong to this user.",
+        )
+
+    if is_completed_form(form):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This assessment has already been completed and is read-only. "
+                "A clinician must assign a new assessment before additional files can be uploaded."
+            ),
         )
 
     if not files:

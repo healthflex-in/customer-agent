@@ -80,13 +80,84 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
         self.assertIn("exact change", patch["response_text"])
         self.assertEqual(self.edges.after_apply_correction(routed_state), "__end__")
 
-    def test_successful_summary_correction_regenerates_summary(self):
+    def test_successful_summary_correction_confirms_change_without_full_summary(self):
         self.assertEqual(
             self.edges.after_apply_correction(
                 {"correction_applied": True, "phase": "summary"}
             ),
-            "generate_summary",
+            "__end__",
         )
+
+    def test_done_after_correction_confirms_without_llm(self):
+        def unexpected_llm_call(_prompt):
+            self.fail("A clear final approval must not call the LLM")
+
+        result = classify_summary_response("ok done", "summary", unexpected_llm_call)
+        self.assertEqual(result["intent"], "confirm")
+
+    def test_pain_location_correction_reconciles_dependent_fields(self):
+        from src.graph.pure_functions.form_extraction import detect_form_correction
+
+        form = {
+            "Present Complaint": {
+                "Primary Complaint": "Pain in leg and arm",
+                "Mechanism of Injury or Cause": "Unknown",
+            },
+            "Pain Assessment": {
+                "Primary Location of Pain": "Leg and arm",
+                "Severity (1-10)": "6",
+                "Aggravating Factors": "Moving my hand and leg makes it worse",
+                "Relieving Factors": "Rest helps",
+            },
+            "Treatment Goals": {
+                "Short-Term Goals (within 3 months)": "Resolve pain in leg and arm",
+                "Long-Term Goals (after 3 months)": "Return to normal activity",
+                "Specific Expectations from Treatment": "Treat leg and arm pain",
+            },
+        }
+
+        def unexpected_llm_call(_prompt):
+            self.fail("The explicit pain-location correction must be deterministic")
+
+        correction = detect_form_correction(
+            "I don't have any pain in my legs and arms. I have pain in my head only.",
+            form,
+            is_summary_mode=True,
+            llm_complete=unexpected_llm_call,
+        )
+        updated, success, message = apply_form_correction(
+            correction, form, unexpected_llm_call
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(
+            updated["Pain Assessment"]["Primary Location of Pain"], "Head only"
+        )
+        self.assertEqual(updated["Pain Assessment"]["Aggravating Factors"], "")
+        self.assertEqual(
+            updated["Present Complaint"]["Primary Complaint"], "Pain in head only"
+        )
+        self.assertNotIn(
+            "leg",
+            updated["Treatment Goals"]["Short-Term Goals (within 3 months)"].lower(),
+        )
+        self.assertNotIn(
+            "arm",
+            updated["Treatment Goals"]["Specific Expectations from Treatment"].lower(),
+        )
+        self.assertIn("update anything else", message)
+
+    def test_pain_location_replacement_routes_as_correction_without_llm(self):
+        def unexpected_llm_call(_prompt):
+            self.fail("Explicit old/new pain locations must not call the LLM")
+
+        text = (
+            "I don't have any pain in my legs and arms. "
+            "I have pain in my head only."
+        )
+        intent = classify_summary_response(text, "summary", unexpected_llm_call)
+        self.assertEqual(intent["intent"], "request_change")
+        self.assertEqual(intent["correction_text"], text)
 
     def test_application_changes_only_the_identified_field(self):
         original = {

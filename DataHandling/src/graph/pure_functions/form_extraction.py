@@ -290,6 +290,29 @@ def detect_form_correction(
     Returns correction dict or None.
     Extracted from HealthAgent.detect_correction().
     """
+    if is_summary_mode:
+        from src.graph.pure_functions.correction_consistency import (
+            detect_pain_location_correction,
+        )
+        from src.graph.pure_functions.referral import normalize_referral_source
+
+        pain_location_correction = detect_pain_location_correction(user_input, form)
+        if pain_location_correction:
+            return pain_location_correction
+
+        referral_source = normalize_referral_source(user_input)
+        if referral_source:
+            return {
+                "is_correction": True,
+                "confidence": "high",
+                "old_value": form.get("Referral", {}).get("Source", ""),
+                "new_value": referral_source,
+                "field_name": "Source",
+                "section_name": "Referral",
+                "needs_clarification": False,
+                "clarification_question": "",
+            }
+
     try:
         if is_summary_mode:
             prompt = f"""The user is reviewing their medical form summary and wants to make changes.
@@ -323,6 +346,7 @@ Respond with a JSON object:
             return None
         data = json.loads(json_str)
         if data.get("is_correction", False):
+            data["source_text"] = user_input
             return data
         return None
     except Exception as e:
@@ -367,5 +391,23 @@ def apply_form_correction(
     # form could alter unrelated clinical information.
     old_value = updated_form[section_name][field_name]
     updated_form[section_name][field_name] = new_value
-    msg = f"I've updated '{field_name}' from '{old_value or '(empty)'}' to '{new_value}'."
+
+    from src.graph.pure_functions.correction_consistency import (
+        reconcile_pain_location_dependencies,
+    )
+
+    updated_form, related_changes = reconcile_pain_location_dependencies(
+        updated_form, correction_data
+    )
+    msg = f"I've updated {field_name} to '{new_value}'."
+    if related_changes:
+        if len(related_changes) == 1:
+            related_text = related_changes[0]
+        else:
+            related_text = ", ".join(related_changes[:-1]) + f", and {related_changes[-1]}"
+        msg += f" I also {related_text} so the record stays consistent."
+    msg += (
+        " Would you like to update anything else? If everything is correct, "
+        "reply 'done' or 'yes' to confirm."
+    )
     return updated_form, True, msg

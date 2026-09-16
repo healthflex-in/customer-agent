@@ -9,6 +9,7 @@ from app.forms.lifecycle import (
     build_lifecycle_update_filter,
     ensure_form_lifecycle_ttl_index,
     has_meaningful_form_data,
+    is_completed_form,
     resolve_form_lifecycle,
 )
 
@@ -83,14 +84,19 @@ class FormLifecycleTests(unittest.TestCase):
             {"_id": "document-1", "status": {"$ne": COMPLETED}},
         )
 
-    def test_explicit_completion_can_update_the_terminal_snapshot(self):
+    def test_duplicate_completion_cannot_update_the_terminal_snapshot(self):
         self.assertEqual(
             build_lifecycle_update_filter(
                 "document-1",
                 requested_status=COMPLETED,
             ),
-            {"_id": "document-1"},
+            {"_id": "document-1", "status": {"$ne": COMPLETED}},
         )
+
+    def test_completed_form_detection_uses_persisted_status(self):
+        self.assertTrue(is_completed_form({"status": COMPLETED}))
+        self.assertFalse(is_completed_form({"status": IN_PROGRESS}))
+        self.assertFalse(is_completed_form(None))
 
     def test_rejects_invalid_status_and_ttl(self):
         with self.assertRaises(ValueError):

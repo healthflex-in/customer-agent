@@ -87,6 +87,43 @@ def classify_summary_response(
     """
     normalized = re.sub(r"[^a-z0-9\s]", " ", user_input.lower())
     normalized = " ".join(normalized.split())
+
+    if normalized in {
+        "yes", "correct", "looks good", "that is right", "thats right",
+        "done", "ok done", "okay done", "all done", "finished",
+        "yes done", "yes correct",
+    }:
+        return {
+            "intent": "confirm",
+            "correction_text": None,
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
+    from src.graph.pure_functions.correction_consistency import (
+        detect_pain_location_correction,
+    )
+
+    if detect_pain_location_correction(user_input, {}):
+        return {
+            "intent": "request_change",
+            "correction_text": user_input.strip(),
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
+    # A direct channel answer at summary time commonly follows a referral
+    # question that was displayed just before a reconnect/race. Treat it as a
+    # concrete field update, never as an ambiguous generic correction.
+    from src.graph.pure_functions.referral import normalize_referral_source
+
+    if normalize_referral_source(user_input):
+        return {
+            "intent": "request_change",
+            "correction_text": user_input.strip(),
+            "has_reports": None,
+            "wants_upload": None,
+        }
     vague_change_responses = {
         "no", "nope", "incorrect", "wrong", "not correct", "not right",
         "this is incorrect", "this is wrong", "this is not correct",
@@ -178,6 +215,35 @@ def classify_reports_intent(
     """
     import re as _re
     lowered = user_input.lower()
+    report_words = ["report", "mri", "x-ray", "xray", "ct scan", "scan", "ultrasound",
+                    "blood test", "lab", "x ray", "imaging", "film", "result"]
+    _cq_str = str(context_question) if not isinstance(context_question, str) else context_question
+    asking_about_reports = any(w in _cq_str.lower() for w in report_words) if _cq_str else False
+
+    decline_upload_indicators = [
+        "don't want to upload", "dont want to upload", "do not want to upload",
+        "won't upload", "wont upload", "will not upload", "not upload here",
+        "don't upload here", "dont upload here", "not comfortable uploading",
+        "share directly with the doctor", "share directly with my doctor",
+        "share directly with the clinician", "show directly to the doctor",
+        "show it to the doctor", "bring it to the appointment",
+        "bring them to the appointment", "share in person",
+    ]
+    accept_upload_indicators = [
+        "want to upload", "will upload", "i'll upload", "ill upload",
+        "can upload", "upload it here", "upload them here",
+    ]
+    deterministic_upload_preference = None
+    if any(ind in lowered for ind in decline_upload_indicators):
+        deterministic_upload_preference = False
+    elif any(ind in lowered for ind in accept_upload_indicators):
+        deterministic_upload_preference = True
+    direct_share_with_clinician = bool(
+        _re.search(
+            r"\bshare\b.{0,60}\bdirectly\b.{0,40}\b(?:doctor|clinician)\b",
+            lowered,
+        )
+    )
 
     # Use specific multi-word phrases only — short fragments like "i do" match
     # substrings of "i dont" and cause false positives.
@@ -192,6 +258,25 @@ def classify_reports_intent(
     explicitly_has = (
         any(ind in lowered for ind in has_reports_indicators)
         or any(conf in lowered for conf in short_confirmations)
+        or bool(_re.search(
+            r"\bi (?:do )?have (?:the |an? |some |my )?"
+            r"(?:x[ -]?rays?|mri|ct scans?|scans?|reports?|imaging|films?)\b",
+            lowered,
+        ))
+        or (
+            asking_about_reports
+            and (
+                direct_share_with_clinician
+                or any(
+                    phrase in lowered
+                    for phrase in (
+                        "show it to the doctor",
+                        "bring it to the appointment",
+                        "bring them to the appointment",
+                    )
+                )
+            )
+        )
     )
 
     # Fast definite-negative check: if the user clearly has no reports, skip the LLM call
@@ -206,18 +291,17 @@ def classify_reports_intent(
     explicitly_no = any(ind in lowered for ind in no_reports_indicators)
 
     if explicitly_has:
-        return {"has_reports": True, "wants_upload": None}
+        return {
+            "has_reports": True,
+            "wants_upload": deterministic_upload_preference,
+        }
     if explicitly_no and not context_question:
         # Only skip LLM when there's no question context (can't be a "yes" to a report question)
         return {"has_reports": False, "wants_upload": False}
 
     # If the user is clearly talking about symptoms/pain (no report words at all),
     # skip the LLM call — it would return null anyway.
-    report_words = ["report", "mri", "x-ray", "xray", "ct scan", "scan", "ultrasound",
-                    "blood test", "lab", "x ray", "imaging", "film", "result"]
     has_any_report_word = any(w in lowered for w in report_words)
-    _cq_str = str(context_question) if not isinstance(context_question, str) else context_question
-    asking_about_reports = any(w in _cq_str.lower() for w in report_words) if _cq_str else False
 
     if not has_any_report_word and not asking_about_reports:
         # No report-related content in input or context → definitely null, skip LLM
@@ -246,6 +330,7 @@ RULES:
 - has_reports = false ONLY if they explicitly say they do NOT have any reports/scans.
 - When in doubt → has_reports = null (never guess true from unrelated context).
 - wants_upload = true only if they clearly want to upload now.
+- wants_upload = false if they decline uploading or say they will share the report directly with their doctor/clinician.
 """
     try:
         raw = llm_complete(prompt)
@@ -259,6 +344,8 @@ RULES:
         wants_upload = data.get("wants_upload")
         if explicitly_has and has_reports is not False:
             has_reports = True
+        if deterministic_upload_preference is not None:
+            wants_upload = deterministic_upload_preference
         return {"has_reports": has_reports, "wants_upload": wants_upload}
     except Exception as e:
         print(f"[classify_reports_intent] Failed: {error_type(e)}")

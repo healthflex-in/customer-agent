@@ -46,18 +46,23 @@ def validate_section(form: dict, section: str) -> list:
     """
     missing: list = []
 
-    if section not in form:
-        return missing
-
-    section_data = form[section]
+    # Persisted draft reservations use {} and partial records may omit fields.
+    # Missing schema keys are unanswered, never evidence of completion.
+    from src.forms.loader import load_form
+    expected_fields = load_form("FRM-01").sections.get(section, [])
+    stored_section = form.get(section, {})
+    if not isinstance(stored_section, dict):
+        stored_section = {}
+    section_data = {field: "" for field in expected_fields}
+    section_data.update(stored_section)
 
     # ── Special handling: Previous Consultations ──────────────────────────────
     if section == "Previous Consultations":
         prev_field = "Previous Diagnosis or Advice and Prescribed Treatment Taken"
         status_field = "Current Status of Issue (Improved, Same, Worse)"
 
-        previous_value = section_data.get(prev_field, "").strip()
-        status_value = section_data.get(status_field, "").strip()
+        previous_value = str(section_data.get(prev_field) or "").strip()
+        status_value = str(section_data.get(status_field) or "").strip()
 
         consultation_keywords = [
             "doctor", "physiotherapist", "hospital", "consulted", "visited",
@@ -101,7 +106,7 @@ def validate_section(form: dict, section: str) -> list:
         # when deciding section completion so they never block advancement.
         if "(If Any)" in field or "(Optional)" in field:
             continue
-        if not value:
+        if value is None or (isinstance(value, str) and not value.strip()):
             missing.append(field)
 
     return missing

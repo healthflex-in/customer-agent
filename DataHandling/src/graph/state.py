@@ -46,6 +46,7 @@ class InterviewState(TypedDict):
     reports_intent: Optional[dict]
     correction_data: Optional[dict]
     correction_applied: bool
+    direct_response_handled: bool
 
     # ── Orchestrator question override ─────────────────────────
     orchestrator_question_id: Optional[str]
@@ -73,7 +74,7 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
     """Return a blank InterviewState for a new interview. Replaces HealthAgent.init_form()."""
     fresh_form = _load_form("FRM-01").empty_form()
     form_sections = list(fresh_form.keys())
-    from src.prompts import WELCOME_PROMPT
+    from src.prompts import INITIAL_INTAKE_PROMPT
     return InterviewState(
         user_id=user_id,
         form_id=form_id,
@@ -90,12 +91,13 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         attempts_on_current_section=0,
         referral_asked=False,
         visit_context="unknown",
-        history=[{"role": "agent", "message": WELCOME_PROMPT}],
+        history=[{"role": "agent", "message": INITIAL_INTAKE_PROMPT}],
         missing_fields=[],
         summary_intent=None,
         reports_intent=None,
         correction_data=None,
         correction_applied=False,
+        direct_response_handled=False,
         orchestrator_question_id=None,
         orchestrator_question_text=None,
         pending_question=None,

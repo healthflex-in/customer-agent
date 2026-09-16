@@ -75,9 +75,9 @@ Control messages are UTF-8 JSON. Recorded audio chunks are binary frames.
 
 | Type | Fields | Behavior |
 |---|---|---|
-| `start_interview` | `userId` required; `formId`/`attemptId` optional | Validates that the user exists, then starts or resumes the intake. |
-| `start_new_form` | `userId` required if not already associated | Clears all regular/PROM/graph session state and allocates a new opaque attempt ID without creating an empty database document. |
-| `load_form` | `formId` required; `attemptId` optional | Loads the exact attempt for the session user, or the latest matching attempt for an older client. |
+| `start_interview` | `userId` required; `formId`/`attemptId` optional | Validates the user and resumes a `draft`/`in_progress` attempt. A completed attempt returns `form_completed` without invoking AI. |
+| `start_new_form` | — | Rejected on the public patient socket with `CLINICIAN_ASSIGNMENT_REQUIRED`. New attempts must be created by the consultant/dashboard workflow first. |
+| `load_form` | `formId` required; `attemptId` optional | Loads an active exact/latest attempt. A completed attempt is returned as read-only and is never hydrated into the interview agent. |
 | `text_input` | `text`; optional `requestId`, `questionId`, `inputMode` | Processes one typed/transcribed answer. `inputMode: "structured_prom"` is accepted only when its validated metadata matches the active PROM question(s). |
 | `audio_start` | Timestamp is accepted but not trusted | Opens a server-timed, size-limited recording window. |
 | binary frame | Raw browser audio bytes | Appended only while recording; cumulative bytes and elapsed time are bounded. |
@@ -98,6 +98,7 @@ returns an error. This window is bounded and process-local.
 | `thought_update` | `thoughts[]` containing `stage`, `detail`, `status` | UI progress labels for graph processing stages; not model chain-of-thought. |
 | `transcription` | `text`, `timestamp` | Gemini transcription or Google Speech fallback result after `audio_end`. |
 | `form_loaded` | `text`, `session_id`, `interview_state`, `form_data` | Confirmation/state sent by `load_form`; normally followed by `text_message`. |
+| `form_completed` | `text`, `formId`, `attemptId`, `status`, `completedAt`, `interview_state.locked` | Deterministic read-only response for a completed attempt. The client disables all answer/audio controls; no AI call is made. |
 | `submission_ack` | `status: "duplicate"`, `requestId` | A retry was recognized and not processed again. |
 | `clinical_escalation` | `text`, `category`, `severity`, `policyVersion`, `stopInterview` | Deterministic urgent-risk response. The server then closes with code `4003`; clients must display the message, stop intake, and must not reconnect automatically. |
 | `error` | `text` or `message` | Validation/provider/processing failure. Both keys currently exist; clients must handle either until the protocol is normalized. |
@@ -138,7 +139,11 @@ source wording and recall window; they are not personalized. An optional
   intake submission. Legacy records without an attempt ID remain readable and
   updateable, while every explicit new intake receives an independent ID.
 - Forms transition monotonically through `draft`, `in_progress`, and
-  `completed`; ordinary saves cannot downgrade a completed record.
+  `completed`. A completed attempt is immutable and cannot be reopened by the
+  patient. A repeat intake requires a consultant-assigned new `attemptId`.
+- The customer-agent public API consumes that assignment; it does not expose a
+  patient-callable attempt-creation operation. The clinical/dashboard backend
+  must persist the assigned draft attempt before issuing its patient link.
 - Only drafts receive `expiresAt` for TTL cleanup.
 - Report jobs use the `customer-agent-report-jobs` MongoDB collection.
 - Clinical safety events use `customer-agent-clinical-escalations`; events omit

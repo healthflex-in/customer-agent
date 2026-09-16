@@ -140,6 +140,7 @@ def build_graph_state(
         reports_intent=None,
         correction_data=None,
         correction_applied=False,
+        direct_response_handled=False,
         # Orchestrator
         orchestrator_question_id=client_state.get("current_question_id"),
         orchestrator_question_text=None,

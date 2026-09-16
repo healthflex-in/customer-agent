@@ -6,6 +6,7 @@ from typing import Callable
 
 from src.graph.state import InterviewState
 from src.graph.pure_functions.summary import classify_summary_response
+from src.graph.nodes.generate import required_response_before_summary
 
 
 def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
@@ -57,6 +58,14 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             # response_text left empty — generate_question will ask about the complaint
 
         elif intent == "confirm":
+            required_response = required_response_before_summary(
+                state, list(state["history"])
+            )
+            if required_response is not None:
+                # An old/resumed session may reach summary with legacy blank
+                # fields. Never terminally complete it until it goes through
+                # the same required-field gate as fresh interviews.
+                return required_response
             response_text = (
                 "Thank you for confirming. Your medical information has been recorded. "
                 "You can now close this page. Our team will review your information and get back to you soon."
