@@ -55,8 +55,8 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
         end = source.index("await send_text_message(", start)
         selection = source[start:end]
 
-        self.assertIn("if not _saved_patient_content:", selection)
-        self.assertLess(selection.index("if not _saved_patient_content:"), selection.index("elif not _required_missing:"))
+        self.assertIn("elif not _saved_patient_content:", selection)
+        self.assertLess(selection.index("elif not _saved_patient_content:"), selection.index("elif not _required_missing:"))
         self.assertIn("resume_message = INITIAL_INTAKE_PROMPT", selection)
 
         resume_start = source.index("client_state[\"graph_history\"]", start)

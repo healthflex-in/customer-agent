@@ -13,7 +13,7 @@ class ClinicalScopeTests(unittest.TestCase):
 
         self.assertIsNotNone(decision)
         self.assertEqual(decision.category, "respiratory_or_fever")
-        self.assertTrue(decision.stop_interview)
+        self.assertFalse(decision.stop_interview)
         self.assertEqual(decision.patient_message, NON_MSK_INTAKE_MESSAGE)
 
     def test_other_clear_non_msk_presentations_are_redirected(self):
@@ -47,6 +47,16 @@ class ClinicalScopeTests(unittest.TestCase):
         self.assertLess(urgent_gate, scope_gate)
         self.assertLess(scope_gate, off_topic)
         self.assertLess(scope_gate, graph_path)
+
+    def test_scope_clarification_is_a_chat_message_without_socket_close(self):
+        source = (Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8")
+        start = source.index("_scope_decision = assess_msk_intake_scope(text_input)")
+        end = source.index("# ── Off-topic question shortcut", start)
+        flow = source[start:end]
+        self.assertIn("await send_text_message(", flow)
+        self.assertNotIn("websocket.close", flow)
+        self.assertNotIn('"type": "clinical_escalation"', flow)
+        self.assertIn('client_state["scope_notice_sent"] = True', flow)
 
 
 if __name__ == "__main__":

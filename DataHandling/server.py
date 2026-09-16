@@ -1317,7 +1317,8 @@ def save_customer_info(
             attachments if attachments is not None else
             (existing.get("attachments", []) if existing else [])
         )
-        customer_doc["attachments"] = attachments_to_store
+        from app.uploads.attachments import attachment_urls
+        customer_doc["attachments"] = attachment_urls(attachments_to_store)
 
         if existing:
             # Update the doc we found (regardless of how userId was stored)
@@ -1538,7 +1539,17 @@ def fetch_form_attachments(
             {"_id": 0, "attachments": 1},
             sort=[("updatedAt", -1), ("createdAt", -1)],
         )
-        return doc.get("attachments", []) if doc else []
+        # Patient UI uses metadata records; MongoDB/dashboard stores URL strings.
+        # Preserve the existing REST/WS shape while accepting both DB formats.
+        from urllib.parse import urlparse, unquote
+        return [
+            item if isinstance(item, dict) else {
+                "url": item, "type": "report", "label": "Medical Report",
+                "fileName": unquote(urlparse(item).path.rsplit("/", 1)[-1]),
+            }
+            for item in (doc.get("attachments", []) if doc else [])
+            if isinstance(item, (str, dict))
+        ]
     except Exception as e:
         print(f"[fetch_attachments] Retrieval failed: {error_type(e)}")
         return []
@@ -2593,26 +2604,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     for value in section.values()
                                     if value and str(value).strip()
                                 )
-                                _saved_scope = assess_msk_intake_scope(_saved_patient_content)
-                                if _saved_scope is not None:
-                                    _log.info(
-                                        "stored_form_scope_redirected",
-                                        subject=pseudonymous_id(provided_user_id),
-                                        category=_saved_scope.category,
-                                        policy_version=_saved_scope.policy_version,
-                                    )
-                                    await websocket.send_text(json.dumps({
-                                        "type": "clinical_escalation",
-                                        "text": _saved_scope.patient_message,
-                                        "category": _saved_scope.category,
-                                        "severity": "non_emergency",
-                                        "policyVersion": _saved_scope.policy_version,
-                                        "stopInterview": _saved_scope.stop_interview,
-                                    }))
-                                    await websocket.close(
-                                        code=4003, reason="Outside MSK intake scope"
-                                    )
-                                    break
+                                # Scope is advisory. Ask for visit clarification in
+                                # chat; never stop the socket for a non-MSK answer.
+                                # Use the complaint alone, not allergies/past history.
+                                _saved_scope = assess_msk_intake_scope(
+                                    form_data.get("Present Complaint", {}).get("Primary Complaint", "")
+                                ) if provided_form_id == DEFAULT_FORM_ID else None
 
                                 # Validate sections using the stateless LangGraph helper
                                 # (takes form as a parameter — no global state risk).
@@ -2686,7 +2683,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     for section in client_state["graph_form_sections"]
                                     for field in _vs(form_data, section)
                                 ]
-                                if not _saved_patient_content:
+                                if _saved_scope is not None:
+                                    resume_message = _saved_scope.patient_message
+                                    client_state["scope_notice_sent"] = True
+                                elif not _saved_patient_content:
                                     resume_message = INITIAL_INTAKE_PROMPT
                                 elif not _required_missing:
                                     resume_message = (
@@ -3346,26 +3346,30 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # assessment.  This comes after urgent-risk detection so
                         # emergency handling always takes priority.
                         _scope_decision = assess_msk_intake_scope(text_input)
+                        _existing_complaint = (client_state.get("graph_form") or {}).get(
+                            "Present Complaint", {}
+                        ).get("Primary Complaint", "")
+                        # Clarify only an initial visit description. Later history
+                        # answers must not interrupt an established interview.
+                        if _existing_complaint or client_state.get("scope_notice_sent") or client_state.get("form_id") != DEFAULT_FORM_ID:
+                            _scope_decision = None
                         if _scope_decision is not None:
                             _log.info(
-                                "clinical_scope_redirected",
+                                "clinical_scope_clarification",
                                 subject=pseudonymous_id(client_state.get("user_id")),
                                 category=_scope_decision.category,
                                 policy_version=_scope_decision.policy_version,
                             )
-                            await websocket.send_text(json.dumps({
-                                # Reuse the established frontend safety-message
-                                # contract. The category distinguishes this
-                                # non-emergency redirect from urgent escalation.
-                                "type": "clinical_escalation",
-                                "text": _scope_decision.patient_message,
-                                "category": _scope_decision.category,
-                                "severity": "non_emergency",
-                                "policyVersion": _scope_decision.policy_version,
-                                "stopInterview": _scope_decision.stop_interview,
-                            }))
-                            await websocket.close(code=4003, reason="Outside MSK intake scope")
-                            break
+                            client_state["scope_notice_sent"] = True
+                            client_state["graph_history"] = list(client_state.get("graph_history") or []) + [
+                                {"role": "user", "message": text_input},
+                                {"role": "agent", "message": _scope_decision.patient_message},
+                            ]
+                            await send_text_message(
+                                websocket, client_state, _scope_decision.patient_message,
+                                await build_interview_state_async(client_state), user_response=None,
+                            )
+                            continue
 
                         # ── Off-topic question shortcut — answer WITHOUT touching the graph ──
                         # Detects two categories:
@@ -4744,13 +4748,14 @@ async def upload_form_attachment(
         update_fields["form_data.History & Diagnostics.Reports"] = processing_text
         form_data.setdefault("History & Diagnostics", {})["Reports"] = processing_text
 
+    from app.uploads.attachments import append_attachment_urls_expression
     await run_blocking(
         customer_info_collection.update_one,
         owned_form_filter,
-        {
-            "$push": {"attachments": {"$each": attachment_records}},
-            "$set": update_fields,
-        },
+        [{"$set": {
+            **{key: {"$literal": value} for key, value in update_fields.items()},
+            "attachments": append_attachment_urls_expression(attachment_records),
+        }}],
     )
     print(f"[upload_attachment] Saved {len(attachment_records)} attachment(s) to MongoDB")
 

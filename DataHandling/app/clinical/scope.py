@@ -15,12 +15,10 @@ import re
 POLICY_VERSION = "2026-09-16.1"
 
 NON_MSK_INTAKE_MESSAGE = (
-    "Stance Health's digital intake is designed for musculoskeletal concerns, "
-    "such as joint, muscle, bone, movement, or injury problems. Your message "
-    "appears to concern a health issue outside that scope, which this intake "
-    "cannot assess safely. Please contact an appropriate qualified clinician. "
-    "If you feel seriously unwell or need urgent help, call 112 in India or go "
-    "to the nearest emergency department. This MSK assessment has not been completed."
+    "This interview helps your Stance Health clinician understand muscle, joint, "
+    "movement or injury concerns, or prepare for a general assessment. "
+    "Are you visiting for one of these concerns, or for a general assessment? "
+    "You can tell me here and we can continue."
 )
 
 
@@ -31,7 +29,7 @@ class ClinicalScopeDecision:
     category: str
     patient_message: str = NON_MSK_INTAKE_MESSAGE
     policy_version: str = POLICY_VERSION
-    stop_interview: bool = True
+    stop_interview: bool = False
 
 
 # MSK wording takes precedence.  For example, "cold makes my knee pain worse"
