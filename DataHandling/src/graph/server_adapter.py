@@ -95,7 +95,7 @@ def build_graph_state(
     # Check if REST upload already saved attachments → mark as uploaded so graph
     # doesn't keep prompting for uploads. Must be computed before InterviewState().
     _reports_uploaded = client_state.get("graph_reports_uploaded", False)
-    if not _reports_uploaded and client_state.get("graph_awaiting_report_upload", False):
+    if not _reports_uploaded:
         try:
             _fetch = client_state.get("_fetch_form_fn")
             if _fetch:

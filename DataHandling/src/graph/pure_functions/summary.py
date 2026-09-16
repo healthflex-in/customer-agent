@@ -88,6 +88,14 @@ def classify_summary_response(
     normalized = re.sub(r"[^a-z0-9\s]", " ", user_input.lower())
     normalized = " ".join(normalized.split())
 
+    if re.search(r"\b(?:have uploaded|already uploaded|just uploaded|i uploaded|uploaded my|uploaded the|done uploading)\b", normalized):
+        return {
+            "intent": "has_reports",
+            "wants_upload": False,
+            "upload_claimed": True,
+            "correction_text": None,
+        }
+
     if normalized in {
         "yes", "correct", "looks good", "that is right", "thats right",
         "done", "ok done", "okay done", "all done", "finished",
@@ -254,10 +262,13 @@ def classify_reports_intent(
         "i do have scans", "i do have my reports",
     ]
     # Whole-word check for common short confirmations to avoid "i dont" → "i do"
-    short_confirmations = ["yes i do", "yes, i do", "yes i have"]
+    short_confirmation = " ".join(_re.sub(r"[^a-z0-9\s]", " ", lowered).split())
+    confirms_reports_question = asking_about_reports and short_confirmation in {
+        "yes", "yes i do", "yes i have", "yes i have one", "yes i have reports",
+    }
     explicitly_has = (
         any(ind in lowered for ind in has_reports_indicators)
-        or any(conf in lowered for conf in short_confirmations)
+        or confirms_reports_question
         or bool(_re.search(
             r"\bi (?:do )?have (?:the |an? |some |my )?"
             r"(?:x[ -]?rays?|mri|ct scans?|scans?|reports?|imaging|films?)\b",

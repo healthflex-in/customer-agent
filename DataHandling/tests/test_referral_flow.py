@@ -93,6 +93,23 @@ class ReferralFlowRegressionTests(unittest.TestCase):
 
         self.assertFalse(is_referral_question(result["response_text"]))
 
+    def test_extracted_free_text_referral_returns_summary_in_same_turn(self):
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state["phase"] = "interviewing"
+        for section, fields in state["form"].items():
+            for field in fields:
+                fields[field] = "Patient-provided answer"
+        state["form"]["Referral"]["Source"] = "Somebody gave me a referral"
+        state["referral_asked"] = False
+        state["user_input"] = "And actually there is a referral somebody gave me the referral"
+        summary = "You described your concern and received a referral. Is this information correct, or would you like to make any changes?"
+        with patch("src.graph.nodes.generate.get_stream_writer", return_value=lambda _event: None):
+            result = make_generate_question_node(lambda _prompt: summary, "unused")(state)
+        self.assertEqual(result["phase"], "summary")
+        self.assertEqual(result["response_text"], summary)
+        self.assertTrue(result["referral_asked"])
+        self.assertEqual(result["history"][-1]["message"], summary)
+
 
 if __name__ == "__main__":
     unittest.main()

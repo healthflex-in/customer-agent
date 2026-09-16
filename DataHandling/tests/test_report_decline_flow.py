@@ -23,6 +23,68 @@ except ModuleNotFoundError as exc:
 
 
 class ReportDeclineFlowTests(unittest.TestCase):
+    def test_summary_recognizes_uploaded_documents_without_provider_call(self):
+        from src.graph.pure_functions.summary import classify_summary_response
+        result = classify_summary_response(
+            "I have uploaded my clinical documents.", "summary",
+            lambda _: self.fail("Upload notification must be deterministic"),
+        )
+        self.assertEqual(result["intent"], "has_reports")
+        self.assertTrue(result["upload_claimed"])
+
+    def test_summary_acknowledges_verified_attachments_without_reprompt(self):
+        from src.graph.nodes.summary import make_handle_summary_response_node
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state["phase"] = "summary"
+        state["reports_uploaded"] = True
+        state["summary_intent"] = {"intent": "has_reports", "wants_upload": True}
+        result = make_handle_summary_response_node(lambda _: "unused")(state)
+        self.assertFalse(result["awaiting_report_upload"])
+        self.assertFalse(result["request_attachment"])
+        self.assertIn("already attached", result["response_text"])
+
+    def test_upload_claim_without_attachment_does_not_fake_receipt(self):
+        from src.graph.nodes.summary import make_handle_summary_response_node
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state["summary_intent"] = {"intent": "has_reports", "upload_claimed": True}
+        result = make_handle_summary_response_node(lambda _: "unused")(state)
+        self.assertFalse(result.get("reports_uploaded", False))
+        self.assertFalse(result["request_attachment"])
+        self.assertIn("cannot verify", result["response_text"])
+
+    def test_adapter_checks_saved_attachments_outside_upload_wait(self):
+        from src.graph.server_adapter import build_graph_state
+        calls = []
+        def fetch(form_id, user_id, attempt_id):
+            calls.append((form_id, user_id, attempt_id))
+            return {"attachments": [{"key": "report.pdf"}]}
+        client = {"user_id": "u", "form_id": "FRM-01", "attempt_id": "ATT-test",
+                  "graph_phase": "summary", "graph_awaiting_report_upload": False,
+                  "_fetch_form_fn": fetch}
+        result = build_graph_state(client, "I have uploaded my clinical documents.", lambda **_: None)
+        self.assertTrue(result["reports_uploaded"])
+        self.assertEqual(calls, [("FRM-01", "u", "ATT-test")])
+
+    def test_doctor_consultation_confirmation_is_not_report_confirmation(self):
+        def unexpected_llm(_prompt):
+            self.fail("An unrelated consultation answer must not trigger report classification")
+
+        result = classify_reports_intent(
+            "Actually from last day I have experiencing this issue. It started suddenly. "
+            "I think the screen time caused it. Yes I have seen the doctor. "
+            "He suggested to reduce the screen time. Okay.",
+            unexpected_llm,
+            context_question="Have you seen a doctor or physiotherapist? What advice did they give?",
+        )
+        self.assertEqual(result, {})
+
+    def test_short_confirmation_needs_report_question_context(self):
+        self.assertEqual(classify_reports_intent("yes i have", lambda _: "unused", "Have you seen a doctor?"), {})
+        self.assertEqual(
+            classify_reports_intent("yes i have", lambda _: "unused", "Do you have related X-rays?"),
+            {"has_reports": True, "wants_upload": None},
+        )
+
     def test_smoking_alcohol_and_walking_are_registered_without_llm(self):
         value = merge_lifestyle_answer(
             "",

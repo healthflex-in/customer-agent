@@ -308,8 +308,13 @@ def make_generate_question_node(llm_complete, system_prompt):
                 "referral_asked": True,
             }
         elif referral_source_filled and not referral_asked:
-            # Referral already captured — mark as asked so we skip to summary
-            return {"referral_asked": True}
+            # generate_question has a terminal graph edge. A flags-only return
+            # ends the turn with no response and leaves the UI processing forever.
+            # Summarize in this same turn, even if the source came from extraction
+            # rather than the deterministic known-channel recognizer.
+            result = _make_summary(state, history)
+            result["referral_asked"] = True
+            return result
 
         # ── All fields done including referral — generate summary ─────────────
         writer({"stage": "Formulating next question", "detail": "Generating summary", "status": "active"})

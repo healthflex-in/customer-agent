@@ -75,7 +75,33 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
 
         elif intent == "has_reports":
-            if wants_upload:
+            if state.get("reports_uploaded"):
+                response_text = (
+                    "Your documents are already attached to this assessment. "
+                    "There is no need to upload them again. Is the summary correct, "
+                    "or would you like to change any information?"
+                )
+                patch["awaiting_report_upload"] = False
+                patch["request_attachment"] = False
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
+            elif summary_intent.get("upload_claimed"):
+                response_text = (
+                    "Thank you for letting me know. I cannot verify an attached file for this assessment yet. "
+                    "You can continue reviewing your summary and share the documents with your clinician. "
+                    "Is the summary correct, or would you like to change anything?"
+                )
+                patch["awaiting_report_upload"] = False
+                patch["request_attachment"] = False
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
+            elif wants_upload is False:
+                response_text = "You can share your reports directly with your clinician. Is the summary correct, or would you like to change anything?"
+                patch["awaiting_report_upload"] = False
+                patch["request_attachment"] = False
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
+            elif wants_upload:
                 response_text = (
                     "Great! Since you mentioned you have reports, would you like to upload them? "
                     "You can upload MRI, X-ray, CT scan, or blood test reports."
