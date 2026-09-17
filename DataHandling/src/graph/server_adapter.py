@@ -181,6 +181,7 @@ def sync_client_state_from_graph(
     client_state["graph_current_section"] = result_state["current_section"]
     client_state["graph_phase"] = result_state["phase"]
     client_state["graph_history"] = result_state["history"]
+    client_state["graph_form_sections"] = result_state.get("form_sections") or list(result_state["form"])
 
     # Persist the extra flags so they survive into the next turn.
     client_state["graph_asked_previous_consultations"] = result_state.get(

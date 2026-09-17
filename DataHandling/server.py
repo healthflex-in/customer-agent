@@ -2588,6 +2588,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         _stored_fields = form_data.get(_section, {})
                                         if isinstance(_stored_fields, dict):
                                             _fields.update(_stored_fields)
+                                    for _section, _fields in form_data.items():
+                                        if _section.startswith("Additional Complaint ") and isinstance(_fields, dict):
+                                            _resume_template[_section] = dict(_fields)
                                     form_data = _resume_template
                                 current_section = existing_form.get("current_section", "Present Complaint")
 
@@ -2669,7 +2672,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                                 # Derive the ordered form_sections list
                                 from src.prompts import get_medical_form_template as _get_tmpl
-                                client_state["graph_form_sections"] = list(_get_tmpl().keys())
+                                client_state["graph_form_sections"] = list(form_data.keys())
 
                                 print(f"[start_interview] Loaded form at section index {_resume_idx}")
 

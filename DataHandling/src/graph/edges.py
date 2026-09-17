@@ -64,8 +64,9 @@ def after_handle_summary_response(state: InterviewState) -> str:
     if intent == "confirm":
         return END
     if intent == "new_complaint":
-        # Patient revealed new health info — reopen interview, ask follow-ups
-        return "generate_question"
+        # The handler saves the addition and acknowledges it with follow-ups.
+        # Do not overwrite that response with another old-form summary.
+        return END
     if intent == "request_change":
         if (state.get("summary_intent") or {}).get("correction_text"):
             return "detect_correction"

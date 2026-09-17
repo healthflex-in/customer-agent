@@ -52,6 +52,13 @@ def reasoning_extract(
             current_form=form_structure,
             form_structure=form_structure,
         )
+        if any(section.startswith("Additional Complaint ") for section in current_form):
+            prompt += (
+                "\nAdditional Complaint sections describe separate symptoms. Retain their exact Primary Complaint text. "
+                "Fill their details ONLY from patient statements about that particular additional symptom. "
+                "Never copy duration, severity, cause, or triggers from the original complaint. "
+                "Leave unprovided details empty."
+            )
 
         import time as _time
         _t0 = _time.perf_counter()
@@ -75,6 +82,8 @@ def reasoning_extract(
             if section in result and isinstance(fields, dict):
                 for field, value in fields.items():
                     if field in result[section]:
+                        if section.startswith("Additional Complaint ") and field == "Primary Complaint":
+                            continue
                         # Accept any non-null value including explicit "None" strings
                         if value is not None:
                             result[section][field] = str(value).strip() if value != "" else ""

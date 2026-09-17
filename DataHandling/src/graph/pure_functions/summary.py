@@ -56,6 +56,21 @@ Return ONLY the summary text."""
                      "all fields are filled", "the interview is finished"]
         if any(p in summary.lower() for p in forbidden):
             summary = _fallback_summary(form)
+        # Do not let a narrative model silently omit newly added complaints.
+        # Preserve the patient's own wording as explicit additional key points.
+        additions = [
+            str(fields.get("Primary Complaint", "")).strip()
+            for section, fields in form.items()
+            if section.startswith("Additional Complaint ") and isinstance(fields, dict)
+            and fields.get("Primary Complaint")
+        ]
+        if additions and summary:
+            approval = "Is this information correct, or would you like to make any changes?"
+            summary = summary.replace(approval, "").rstrip()
+            summary += "\n\nAdditional key points you shared:\n" + "\n".join(
+                f'- You also told us: "{text}"' for text in additions
+            )
+            summary += "\n\n" + approval
         return summary or _fallback_summary(form)
     except Exception as e:
         print(f"[generate_interview_summary] Failed: {error_type(e)}")
@@ -119,6 +134,11 @@ def classify_summary_response(
             "has_reports": None,
             "wants_upload": None,
         }
+
+    from src.graph.pure_functions.additional_complaint import is_explicit_symptom_addition
+    if is_explicit_symptom_addition(user_input):
+        return {"intent": "new_complaint", "correction_text": None,
+                "has_reports": None, "wants_upload": None}
 
     # A direct channel answer at summary time commonly follows a referral
     # question that was displayed just before a reconnect/race. Treat it as a

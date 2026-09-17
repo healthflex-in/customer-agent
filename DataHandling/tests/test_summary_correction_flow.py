@@ -26,6 +26,61 @@ def _load_edges_without_langgraph():
 
 
 class SummaryCorrectionFlowTests(unittest.TestCase):
+    def test_generated_summary_cannot_omit_added_pain(self):
+        from src.graph.pure_functions.summary import generate_interview_summary
+        text = "I have pain in my hand as well"
+        form = {
+            "Present Complaint": {"Primary Complaint": "Head pain"},
+            "Additional Complaint 1": {"Primary Complaint": text},
+        }
+        response = generate_interview_summary(
+            form, [], lambda _: "You have head pain.\nKey points:\n- Head pain.\nIs this information correct, or would you like to make any changes?"
+        )
+        self.assertIn(text, response)
+        self.assertEqual(response.count("Is this information correct"), 1)
+
+    def test_additional_pain_is_saved_acknowledged_and_requires_followup(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+        from src.graph.nodes.generate import required_response_before_summary
+        from src.graph.server_adapter import sync_client_state_from_graph, build_graph_state
+        for text in (
+            "I want to can you add some info for me like I have pain in my hand as well. I forgot to tell you can you please add that.",
+            "I actually I want to oh let you know that I have pain in my arms as well. Okay.",
+            "I want to update information I have pain in my hand aswell",
+        ):
+            with self.subTest(text=text):
+                state = get_fresh_interview_state("u", "FRM-01", "s")
+                state["phase"] = "summary"
+                for fields in state["form"].values():
+                    for field in fields:
+                        fields[field] = "Original patient answer"
+                state["form"]["Present Complaint"]["Primary Complaint"] = "Head pain"
+                state["form"]["Pain Assessment"]["Primary Location of Pain"] = "Head"
+                original = {key: dict(value) for key, value in state["form"].items()}
+                state["user_input"] = text
+                def unexpected_llm(_):
+                    self.fail("An explicit symptom addition must not require a classifier call")
+                intent = make_classify_summary_intent_node(unexpected_llm)(state)
+                state.update(intent)
+                self.assertEqual(state["summary_intent"]["intent"], "new_complaint")
+                result = make_handle_summary_response_node(unexpected_llm)(state)
+                updated = {**state, **result}
+                for section, fields in original.items():
+                    self.assertEqual(updated["form"][section], fields)
+                self.assertEqual(updated["form"]["Additional Complaint 1"]["Primary Complaint"], text)
+                self.assertIn("I've added", result["response_text"])
+                self.assertNotIn("Key points", result["response_text"])
+                self.assertEqual(self.edges.after_handle_summary_response(updated), "__end__")
+                client = {}
+                sync_client_state_from_graph(client, updated)
+                restored = build_graph_state(client, "ok done", lambda **_: None)
+                self.assertIn("Additional Complaint 1", restored["form_sections"])
+                gate = required_response_before_summary(restored, restored["history"])
+                self.assertIsNotNone(gate)
+                self.assertEqual(gate["phase"], "interviewing")
+                self.assertIn("Duration of the Issue", gate["missing_fields"])
+
     def test_summary_classification_uses_current_facts_after_correction(self):
         from src.graph.nodes.summary import make_classify_summary_intent_node
         prompts = []
