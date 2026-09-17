@@ -1,11 +1,11 @@
 version: '3.8'
 
 services:
-  healthflex-agent:
+  customer-agent-prod:
     build:
       context: .
       dockerfile: DataHandling/deployment/Dockerfile
-    container_name: healthflex-customer-agent
+    container_name: customer-agent-prod
     ports:
       - "8000:8000"
     env_file:
@@ -39,7 +39,7 @@ services:
     restart: unless-stopped
     
     networks:
-      - healthflex-network
+      - customer-agent-network
     
     # Resource limits (adjust based on your EC2 instance)
     deploy:
@@ -52,6 +52,6 @@ services:
           memory: 2G
 
 networks:
-  healthflex-network:
+  customer-agent-network:
     driver: bridge
 
