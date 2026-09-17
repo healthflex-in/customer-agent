@@ -72,9 +72,27 @@ class ExtractRoutingCharacterizationTests(unittest.TestCase):
             ),
             "validate_section",
         )
+        self.assertEqual(
+            self.edges.after_extract(
+                {
+                    "reports_intent": {
+                        "has_reports": True,
+                        "wants_upload": False,
+                    },
+                    "reports_uploaded": False,
+                }
+            ),
+            "validate_section",
+        )
 
     def test_default_route_is_validation(self):
         self.assertEqual(self.edges.after_extract({}), "validate_section")
+
+    def test_patient_clarification_stops_before_question_generation(self):
+        self.assertEqual(
+            self.edges.after_extract({"direct_response_handled": True}),
+            "__end__",
+        )
 
 
 class GraphTopologyContractTests(unittest.TestCase):

@@ -14,6 +14,9 @@ from langgraph.config import get_stream_writer
 from src.graph.state import InterviewState
 from src.graph.pure_functions.summary import generate_interview_summary
 from src.graph.pure_functions.form_validation import get_all_missing_fields, validate_section as _vs
+from src.graph.pure_functions.referral import is_referral_question
+from src.graph.pure_functions.question_repetition import asks_about_answered_field
+from src.graph.pure_functions.question_plan import question_for_missing_fields
 from src.prompts import INTELLIGENT_QUESTION_PROMPT
 from src.forms.loader import load_form as _load_form
 
@@ -68,6 +71,18 @@ def _build_needed_summary(flat_missing: list[tuple]) -> str:
         label = _FIELD_LABELS.get(field, field)
         lines.append(f"  • [{section}] {label}")
     return "\n".join(lines)
+
+
+def _fallback_missing_question(flat_missing: list[tuple]) -> str:
+    """Ask every required field explicitly, in small deterministic batches.
+
+    The LLM can make the interview warmer, but it must not decide whether a
+    required clinical field is skipped.  This wording is intentionally tied to
+    the FRM-01 field contract, so a form cannot complete merely because a model
+    says ``DONE``.
+    """
+
+    return question_for_missing_fields(flat_missing, _FIELD_LABELS)
 
 
 def _generate_intelligent_question(
@@ -148,25 +163,62 @@ def _generate_intelligent_question(
 
 
 def _fill_unanswered_fields(form: dict) -> dict:
-    """
-    Before generating the summary, fill any remaining empty fields with
-    'Not mentioned by patient' so no field in the final document is blank.
-    Skips fields already filled and fields marked as Not applicable.
+    """Return a copy without fabricating values for unanswered fields.
+
+    Completion is validated before summary generation.  This helper remains for
+    compatibility with the summary call sites, but deliberately preserves empty
+    fields so an omitted answer can never become clinical record content.
     """
     import copy
-    filled = copy.deepcopy(form)
-    for section, fields in filled.items():
-        if not isinstance(fields, dict):
-            continue
-        for field, value in fields.items():
-            if not value or not str(value).strip():
-                filled[section][field] = "Not mentioned by patient"
-    return filled
+    return copy.deepcopy(form)
+
+
+def required_response_before_summary(state: InterviewState, history: list) -> dict | None:
+    """Block summary/completion until the persisted required-field contract is met."""
+
+    # PROM sessions have their own validated structured-question contract.
+    if state.get("tagged_form_template"):
+        return None
+
+    visit_context = state.get("visit_context", "unknown")
+    missing = _get_relevant_missing(
+        state["form"], state["form_sections"], visit_context
+    )
+    if missing:
+        response = _fallback_missing_question(missing)
+        return {
+            "response_text": response,
+            "history": history + [{"role": "agent", "message": response}],
+            "phase": "interviewing",
+            "current_section": missing[0][0],
+            "missing_fields": [field for _, field in missing],
+        }
+
+    referral = str(state["form"].get("Referral", {}).get("Source", "")).strip()
+    if not referral:
+        response = (
+            "Last thing — how did you come to know about us? "
+            "(Friend/family, Google, Instagram, Facebook, YouTube, doctor referral, etc.)"
+        )
+        return {
+            "response_text": response,
+            "history": history + [{"role": "agent", "message": response}],
+            "phase": "interviewing",
+            "current_section": "Referral",
+            "referral_asked": True,
+            "missing_fields": ["Source"],
+        }
+    return None
 
 
 def make_generate_question_node(llm_complete, system_prompt):
     def _make_summary(state, history):
-        # Fill any remaining empty fields before generating the summary
+        required_response = required_response_before_summary(state, history)
+        if required_response is not None:
+            return required_response
+
+        # A validated form may be summarized. This does not fabricate values
+        # for optional/skipped fields.
         complete_form = _fill_unanswered_fields(state["form"])
         summary = generate_interview_summary(complete_form, history, llm_complete)
         history.append({"role": "agent", "message": summary})
@@ -214,34 +266,29 @@ def make_generate_question_node(llm_complete, system_prompt):
         flat_missing = _get_relevant_missing(form, form_sections, visit_context)
 
         if flat_missing:
-            # Use the pre-computed question from the extract node (ran concurrently)
-            # if available, otherwise fall back to a fresh LLM call.
-            pending_q = state.get("pending_question")
-            mcp_questions = state.get("mcp_questions") or []
-            if pending_q:
-                response = pending_q
-                print(f"[generate] using prefetched question (saved concurrent LLM call)")
-            else:
-                response = _generate_intelligent_question(
-                    flat_missing, history, visit_context, form, llm_complete,
-                    mcp_hints=mcp_questions,
-                )
+            # Required FRM-01 questions are generated from the missing-field
+            # contract, not from an AI completion guess. This makes every
+            # required field visible to the patient before summary/completion.
+            response = _fallback_missing_question(flat_missing)
 
-            # LLM signals "DONE" when it thinks everything is collected
-            if response.strip().upper() == "DONE":
-                writer({"stage": "Formulating next question", "detail": "Interview complete", "status": "done"})
-                if not referral_asked:
-                    response = (
-                        "Last thing — how did you come to know about us? "
-                        "(Friend/family, Google, Instagram, Facebook, YouTube, doctor referral, etc.)"
-                    )
-                    history.append({"role": "agent", "message": response})
-                    return {"response_text": response, "history": history, "referral_asked": True}
-                return _make_summary(state, history)
+            referral_source_filled = bool(
+                str(form.get("Referral", {}).get("Source", "")).strip()
+            )
+            if is_referral_question(response) and (
+                referral_asked or referral_source_filled
+            ):
+                print("[generate] Suppressed repeated referral question")
+                response = _fallback_missing_question(flat_missing)
+            elif asks_about_answered_field(response, form):
+                print("[generate] Suppressed question about an answered field")
+                response = _fallback_missing_question(flat_missing)
 
             history.append({"role": "agent", "message": response})
             writer({"stage": "Formulating next question", "detail": "Ready", "status": "done"})
-            return {"response_text": response, "history": history}
+            patch = {"response_text": response, "history": history}
+            if is_referral_question(response):
+                patch["referral_asked"] = True
+            return patch
 
         # ── All non-referral fields done — ask referral exactly once ──────────
         # Only ask if Source isn't already filled (e.g. patient mentioned it earlier)
@@ -261,8 +308,13 @@ def make_generate_question_node(llm_complete, system_prompt):
                 "referral_asked": True,
             }
         elif referral_source_filled and not referral_asked:
-            # Referral already captured — mark as asked so we skip to summary
-            return {"referral_asked": True}
+            # generate_question has a terminal graph edge. A flags-only return
+            # ends the turn with no response and leaves the UI processing forever.
+            # Summarize in this same turn, even if the source came from extraction
+            # rather than the deterministic known-channel recognizer.
+            result = _make_summary(state, history)
+            result["referral_asked"] = True
+            return result
 
         # ── All fields done including referral — generate summary ─────────────
         writer({"stage": "Formulating next question", "detail": "Generating summary", "status": "active"})
@@ -274,6 +326,9 @@ def make_generate_question_node(llm_complete, system_prompt):
 def make_generate_summary_node(llm_complete):
     def generate_summary_node(state: InterviewState) -> dict:
         history = list(state["history"])
+        required_response = required_response_before_summary(state, history)
+        if required_response is not None:
+            return required_response
         complete_form = _fill_unanswered_fields(state["form"])
         summary = generate_interview_summary(complete_form, history, llm_complete)
         history.append({"role": "agent", "message": summary})

@@ -95,7 +95,7 @@ def build_graph_state(
     # Check if REST upload already saved attachments → mark as uploaded so graph
     # doesn't keep prompting for uploads. Must be computed before InterviewState().
     _reports_uploaded = client_state.get("graph_reports_uploaded", False)
-    if not _reports_uploaded and client_state.get("graph_awaiting_report_upload", False):
+    if not _reports_uploaded:
         try:
             _fetch = client_state.get("_fetch_form_fn")
             if _fetch:
@@ -140,6 +140,7 @@ def build_graph_state(
         reports_intent=None,
         correction_data=None,
         correction_applied=False,
+        direct_response_handled=False,
         # Orchestrator
         orchestrator_question_id=client_state.get("current_question_id"),
         orchestrator_question_text=None,
@@ -180,6 +181,7 @@ def sync_client_state_from_graph(
     client_state["graph_current_section"] = result_state["current_section"]
     client_state["graph_phase"] = result_state["phase"]
     client_state["graph_history"] = result_state["history"]
+    client_state["graph_form_sections"] = result_state.get("form_sections") or list(result_state["form"])
 
     # Persist the extra flags so they survive into the next turn.
     client_state["graph_asked_previous_consultations"] = result_state.get(

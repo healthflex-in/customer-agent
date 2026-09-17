@@ -7,7 +7,7 @@ their visit intent, and generates the appropriate first question — no keyword 
 import json
 from app.observability.privacy import error_type
 from src.graph.state import InterviewState
-from src.prompts import FIRST_TURN_CONDUCTOR_PROMPT
+from src.prompts import FIRST_TURN_CONDUCTOR_PROMPT, INITIAL_INTAKE_PROMPT
 
 # Simple affirmative words that don't carry health information.
 # For these, skip the full conductor and use a direct open question.
@@ -28,10 +28,12 @@ def make_handle_first_turn_node(llm_complete, welcome_prompt, reasoning_llm=None
         response = None
         thinking = ""
 
-        # Fast path: simple confirmation ("yeah can we start?") → skip full conductor
+        # Fast path: a genuine simple confirmation ("yeah can we start?") skips
+        # the conductor.  Do not use message length here: short clinical replies
+        # such as "I have fever" or "knee pain" still contain real information.
         _normalized = user_input.strip().lower().rstrip("!?.,")
-        if _normalized in _CONFIRMATIONS or len(user_input.strip()) < 20:
-            response = "I'm glad you're here! To help your clinician prepare, could you tell me what brings you in today and what you're hoping to address?"
+        if _normalized in _CONFIRMATIONS:
+            response = INITIAL_INTAKE_PROMPT
             history.append({"role": "agent", "message": response})
             return {
                 "response_text": response,

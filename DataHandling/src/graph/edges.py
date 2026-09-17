@@ -13,6 +13,12 @@ def route_by_phase(state: InterviewState) -> str:
 
 def after_extract(state: InterviewState) -> str:
     """Route signals computed by the combined extraction/intent node."""
+    # The patient asked what the current intake question means. The extract
+    # node has already retained any facts from the same message and supplied a
+    # focused explanation; stop this turn so validation/generation cannot
+    # overwrite that reply with the next question.
+    if state.get("direct_response_handled"):
+        return END
     # In PROM/tagged-question sessions, skip reports upload flow entirely —
     # "yes" answers are about clinical scores, not document uploads
     if state.get("tagged_turns"):
@@ -23,6 +29,7 @@ def after_extract(state: InterviewState) -> str:
     reports_intent = state.get("reports_intent") or {}
     if (
         reports_intent.get("has_reports") is True
+        and reports_intent.get("wants_upload") is not False
         and not state.get("reports_uploaded")
     ):
         return "handle_upload_response"
@@ -45,7 +52,10 @@ def after_apply_correction(state: InterviewState) -> str:
     if not state.get("correction_applied"):
         return END
     if state.get("phase") == "summary":
-        return "generate_summary"
+        # The correction node already confirms the exact changed fields. Keep
+        # summary review active and wait for another correction or approval;
+        # regenerating the entire narrative after every edit is repetitive.
+        return END
     return "generate_question"
 
 
@@ -54,8 +64,9 @@ def after_handle_summary_response(state: InterviewState) -> str:
     if intent == "confirm":
         return END
     if intent == "new_complaint":
-        # Patient revealed new health info — reopen interview, ask follow-ups
-        return "generate_question"
+        # The handler saves the addition and acknowledges it with follow-ups.
+        # Do not overwrite that response with another old-form summary.
+        return END
     if intent == "request_change":
         if (state.get("summary_intent") or {}).get("correction_text"):
             return "detect_correction"

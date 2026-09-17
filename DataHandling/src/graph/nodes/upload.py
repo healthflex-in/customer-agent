@@ -13,6 +13,15 @@ _DECLINE_KEYWORDS = {
     "don't have", "dont have", "do not have",
 }
 
+_DECLINE_PHRASES = (
+    "don't want to upload", "dont want to upload", "do not want to upload",
+    "won't upload", "wont upload", "will not upload", "not upload here",
+    "share directly with the doctor", "share directly with my doctor",
+    "share directly with the clinician", "show it to the doctor",
+    "bring it to the appointment", "bring them to the appointment",
+    "share in person",
+)
+
 # Phrases that indicate the user already uploaded
 _ALREADY_UPLOADED_PHRASES = [
     "have uploaded", "already uploaded", "i uploaded", "just uploaded",
@@ -57,11 +66,14 @@ def make_handle_upload_response_node():
         words = set(user_input.replace(",", " ").replace(".", " ").split())
 
         # Detect "I have uploaded..." and similar past-tense confirmations
-        already_uploaded = any(phrase in user_input for phrase in _ALREADY_UPLOADED_PHRASES)
-        user_confirmed = already_uploaded or bool(words & _UPLOAD_CONFIRM_KEYWORDS)
-        user_declined = (not user_confirmed) and (
+        user_declined = (
             bool(words & _DECLINE_KEYWORDS)
             or any(d in user_input for d in _DECLINE_KEYWORDS)
+            or any(phrase in user_input for phrase in _DECLINE_PHRASES)
+        )
+        already_uploaded = any(phrase in user_input for phrase in _ALREADY_UPLOADED_PHRASES)
+        user_confirmed = (not user_declined) and (
+            already_uploaded or bool(words & _UPLOAD_CONFIRM_KEYWORDS)
         )
 
         if user_confirmed:
@@ -83,10 +95,10 @@ def make_handle_upload_response_node():
                 for section, fields in form.items()
             }
             if "History & Diagnostics" in updated_form and isinstance(updated_form["History & Diagnostics"], dict):
-                if not updated_form["History & Diagnostics"].get("Reports", "").strip():
-                    updated_form["History & Diagnostics"]["Reports"] = (
-                        "Patient mentioned having reports but chose not to upload them."
-                    )
+                updated_form["History & Diagnostics"]["Reports"] = (
+                    "Patient has diagnostic reports and chose to share them directly "
+                    "with the clinician instead of uploading them."
+                )
             return {
                 "form": updated_form,
                 "awaiting_report_upload": False,

@@ -102,6 +102,11 @@ REPORT_JOB_RETRY_BASE_SECONDS: int = _positive_int_env(
 REPORT_JOB_RETRY_MAX_SECONDS: int = _positive_int_env(
     "REPORT_JOB_RETRY_MAX_SECONDS", 900
 )
+# A provider request must never leave a patient WebSocket turn waiting
+# indefinitely.  This is passed to the direct Gemini SDK as milliseconds.
+GEMINI_REQUEST_TIMEOUT_MS: int = _positive_int_env(
+    "GEMINI_REQUEST_TIMEOUT_MS", 15_000
+)
 
 if MAX_ATTACHMENT_TOTAL_MB < MAX_ATTACHMENT_SIZE_MB:
     raise ValueError("MAX_ATTACHMENT_TOTAL_MB must be at least MAX_ATTACHMENT_SIZE_MB")

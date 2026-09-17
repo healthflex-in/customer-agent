@@ -85,15 +85,20 @@ def build_lifecycle_update_filter(
 ) -> dict[str, object]:
     """Build the atomic guard used by background form updates.
 
-    Only a caller explicitly reporting the terminal event may write an already
-    completed record. This prevents delayed ordinary saves from overwriting the
-    terminal snapshot or restoring draft expiration.
+    A completed attempt is immutable, including when a duplicated terminal
+    request reports ``completed`` again. The first completion still succeeds
+    because the stored record is ``draft`` or ``in_progress`` at that point.
+    This prevents retries, stale sockets, and reopened patient links from
+    changing the terminal clinical snapshot.
     """
 
-    update_filter: dict[str, object] = {"_id": document_id}
-    if requested_status != COMPLETED:
-        update_filter["status"] = {"$ne": COMPLETED}
-    return update_filter
+    return {"_id": document_id, "status": {"$ne": COMPLETED}}
+
+
+def is_completed_form(form: Mapping[str, object] | None) -> bool:
+    """Return whether a persisted assessment attempt is terminal/read-only."""
+
+    return bool(form) and form.get("status") == COMPLETED
 
 
 def ensure_form_lifecycle_ttl_index(collection: object) -> None:

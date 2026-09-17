@@ -5,6 +5,15 @@ I'll need about 5 minutes to understand your clinical history so I can share it 
 Please note that this information is critical to proceed with your session.
 """
 
+# The FRM-01 interview opens with one simple question.  The patient's reply is
+# then processed by the normal extraction/question-selection flow, so we do not
+# front-load a long batch of clinical questions before they have said why they
+# are visiting.
+INITIAL_INTAKE_PROMPT = (
+    "I'm glad you're here! To help your clinician prepare, could you tell me "
+    "what brings you in today and what you're hoping to address?"
+)
+
 # ──────────────────────────────────────────────────────────────
 # FIRST-TURN CONDUCTOR — LLM reads opening message, thinks, responds
 # ──────────────────────────────────────────────────────────────
@@ -64,13 +73,11 @@ Read the ENTIRE conversation above. Determine what the patient has already commu
 - Lifestyle (job, smoking/drinking, exercise)
 - Diagnostic reports (MRI, X-ray, scans)
 - Treatment goals
-- How they found Stance Health (referral source)
 
 **What to collect for a general_assessment visit:**
 - General health conditions, past surgeries
 - Lifestyle (job, habits, activity level)
 - Treatment/wellness goals
-- Referral source
 (Skip: specific pain details, injury mechanism, previous complaint-specific treatment)
 
 **Rules:**
@@ -79,6 +86,7 @@ Read the ENTIRE conversation above. Determine what the patient has already commu
 - If the patient addressed a topic in ANY way (even informally, with negation, or imperfectly), it is COVERED — do NOT ask again
 - Group related missing items into max 4–5 bullets, never ask one field per bullet
 - NEVER ask about something the patient already told you
+- Do NOT ask how they found Stance Health. Referral is handled separately by application code at the end.
 - NEVER output marketing language or statements without a question
 - If everything is covered → respond with exactly DONE
 
@@ -167,6 +175,10 @@ Ask yourself: Why is this patient here?
 - Are they asking about the clinic? → clinic_inquiry
 This shapes everything below.
 
+Only classify as general_assessment when the patient explicitly describes a
+wellness/check-up/posture/exploration visit with no complaint. Do NOT use that
+classification merely because a symptom lacks an MSK body location.
+
 **Step 2 — Reason through each form section**
 
 Present Complaint:
@@ -180,7 +192,9 @@ Previous Consultations:
 
 Pain Assessment:
 - Location, severity, aggravating factors, relieving factors
-- For general_assessment or no-pain visits: fill as "Not applicable — no pain reported"
+- Fill pain fields as "Not applicable — no pain reported" only when the patient
+  explicitly says they have no pain or explicitly describes a general wellness
+  visit without a complaint. Never infer no pain from an omitted answer.
 - "ice pack helps" → Relieving Factors = "Ice pack application"
 
 History & Diagnostics:
@@ -191,7 +205,7 @@ History & Diagnostics:
 
 Treatment Goals:
 - Short-term (3 months) and long-term goals
-- "understand my body", "figure out what's happening", "get back to playing" → infer appropriate goals
+- "understand my body", "figure out what's happening", "get back to playing" → store only that expressed goal
 - "don't think I'll need treatment", "no future goals" → "No specific treatment goals"
 - Genuinely not mentioned → leave empty
 
@@ -206,6 +220,9 @@ Referral:
 - Interpret goals, desires, and aspirations broadly: anything the patient wants to achieve, feel, or be able to do is a treatment goal.
 - For general_assessment visits, pre-fill complaint and pain sections with "Not applicable — general visit"
 - Leave truly unknown fields as empty string ""
+- Never convert a missing answer into a negative answer. For example, do not
+  write "no doctor visit", "no health conditions", "no pain", or a treatment
+  goal unless the patient explicitly said it.
 - Return ONLY valid JSON matching the exact structure below. No explanation, no markdown.
 
 Fill this structure:

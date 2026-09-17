@@ -204,6 +204,13 @@ def _classify_visit_context(user_input: str, llm_complete) -> str:
 
 from src.graph.pure_functions.form_extraction import extract_form_data_from_text
 from src.graph.pure_functions.form_validation import validate_section
+from src.graph.pure_functions.clarification import build_intake_clarification
+from src.graph.pure_functions.question_repetition import asks_about_answered_field
+from src.graph.pure_functions.lifestyle import merge_lifestyle_answer
+from src.graph.pure_functions.referral import (
+    is_referral_question,
+    normalize_referral_source,
+)
 from src.graph.pure_functions.summary import classify_reports_intent
 from src.prompts import FORMAT_PROMPT
 
@@ -260,6 +267,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     "response_text": brand_answer,
                     "reports_intent": {},
                     "pending_question": None,
+                    "direct_response_handled": True,
                 }
 
         # ── Visit context classification (fallback only) ──────────────────────
@@ -360,6 +368,9 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             if entry.get("role") == "agent":
                 last_agent_q = entry.get("message", "")
                 break
+        clarification_response = build_intake_clarification(
+            user_input, last_agent_q
+        )
 
         # ── Run extraction + intent concurrently ─────────────────────────────────
         # IMPORTANT: get_stream_writer() uses LangGraph context variables that are
@@ -411,35 +422,56 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 context_question=last_agent_q,
             )
 
-        def _run_question():
-            # Skip prefetch in PROM/tagged mode — generate_question uses pre-batched turns
-            if _is_prom:
-                return None
-            # Pre-compute the next question concurrently with extraction.
-            try:
-                from src.graph.nodes.generate import (
-                    _generate_intelligent_question,
-                    _VISIT_CONTEXT_DESCRIPTIONS,
-                )
-                _hist = history + [{"role": "user", "message": user_input}]
-                _visit_ctx = state.get("visit_context", "unknown")
-                return _generate_intelligent_question([], _hist, _visit_ctx, form, llm_complete)
-            except Exception as _e:
-                print(f"[question_prefetch] Failed: {error_type(_e)}")
-                return None
-
-        # All three run concurrently: extraction (slow), intent (fast), question (slow).
-        # Total wait = max of the three instead of sum of extraction + question.
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        # The next FRM-01 question is now generated deterministically from the
+        # persisted missing-field contract. Do not spend a second AI request on
+        # a speculative question that could omit a mandatory field.
+        with ThreadPoolExecutor(max_workers=2) as pool:
             fut_extract = pool.submit(_run_extraction)
             fut_intent = pool.submit(_run_intent)
-            fut_question = pool.submit(_run_question)
             _extract_result = fut_extract.result()
             reports_intent = fut_intent.result()
-            pending_q = fut_question.result()
+            pending_q = None
 
         # Unpack the tagged extraction result and log it in the main thread
         _extract_method, updated_form = _extract_result if isinstance(_extract_result, tuple) else ("failed", form)
+
+        updated_lifestyle = merge_lifestyle_answer(
+            updated_form.get("History & Diagnostics", {}).get("Current Lifestyle", ""),
+            user_input,
+        )
+        if updated_lifestyle:
+            updated_form = dict(updated_form)
+            updated_form["History & Diagnostics"] = dict(
+                updated_form.get("History & Diagnostics", {})
+            )
+            updated_form["History & Diagnostics"]["Current Lifestyle"] = (
+                updated_lifestyle
+            )
+
+        # A patient may have a report but explicitly choose to show it directly
+        # to the clinician. Persist both facts deterministically so the Reports
+        # field is complete and the interview does not ask again or force upload.
+        if (
+            reports_intent.get("has_reports") is True
+            and reports_intent.get("wants_upload") is False
+        ):
+            updated_form = dict(updated_form)
+            updated_form["History & Diagnostics"] = dict(
+                updated_form.get("History & Diagnostics", {})
+            )
+            _report_context = f"{user_input} {last_agent_q}".lower()
+            if any(term in _report_context for term in ("x-ray", "x ray", "xray")):
+                _report_label = "X-ray reports"
+            elif "mri" in _report_context:
+                _report_label = "MRI reports"
+            elif "ct scan" in _report_context:
+                _report_label = "CT scan reports"
+            else:
+                _report_label = "Diagnostic reports"
+            updated_form["History & Diagnostics"]["Reports"] = (
+                f"{_report_label} available; patient will share them directly with "
+                "the clinician and declined in-app upload."
+            )
         _filled_count = sum(1 for sec in updated_form.values() if isinstance(sec, dict)
                             for v in sec.values() if v and str(v).strip())
         print(f"[extract_node] {_extract_method}: {_filled_count} fields filled")
@@ -575,7 +607,13 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
         # Guard against medical/symptom answers being stored as referral source.
         # If the user's response looks like a symptom or treatment answer, it means
         # a previous question went unanswered — don't store as referral, re-ask later.
-        if state.get("referral_asked", False):
+        _stored_referral = str(
+            form.get("Referral", {}).get("Source", "")
+        ).strip()
+        _referral_turn = is_referral_question(last_agent_q) or (
+            state.get("referral_asked", False) and not _stored_referral
+        )
+        if _referral_turn:
             _ref_input = user_input.strip()
             _is_null = _ref_input.lower() in {"no", "nope", "nah", "none", "n/a", "na", ""}
 
@@ -607,75 +645,56 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                 print("[referral_fill] Medical answer detected; referral will be re-asked")
                 result_extra = {"referral_asked": False}
             elif _ref_input and not _is_null:
-                _channel_map = {
-                    "youtube": "YouTube", "instagram": "Instagram", "facebook": "Facebook",
-                    "google": "Google", "twitter": "Twitter", "whatsapp": "WhatsApp",
-                    "social media": "Social media", "online": "Found online",
-                    "website": "Stance Health website",
-                    "friend": "Friend/word of mouth", "family": "Family referral",
-                    "relative": "Family referral", "colleague": "Colleague referral",
-                    "word of mouth": "Word of mouth", "newspaper": "Newspaper",
-                    "doctor": "Doctor referral", "physician": "Doctor referral",
-                    "doctor referred": "Doctor referral", "referred by doctor": "Doctor referral",
-                    "physiotherapist": "Physiotherapist referral", "hospital": "Hospital referral",
-                    "podcast": "Podcast", "blog": "Blog/article",
-                }
-                _lower = _ref_input.lower()
-                matched = next((label for kw, label in _channel_map.items() if kw in _lower), None)
-                updated_form = dict(updated_form)
-                updated_form["Referral"] = dict(updated_form.get("Referral", {}))
-                updated_form["Referral"]["Source"] = matched or _ref_input
-                print("[referral_fill] Referral source recorded")
-                result_extra = {}
-            else:
-                result_extra = {}
+                matched = normalize_referral_source(_ref_input)
+                # A short direct response to the explicit referral question may
+                # contain a valid campaign/source name outside the known list.
+                # Long or medical answers are never stored as referral data.
+                if matched is None and len(_ref_input.split()) <= 8 and not _is_medical:
+                    matched = _ref_input
+                if matched:
+                    updated_form = dict(updated_form)
+                    updated_form["Referral"] = dict(updated_form.get("Referral", {}))
+                    updated_form["Referral"]["Source"] = matched
+                    print("[referral_fill] Referral source recorded")
+                    result_extra = {"referral_asked": True}
 
-        # ── Comprehensive fill for long/detailed responses ────────────────────────
-        # Only runs on format_prompt extraction (not reasoning) because the reasoning
-        # model already extracts comprehensively from full conversation context.
-        if _extract_method != "reasoning" and len(user_input.strip()) > 100:
-            _still_empty = sum(
-                1 for sec in updated_form.values()
-                if isinstance(sec, dict)
-                for v in sec.values()
-                if not v or not str(v).strip()
-            )
-            if _still_empty >= 4:
-                try:
-                    from src.prompts import FINAL_FORM_FILL_PROMPT
-                    import json as _json2
-                    _full_history = history + [{"role": "user", "message": user_input}]
-                    _conv_text = "\n".join(
-                        f"{'Sage' if e.get('role') == 'agent' else 'Patient'}: {e.get('message', '')}"
-                        for e in _full_history
-                    )
-                    _fill_prompt = FINAL_FORM_FILL_PROMPT.format(
-                        _conv_text,
-                        _json2.dumps(updated_form, indent=2),
-                        _json2.dumps(updated_form, indent=2),
-                    )
-                    _raw = llm_complete(_fill_prompt).strip()
-                    _start, _end = _raw.find("{"), _raw.rfind("}")
-                    if _start != -1 and _end != -1:
-                        _filled = _json2.loads(_raw[_start:_end + 1])
-                        if isinstance(_filled, dict):
-                            for _sec, _fields in _filled.items():
-                                if _sec in updated_form and isinstance(_fields, dict):
-                                    for _field, _val in _fields.items():
-                                        if _val and str(_val).strip() and _field in updated_form.get(_sec, {}):
-                                            updated_form[_sec][_field] = str(_val).strip()
-                            print(f"[comprehensive_fill] Done — {_still_empty} empty fields filled from conversation")
-                except Exception as _e:
-                    print(f"[comprehensive_fill] Failed: {error_type(_e)}")
+                    # This question was prefetched before the current answer was
+                    # merged. Discard it if it asks referral again; generation will
+                    # use the updated history/form instead.
+                    if pending_q and is_referral_question(pending_q):
+                        pending_q = None
+                else:
+                    # Do not overwrite a valid LLM extraction with None. Keep the
+                    # question eligible for one clear retry instead.
+                    result_extra = {"referral_asked": False}
+            else:
+                result_extra = {"referral_asked": True}
 
         new_history = history + [{"role": "user", "message": user_input}]
+
+        if clarification_response:
+            new_history.append({"role": "agent", "message": clarification_response})
 
         result = {
             "form": updated_form,
             "history": new_history,
             "reports_intent": reports_intent,
-            "pending_question": pending_q,
+            "pending_question": None if clarification_response else pending_q,
         }
+
+        if (
+            result["pending_question"]
+            and asks_about_answered_field(result["pending_question"], updated_form)
+        ):
+            print("[question_prefetch] Discarded question about an answered field")
+            result["pending_question"] = None
+        if clarification_response:
+            result.update(
+                {
+                    "response_text": clarification_response,
+                    "direct_response_handled": True,
+                }
+            )
         if _visit_context_update:
             result.update(_visit_context_update)
         if result_extra:

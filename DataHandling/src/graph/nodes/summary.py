@@ -5,22 +5,23 @@ then handle the result (confirm, change, reports, etc.).
 from typing import Callable
 
 from src.graph.state import InterviewState
-from src.graph.pure_functions.summary import classify_summary_response
+from src.graph.pure_functions.summary import classify_summary_response, _fallback_summary
+from src.graph.nodes.generate import required_response_before_summary
 
 
 def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
     def classify_summary_intent_node(state: InterviewState) -> dict:
         user_input = state["user_input"]
 
-        # Find the last agent summary message (contains the "Is this information correct" phrase)
-        summary_text = ""
-        for entry in reversed(state["history"]):
-            if entry.get("role") == "agent" and "Is this information correct" in entry.get("message", ""):
-                summary_text = entry["message"]
-                break
+        # Historical summaries describe the record before later corrections.
+        # Classify against current structured facts, so old key points cannot
+        # steer a subsequent correction or approval back to outdated details.
+        summary_text = _fallback_summary(state["form"])
 
         result = classify_summary_response(user_input, summary_text, llm_complete)
-        return {"summary_intent": result}
+        history = list(state["history"])
+        history.append({"role": "user", "message": user_input})
+        return {"summary_intent": result, "history": history}
 
     return classify_summary_intent_node
 
@@ -34,29 +35,37 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
         patch: dict = {}
 
         if intent == "new_complaint":
-            # Patient revealed a new specific complaint — reopen the interview,
-            # clear all "Not applicable" placeholders from complaint/pain sections,
-            # and switch to specific_complaint mode so the conductor asks follow-ups.
-            _na_values = {
-                "not applicable", "general visit — no specific complaint",
-                "not applicable — no pain reported", "not applicable — general visit",
-                "not applicable — general visit.", "none",
+            from src.graph.pure_functions.additional_complaint import capture_additional_complaint
+            from src.graph.pure_functions.question_plan import question_for_missing_fields
+            updated_form, added_section = capture_additional_complaint(
+                state["form"], state["user_input"]
+            )
+            missing = [(added_section, field) for field, value in updated_form[added_section].items() if not value]
+            response_text = (
+                "I've added what you just shared alongside your earlier concern: "
+                + state["user_input"].strip()
+                + "\n\nFor this additional concern, "
+                + question_for_missing_fields(missing, {})
+            )
+            return {
+                "form": updated_form,
+                "form_sections": list(updated_form),
+                "current_section": added_section,
+                "missing_fields": [field for _, field in missing],
+                "phase": "interviewing",
+                "visit_context": "specific_complaint",
+                "response_text": response_text,
+                "history": state["history"] + [{"role": "agent", "message": response_text}],
             }
-            updated_form = {
-                section: dict(fields) if isinstance(fields, dict) else fields
-                for section, fields in state["form"].items()
-            }
-            for _sec in ["Present Complaint", "Pain Assessment", "Previous Consultations"]:
-                if _sec in updated_form and isinstance(updated_form[_sec], dict):
-                    for _field in list(updated_form[_sec].keys()):
-                        if str(updated_form[_sec].get(_field, "")).strip().lower() in _na_values:
-                            updated_form[_sec][_field] = ""
-            patch["form"] = updated_form
-            patch["phase"] = "interviewing"
-            patch["visit_context"] = "specific_complaint"
-            # response_text left empty — generate_question will ask about the complaint
-
         elif intent == "confirm":
+            required_response = required_response_before_summary(
+                state, list(state["history"])
+            )
+            if required_response is not None:
+                # An old/resumed session may reach summary with legacy blank
+                # fields. Never terminally complete it until it goes through
+                # the same required-field gate as fresh interviews.
+                return required_response
             response_text = (
                 "Thank you for confirming. Your medical information has been recorded. "
                 "You can now close this page. Our team will review your information and get back to you soon."
@@ -66,7 +75,33 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
 
         elif intent == "has_reports":
-            if wants_upload:
+            if state.get("reports_uploaded"):
+                response_text = (
+                    "Your documents are already attached to this assessment. "
+                    "There is no need to upload them again. Is the summary correct, "
+                    "or would you like to change any information?"
+                )
+                patch["awaiting_report_upload"] = False
+                patch["request_attachment"] = False
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
+            elif summary_intent.get("upload_claimed"):
+                response_text = (
+                    "Thank you for letting me know. I cannot verify an attached file for this assessment yet. "
+                    "You can continue reviewing your summary and share the documents with your clinician. "
+                    "Is the summary correct, or would you like to change anything?"
+                )
+                patch["awaiting_report_upload"] = False
+                patch["request_attachment"] = False
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
+            elif wants_upload is False:
+                response_text = "You can share your reports directly with your clinician. Is the summary correct, or would you like to change anything?"
+                patch["awaiting_report_upload"] = False
+                patch["request_attachment"] = False
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
+            elif wants_upload:
                 response_text = (
                     "Great! Since you mentioned you have reports, would you like to upload them? "
                     "You can upload MRI, X-ray, CT scan, or blood test reports."
