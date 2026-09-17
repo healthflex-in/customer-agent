@@ -77,13 +77,14 @@ def make_handle_upload_response_node():
         )
 
         if user_confirmed:
-            # User confirmed upload — mark as done and continue interview
-            response_text = "Thank you! I've noted that your reports have been shared. Let's continue."
+            # Only saved attachments verify receipt. A verbal yes/done alone
+            # must not create a fictional upload or dismiss the upload control.
+            response_text = "I cannot verify an uploaded file for this assessment yet. Please use the upload button, or tap Skip to share it with your clinician later."
             history.append({"role": "agent", "message": response_text})
             return {
-                "awaiting_report_upload": False,
-                "reports_uploaded": True,
-                "request_attachment": False,
+                "awaiting_report_upload": True,
+                "reports_uploaded": False,
+                "request_attachment": True,
                 "response_text": response_text,
                 "history": history,
             }

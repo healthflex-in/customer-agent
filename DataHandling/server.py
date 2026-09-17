@@ -4748,9 +4748,12 @@ async def upload_form_attachment(
         },
         "updatedAt": now,
     }
+    from src.graph.pure_functions.summary import reports_with_verified_upload
+    report_value = reports_with_verified_upload(hist_diag.get("Reports", ""))
     if not str(hist_diag.get("Reports", "")).strip():
-        update_fields["form_data.History & Diagnostics.Reports"] = processing_text
-        form_data.setdefault("History & Diagnostics", {})["Reports"] = processing_text
+        report_value += "; " + processing_text
+    update_fields["form_data.History & Diagnostics.Reports"] = report_value
+    form_data.setdefault("History & Diagnostics", {})["Reports"] = report_value
 
     from app.uploads.attachments import append_attachment_urls_expression
     await run_blocking(
