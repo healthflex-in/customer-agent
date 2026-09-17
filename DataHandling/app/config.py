@@ -22,10 +22,20 @@ MONGO_DB_NAME: str = os.getenv("MONGO_DB_NAME", "stance-dashboard")
 MONGO_USERS_COLLECTION: str = os.getenv("MONGO_USERS_COLLECTION", "users")
 MONGO_CUSTOMER_INFO_COLLECTION: str = "customer-info"
 
+# Dev MongoDB — used when requests originate from dev.customerai.stance.health
+DEV_MONGO_URI: str | None = os.getenv(
+    "DEV_MONGO_URI",
+    "mongodb+srv://healthflex-dev:FUvgMqSppKigmKHK@healthflex-dev.5kbaq08.mongodb.net/stance-dashboard?retryWrites=true&w=majority",
+)
+DEV_MONGO_DB_NAME: str = os.getenv("DEV_MONGO_DB_NAME", "stance-development")
+
+DEV_ORIGIN: str = "https://dev.customerai.stance.health"
+
 
 # ── HTTP / CORS ────────────────────────────────────────────────────────────
 CORS_ALLOWED_ORIGINS: list[str] = [
     "https://customerai.stance.health",
+    "https://dev.customerai.stance.health",
     "https://customer-agent-mu.vercel.app",
     "http://localhost:3000",
     "http://localhost:8080",

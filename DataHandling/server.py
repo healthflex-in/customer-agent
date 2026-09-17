@@ -437,6 +437,7 @@ from fastapi import (
     WebSocket,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     File,
     Form,
@@ -483,6 +484,9 @@ from app.config import (
     MONGO_DB_NAME,
     MONGO_USERS_COLLECTION,
     MONGO_CUSTOMER_INFO_COLLECTION,
+    DEV_MONGO_URI,
+    DEV_MONGO_DB_NAME,
+    DEV_ORIGIN,
     CORS_ALLOWED_ORIGINS,
     AUDIO_RATE as RATE,
     AUDIO_SAMPLE_WIDTH as SAMPLE_WIDTH,
@@ -493,6 +497,8 @@ from app.config import (
     UPLOAD_TRIGGER_PHRASE,
     TTS_CACHE_DIR,
 )
+import app.log as clog
+
 # Pure stateless helpers. Aliased to legacy names used throughout this file.
 from app.db.serializers import (
     normalize_user_id,
@@ -586,6 +592,11 @@ def sanitize_patient_input(text: str) -> str:
 
 # ── FastAPI app with lifespan for graceful startup/shutdown ──────────────────
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+
+# Holds the per-session MongoDB collection for save_customer_info when called
+# from the LangGraph path (which cannot receive client_state directly).
+_session_customer_info_coll: ContextVar = ContextVar("_session_customer_info_coll", default=None)
 
 @asynccontextmanager
 async def lifespan(app_instance):
@@ -711,12 +722,12 @@ if _langfuse_enabled:
         from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
         _langfuse = _lf_get_client()
         LlamaIndexInstrumentor().instrument()
-        print("[langfuse] Instrumentation active — tracing all LlamaIndex LLM calls")
+        clog.step_ok("Langfuse tracing", "LlamaIndex instrumented")
     except Exception as _lf_err:
         print(f"[langfuse] Failed to initialize (non-fatal): {_lf_err}")
         _langfuse_enabled = False
 else:
-    print("[langfuse] Skipping — LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set")
+    clog.step_warn("Langfuse", "keys not set — tracing disabled")
     _langfuse = None
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -735,10 +746,13 @@ os.makedirs(TTS_CACHE_DIR, exist_ok=True)
 
 # STT now uses Google Cloud Speech-to-Text — no local model to load at startup.
 
+clog.banner()
+clog.divider()
+
 # Initialize HealthAgent (kept for audio, summary title generation, and legacy fallback)
-print("Initializing HealthAgent...")
+clog.progress_bar("HealthAgent", total=18, delay=0.02)
 health_agent = HealthAgent()
-print("HealthAgent initialized")
+clog.step_ok("HealthAgent ready")
 
 
 # ── LangGraph interview graph ────────────────────────────────────────────────
@@ -760,10 +774,13 @@ try:
         # runs at module scope (and inside background threads) where the per-
         # connection `client_state` is NOT in scope. Referencing it here raised
         # NameError on every call, silently dropping the FRM-01 intake save.
+        # The per-session collection (dev vs prod) is carried via ContextVar
+        # so graph nodes don't need signature changes.
         return save_customer_info(user_id=user_id, form_data=form,
                                   current_section=section, form_id=form_id,
                                   chat_history=chat_history,
-                                  preferred_doc_id=preferred_doc_id)
+                                  preferred_doc_id=preferred_doc_id,
+                                  collection=_session_customer_info_coll.get())
 
     # In-memory checkpointer — MongoDB is the persistent source of truth.
     from src.graph.graph import create_checkpointer as _create_checkpointer
@@ -811,7 +828,7 @@ try:
                         config=_r_gen_config,
                     )
                     return (resp.text or "").strip()
-                print("[graph] Reasoning LLM (gemini-2.5-flash, thinking=off) initialized for form extraction")
+                clog.step_ok("Reasoning LLM", "gemini-2.5-flash  thinking=off")
             except Exception as _r_sdk_err:
                 print(f"[graph] Direct SDK init failed ({_r_sdk_err}), falling back to LlamaIndex")
                 _r_llm = init_reasoning_llm(_api_key)
@@ -819,9 +836,9 @@ try:
                     resp = _r_llm.complete(prompt)
                     text = getattr(resp, 'text', None) or str(resp)
                     return text.strip()
-                print("[graph] Reasoning LLM (gemini-2.5-flash) initialized for form extraction")
+                clog.step_ok("Reasoning LLM", "gemini-2.5-flash")
         else:
-            print("[graph] WARNING: No API key — reasoning LLM disabled, using flash-lite fallback")
+            clog.step_warn("Reasoning LLM", "no API key — flash-lite fallback")
     except Exception as _r_err:
         import traceback as _rtb
         print(f"[graph] Reasoning LLM init failed: {_r_err}")
@@ -834,10 +851,10 @@ try:
         checkpointer=_checkpointer,
         reasoning_llm=_reasoning_llm_complete,
     )
-    print("[graph] LangGraph interview graph initialized")
+    clog.step_ok("LangGraph interview graph", "reasoning=gemini-2.5-flash")
 except Exception as _graph_err:
     import traceback as _tb
-    print(f"[graph] Failed to initialize LangGraph graph (non-fatal, using HealthAgent fallback): {_graph_err}")
+    clog.step_warn("LangGraph unavailable — HealthAgent fallback active", str(_graph_err))
     _tb.print_exc()
     _interview_graph = None
 
@@ -846,6 +863,10 @@ mongo_client = None
 users_collection: Optional[Collection] = None
 customer_info_collection: Optional[Collection] = None
 tagged_questions_collection: Optional[Collection] = None
+
+# Dev MongoDB handles (populated by init_dev_mongo()).
+dev_mongo_client = None
+dev_customer_info_collection: Optional[Collection] = None
 
 
 # normalize_user_id moved to app.db.serializers (imported above).
@@ -856,9 +877,10 @@ def init_mongo():
     global mongo_client, users_collection, customer_info_collection, tagged_questions_collection
 
     if not MONGO_URI:
-        print("MONGO_URI not set. User suggestions and customer info endpoints will be disabled.")
+        clog.step_warn("MONGO_URI not set — MongoDB disabled")
         return
 
+    clog.progress_bar("MongoDB  [PROD]", total=16, delay=0.025)
     try:
         mongo_client = MongoClient(
             MONGO_URI,
@@ -889,15 +911,47 @@ def init_mongo():
             name="ttl_abandoned_forms",
         )
 
-        print(
-            f"Connected to MongoDB collections: {MONGO_DB_NAME}.{MONGO_USERS_COLLECTION}, {MONGO_DB_NAME}.{MONGO_CUSTOMER_INFO_COLLECTION}"
+        clog.db_connected(
+            "PROD", MONGO_DB_NAME,
+            [MONGO_USERS_COLLECTION, MONGO_CUSTOMER_INFO_COLLECTION, "tagged-questions"],
         )
     except Exception as e:
         mongo_client = None
         users_collection = None
         customer_info_collection = None
         tagged_questions_collection = None
-        print(f"Failed to connect to MongoDB. User suggestions and customer info disabled: {e}")
+        clog.db_error("PROD MongoDB", str(e))
+
+
+def init_dev_mongo():
+    """Initialize a separate MongoDB client for dev-environment writes."""
+    global dev_mongo_client, dev_customer_info_collection
+
+    if not DEV_MONGO_URI:
+        clog.step_warn("DEV_MONGO_URI not set — dev writes fall back to prod")
+        return
+
+    clog.progress_bar("MongoDB  [DEV] ", total=16, delay=0.025)
+    try:
+        dev_mongo_client = MongoClient(
+            DEV_MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            tlsAllowInvalidCertificates=True,
+        )
+        dev_mongo_client.admin.command("ping")
+        dev_db = dev_mongo_client[DEV_MONGO_DB_NAME]
+        dev_customer_info_collection = dev_db[MONGO_CUSTOMER_INFO_COLLECTION]
+
+        dev_customer_info_collection.create_index(
+            [("userId", 1), ("formId", 1)],
+            unique=True,
+            name="unique_user_form",
+        )
+        clog.db_connected("DEV", DEV_MONGO_DB_NAME, [MONGO_CUSTOMER_INFO_COLLECTION])
+    except Exception as e:
+        dev_mongo_client = None
+        dev_customer_info_collection = None
+        clog.db_error("DEV MongoDB", str(e))
 
 
 # _serialize_datetime and serialize_user moved to app.db.serializers (imported above).
@@ -1420,28 +1474,35 @@ def save_customer_info(
     attachments: Optional[List[dict]] = None,
     chat_history: Optional[list] = None,
     preferred_doc_id: Optional[str] = None,
+    collection=None,
 ):
     """
     Save or update customer interview information in MongoDB.
     Forms are unique by the combination of (formId + userId).
     The formId is fixed (same for all users), uniqueness comes from userId.
-    
+
     Args:
         user_id: The user ID from the selected user (required for uniqueness)
         form_data: The form data dictionary
         current_section: Current section of the interview
         form_id: Optional form ID. If None, uses DEFAULT_FORM_ID.
-    
+        collection: Optional MongoDB collection override (e.g. dev_customer_info_collection).
+                    Defaults to the global customer_info_collection.
+
     Returns:
         The form_id of the saved form (always DEFAULT_FORM_ID)
     """
     global customer_info_collection
-    
-    if customer_info_collection is None:
-        # Try to reconnect once
+
+    # Use the provided collection, or fall back to the global prod one.
+    target_collection = collection if collection is not None else customer_info_collection
+
+    if target_collection is None:
+        # Try to reconnect once (only for the prod collection fallback path)
         init_mongo()
-    
-    if customer_info_collection is None:
+        target_collection = customer_info_collection
+
+    if target_collection is None:
         print("Warning: customer-info collection not available. Skipping MongoDB save.")
         return None
     
@@ -1500,7 +1561,7 @@ def save_customer_info(
         existing = None
         if preferred_doc_id:
             try:
-                existing = customer_info_collection.find_one({"_id": _ObjId2(preferred_doc_id)})
+                existing = target_collection.find_one({"_id": _ObjId2(preferred_doc_id)})
             except Exception:
                 pass
         if not existing:
@@ -1510,7 +1571,7 @@ def save_customer_info(
             except Exception:
                 pass
             for _uid in _uid_variants:
-                existing = customer_info_collection.find_one({"formId": form_id, "userId": _uid})
+                existing = target_collection.find_one({"formId": form_id, "userId": _uid})
                 if existing:
                     break
 
@@ -1522,14 +1583,15 @@ def save_customer_info(
 
         if existing:
             # Update the doc we found (regardless of how userId was stored)
-            customer_info_collection.update_one(
+            target_collection.update_one(
                 {"_id": existing["_id"]},
                 {"$set": customer_doc},
             )
         else:
             customer_doc["createdAt"] = datetime.now()
-            customer_info_collection.insert_one(customer_doc)
-        print(f"Saved customer info for user {user_id}, form {form_id} in MongoDB")
+            target_collection.insert_one(customer_doc)
+        _db_name = target_collection.database.name
+        clog.db_save(str(user_id), form_id, _db_name, is_dev=(_db_name == DEV_MONGO_DB_NAME))
         
         return form_id
             
@@ -2050,6 +2112,10 @@ def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, a
 # db = MedicalInterviewDB()
 # print("MongoDB connected")
 init_mongo()
+init_dev_mongo()
+clog.divider()
+clog.step_ok("Server ready  ·  listening on :8000")
+clog.divider()
 
 
 @app.get("/health")
@@ -2483,7 +2549,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     _active_ws_connections.add(websocket)
     WS_CONNECTIONS.inc()
     _log.info("ws_connected", client_id=client_id)
-    print(f"Client {client_id} connected")
 
     # Per-session processing lock — prevents text+audio race condition.
     # Only one message is processed at a time per session.
@@ -2526,12 +2591,22 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     }
     _session_processing = False  # simple flag to prevent concurrent processing
 
+    # Route writes to dev MongoDB when the connection comes from the dev frontend.
+    _ws_origin = websocket.headers.get("origin", "")
+    _is_dev_ws = _is_dev_request(websocket.headers) and dev_customer_info_collection is not None
+    if _is_dev_ws:
+        client_state["customer_info_coll"] = dev_customer_info_collection
+    else:
+        client_state["customer_info_coll"] = None  # None → save_customer_info uses prod global
+
+    # Set the ContextVar so LangGraph callbacks pick up the right collection.
+    _session_customer_info_coll.set(client_state["customer_info_coll"])
+
+    clog.ws_connect(client_id, _ws_origin)
+
     # Create a new interview record
-    # MongoDB DISABLED - Using placeholder values instead
-    # interview_id = db.create_interview(user_id, client_state["session_id"])
-    interview_id = f"interview_{int(time.time())}"  # Placeholder interview ID
+    interview_id = f"interview_{int(time.time())}"
     client_state["interview_id"] = interview_id
-    print(f"WebSocket session started with interview {interview_id} (user will be set on start_interview)")
 
     # Initialize conversation history
     if not hasattr(health_agent, "history"):
@@ -2603,6 +2678,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # formId from URL (e.g. FRM-01, FRM-02); fall back to default
                         provided_form_id = data.get("formId") or DEFAULT_FORM_ID
                         client_state["form_id"] = provided_form_id
+                        _interview_mode = "PROM" if provided_form_id != DEFAULT_FORM_ID else "NEW"
+                        clog.interview_start(provided_user_id, provided_form_id, _interview_mode)
                         # Initialize form_data early so it's always defined regardless of
                         # resume vs new-interview path (avoids UnboundLocalError).
                         form_data = {}
@@ -2769,6 +2846,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         provided_user_id, _skeleton, "PROM",
                                         form_id=provided_form_id,
                                         preferred_doc_id=client_state.get("prom_source_doc_id"),
+                                        collection=client_state.get("customer_info_coll"),
                                     )
                                     print(f"[tagged-questions] Created skeleton with {len(_skeleton)} PROM scales")
                                 except Exception as _ske:
@@ -2822,11 +2900,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                         # Check if user already has a form (resume mode)
                         if existing_form:
-                            print(f"[start_interview] RESUME MODE: Found existing form for user {provided_user_id}.")
+                            clog.interview_start(provided_user_id, provided_form_id, "RESUME")
                             is_resuming = True
                         else:
                             # NEW INTERVIEW MODE: No existing form for this user, start fresh
-                            print(f"[start_interview] NEW INTERVIEW MODE: No existing form for user {provided_user_id}. Resetting health_agent.")
+                            clog.interview_start(provided_user_id, provided_form_id, "NEW")
                             reset_health_agent_for_new_interview(client_state, provided_user_id, agent=health_agent)
                             # reset_health_agent_for_new_interview clears form_id; restore it
                             client_state["form_id"] = provided_form_id
@@ -3498,7 +3576,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 user_id=client_state["user_id"],
                                 form_data=copy.deepcopy(health_agent.form),  # Deep copy to prevent sharing
                                 current_section=health_agent.current_section,
-                                form_id=form_id
+                                form_id=form_id,
+                                collection=client_state.get("customer_info_coll"),
                             )
                             await send_text_message(
                                 websocket,
@@ -3535,8 +3614,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             await websocket.send_text(json.dumps({"type": "error", "text": "Too many messages. Please slow down."}))
                             continue
 
-                        print(f"Received text input: {text_input}")
-                        print(f"[text_input] Current talk_mode: {health_agent.talk_mode}, history length: {len(health_agent.history)}")
+                        clog.user_message(client_state.get("user_id", client_id), text_input)
+                        clog.info("text_input", f"talk_mode={health_agent.talk_mode}  history={len(health_agent.history)}")
 
                         # ── Off-topic question shortcut — answer WITHOUT touching the graph ──
                         # Detects two categories:
@@ -3692,7 +3771,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                             # ── LANGGRAPH PATH ─────────────────────────────────
                             if _interview_graph is not None and client_state.get("graph_phase") is not None:
                                 _turn_t0 = time.perf_counter()
-                                print(f"[graph] Processing turn — phase: {client_state.get('graph_phase')}")
+                                clog.info("graph", f"phase={client_state.get('graph_phase')}")
 
                                 # Send thought stages so the frontend shows the AgentThoughtStream card
                                 _current_sec = client_state.get("graph_current_section", "")
@@ -3808,6 +3887,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                         # per-question PROM dict structure.
                                         import copy as _cp_prom
                                         _prom_injected_form = _cp_prom.deepcopy(_gf)
+                                        _prom_coll = client_state.get("customer_info_coll")
                                         asyncio.create_task(asyncio.to_thread(
                                             save_customer_info,
                                             client_state.get("user_id", ""),
@@ -3816,6 +3896,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                             client_state.get("form_id", ""),
                                             None, None,
                                             client_state.get("prom_source_doc_id"),
+                                            _prom_coll,
                                         ))
 
                                 # ── Re-ask unanswered PROM questions ──────────────────────────────
@@ -3958,8 +4039,8 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                         None, _interview_graph.invoke, graph_state
                                     )
 
-                                print(f"[timing] turn_total={(time.perf_counter() - _turn_t0) * 1000:.0f}ms "
-                                      f"phase={result_state.get('phase') if result_state else 'unknown'}")
+                                _turn_ms = (time.perf_counter() - _turn_t0) * 1000
+                                clog.timing("turn", _turn_ms)
 
                                 if _lf_ctx:
                                     try:
@@ -4100,6 +4181,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                         form_data=copy.deepcopy(health_agent.form),
                                         current_section=health_agent.current_section,
                                         form_id=form_id,
+                                        collection=client_state.get("customer_info_coll"),
                                     )
                                     if saved_form_id and not form_id:
                                         client_state["form_id"] = saved_form_id
@@ -4184,7 +4266,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                 transcribe_audio_bytes, audio_bytes
                             )
                             t_stt_ms = (time.perf_counter() - t_stt_start) * 1000
-                            print(f"[audio] Google STT {t_stt_ms:.0f}ms → {transcription[:80]!r}")
+                            clog.audio_received(t_stt_ms, transcription)
 
                             if is_hallucination(transcription):
                                 print("[audio] Hallucination detected — discarding transcription")
@@ -4264,15 +4346,12 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                     print("Received unexpected binary data when not recording")
 
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        clog.ws_error(client_id, str(e))
     finally:
         WS_CONNECTIONS.dec()
         _active_ws_connections.discard(websocket)
         _log.info("ws_disconnected", client_id=client_id)
-        print("Client disconnected")
-        # Close database connection
-        # MongoDB DISABLED - Commented out
-        # db.close()
+        clog.ws_disconnect(client_id)
 
 
 def validate_user_exists(user_id: str) -> bool:
@@ -4380,8 +4459,29 @@ async def get_users(
         )
 
 
+def _is_dev_request(headers) -> bool:
+    """True when the request originates from the dev frontend."""
+    # Vercel proxy forwards the original host in x-forwarded-host; Origin is stripped.
+    fwd_host = headers.get("x-forwarded-host", "")
+    origin   = headers.get("origin", "")
+    host     = headers.get("host", "")
+    dev_host = "dev.customerai.stance.health"
+    return (
+        dev_host in fwd_host
+        or DEV_ORIGIN in origin
+        or dev_host in host
+    )
+
+
+def _db_for_request(request: Request):
+    """Return the mongo DB appropriate for this HTTP request's origin."""
+    if _is_dev_request(request.headers) and dev_mongo_client is not None:
+        return dev_mongo_client[DEV_MONGO_DB_NAME]
+    return mongo_client[MONGO_DB_NAME] if mongo_client else None
+
+
 @app.get("/api/users/{user_id}/consent")
-async def get_consent_status(user_id: str):
+async def get_consent_status(user_id: str, request: Request):
     """
     Check whether a user has accepted the consent policy.
     Checks two sources:
@@ -4389,8 +4489,11 @@ async def get_consent_status(user_id: str):
     2. consentrecords collection (written by consent.stance.health via recordConsent GraphQL mutation)
     """
     try:
-        from app.config import MONGO_DB_NAME
-        users_col = ensure_users_collection()
+        db = _db_for_request(request)
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        users_col = db[MONGO_USERS_COLLECTION]
+        clog.info("consent", f"user={user_id}  db={db.name}")
         user_oid = ObjectId(user_id)
 
         # Source 1: users.profileData.consentAccepted
@@ -4411,7 +4514,6 @@ async def get_consent_status(user_id: str):
 
         # Source 2: consentrecords collection (created by consent.stance.health)
         try:
-            db = users_col.database
             consent_col = db["consentrecords"]
             record = consent_col.find_one(
                 {"userId": user_oid, "isActive": True},
@@ -4435,11 +4537,14 @@ async def get_consent_status(user_id: str):
 
 
 @app.post("/api/users/{user_id}/consent")
-async def accept_consent(user_id: str):
+async def accept_consent(user_id: str, request: Request):
     """Record that a user has accepted the consent policy."""
     try:
         from datetime import datetime, timezone
-        collection = ensure_users_collection()
+        db = _db_for_request(request)
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        collection = db[MONGO_USERS_COLLECTION]
         user_oid = ObjectId(user_id)
         result = collection.update_one(
             {"_id": user_oid},
