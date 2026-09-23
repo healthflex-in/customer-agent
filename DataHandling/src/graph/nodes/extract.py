@@ -434,6 +434,9 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
 
         # Unpack the tagged extraction result and log it in the main thread
         _extract_method, updated_form = _extract_result if isinstance(_extract_result, tuple) else ("failed", form)
+        if not _is_prom:
+            from src.graph.pure_functions.complaint_severity import reconcile_severities
+            updated_form = reconcile_severities(form, updated_form, user_input, current_section)
 
         updated_lifestyle = merge_lifestyle_answer(
             updated_form.get("History & Diagnostics", {}).get("Current Lifestyle", ""),

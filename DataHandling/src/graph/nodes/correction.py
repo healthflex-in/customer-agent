@@ -11,6 +11,10 @@ def make_detect_correction_node(llm_complete):
         form = state["form"]
         phase = state["phase"]
         is_summary_mode = (phase == "summary")
+        from src.graph.pure_functions.complaint_severity import explicit_severity_updates
+        updates = explicit_severity_updates(form, user_input)
+        if updates:
+            return {"correction_data": {"severity_updates": updates}}
         result = detect_form_correction(
             user_input, form, is_summary_mode=is_summary_mode, llm_complete=llm_complete
         )
@@ -38,6 +42,22 @@ def make_apply_correction_node(llm_complete):
 
         form = state["form"]
         history = list(state["history"])
+
+        if "severity_updates" in correction_data:
+            import copy
+            updated_form = copy.deepcopy(form)
+            changes = []
+            for (section, field), score in correction_data["severity_updates"].items():
+                updated_form[section][field] = score
+                description = (updated_form[section].get("Primary Complaint")
+                               if section.startswith("Additional Complaint ") else
+                               updated_form.get("Pain Assessment", {}).get("Primary Location of Pain")
+                               or updated_form.get("Present Complaint", {}).get("Primary Complaint"))
+                changes.append(f"{description}: {score}")
+            message = "I've updated the pain ratings separately: " + "; ".join(changes) + ". Would you like to update anything else? If everything is correct, you can confirm."
+            return {"form": updated_form, "correction_applied": True,
+                    "response_text": message,
+                    "history": history + [{"role": "agent", "message": message}]}
 
         updated_form, success, message = apply_form_correction(correction_data, form, llm_complete)
 

@@ -18,7 +18,14 @@ def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
         # steer a subsequent correction or approval back to outdated details.
         summary_text = _fallback_summary(state["form"])
 
-        result = classify_summary_response(user_input, summary_text, llm_complete)
+        from src.graph.pure_functions.complaint_severity import explicit_severity_updates, complaint_targets, SCORE
+        updates = explicit_severity_updates(state["form"], user_input)
+        if updates:
+            result = {"intent": "request_change", "correction_text": user_input}
+        elif SCORE.search(user_input) and len(complaint_targets(state["form"])) > 1:
+            result = {"intent": "request_change", "correction_text": None}
+        else:
+            result = classify_summary_response(user_input, summary_text, llm_complete)
         history = list(state["history"])
         history.append({"role": "user", "message": user_input})
         return {"summary_intent": result, "history": history}
