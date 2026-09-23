@@ -11,6 +11,17 @@ from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
 
 
+def reports_with_verified_upload(value: str) -> str:
+    """Keep extracted report findings, replacing obsolete absence claims."""
+    text = str(value or "").strip()
+    if re.search(r"^(?:none|not mentioned|not applicable|no (?:(?:relevant|related|diagnostic) ){0,3}(?:reports?|documents?|scans?)\b)", text.lower()) or re.search(r"\b(?:reports?|documents?) (?:are )?(?:not available|unavailable)\b", text.lower()):
+        text = ""
+    receipt = "Diagnostic documents uploaded and attached to this assessment"
+    if receipt.lower() in text.lower():
+        return text
+    return f"{text}; {receipt}" if text else receipt
+
+
 def generate_interview_summary(
     form: dict,
     history: list,
@@ -71,6 +82,11 @@ Return ONLY the summary text."""
                 f'- You also told us: "{text}"' for text in additions
             )
             summary += "\n\n" + approval
+        reports = str(form.get("History & Diagnostics", {}).get("Reports", "")).strip()
+        if reports and re.search(r"\b(?:uploaded|attached)\b", reports.lower()) and summary:
+            approval = "Is this information correct, or would you like to make any changes?"
+            summary = summary.replace(approval, "").rstrip()
+            summary += "\n\nReport information:\n- " + reports + "\n\n" + approval
         return summary or _fallback_summary(form)
     except Exception as e:
         print(f"[generate_interview_summary] Failed: {error_type(e)}")
@@ -103,13 +119,24 @@ def classify_summary_response(
     normalized = re.sub(r"[^a-z0-9\s]", " ", user_input.lower())
     normalized = " ".join(normalized.split())
 
-    if re.search(r"\b(?:have uploaded|already uploaded|just uploaded|i uploaded|uploaded my|uploaded the|done uploading)\b", normalized):
-        return {
-            "intent": "has_reports",
-            "wants_upload": False,
-            "upload_claimed": True,
-            "correction_text": None,
-        }
+    # New documents and acknowledgements are different actions. Check additions
+    # first: a patient may have uploaded one file AND have another to share.
+    report_word = r"(?:reports?|documents?|files?|x rays?|xrays?|mri|ct scans?|blood tests?)"
+    additional = bool(re.search(
+        rf"\b(?:other|another|additional|more|new|second)\s+(?:\w+\s+){{0,2}}{report_word}\b",
+        normalized,
+    )) and not re.search(r"\b(?:no|not have|dont have|don t have|do not have)\s+(?:any )?(?:other|another|additional|more|new|second)\b", normalized)
+    if additional:
+        declined = bool(re.search(r"\b(?:share|show|give).*\b(?:doctor|clinician)\b|\b(?:dont|don t|do not|not|won t|will not).*\bupload\b", normalized))
+        return {"intent": "has_reports", "has_reports": True,
+                "additional_reports": True, "wants_upload": not declined,
+                "correction_text": None}
+
+    if re.search(r"\b(?:already attach(?:ed)?|u(?:p)?loaded|u loaded|done uploading)\b", normalized) and not re.search(
+        r"\b(?:not|never|dont|don t|do not|haven t|have not)\b", normalized
+    ):
+        return {"intent": "has_reports", "wants_upload": False,
+                "upload_claimed": True, "correction_text": None}
 
     if normalized in {
         "yes", "correct", "looks good", "that is right", "thats right",

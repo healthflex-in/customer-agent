@@ -1883,7 +1883,17 @@ async def send_text_message(
         user_response: Optional user's previous response (to check if they have reports)
         force_request_attachment: If True, always show the upload button regardless of heuristics
     """
-    if force_request_attachment:
+    if interview_state and interview_state.get("status") == FORM_COMPLETED:
+        # Completion during an active session uses a final text_message. Lock
+        # server-side too, so already queued patient messages cannot call AI.
+        client_state["attempt_locked"] = True
+        client_state["locked_form"] = {
+            "formId": client_state.get("form_id"),
+            "attemptId": client_state.get("attempt_id"),
+            "status": FORM_COMPLETED,
+        }
+        requires_attachment = False
+    elif force_request_attachment:
         requires_attachment = True
     else:
         current_section = interview_state.get("section") if interview_state else health_agent.current_section
@@ -3781,6 +3791,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                     )
                                     _prom_result_state = {
                                         "form": _prom_injected_form or {},
+                                        "phase": "complete" if _is_complete else "interviewing",
                                         "current_section": "PROM",
                                         "missing_fields": [],
                                     }
@@ -3946,6 +3957,8 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                         _prom_session_complete = True
 
                                 # Opt 3: use cached form for progress — no blocking DB fetch per turn
+                                if _prom_session_complete:
+                                    result_state = {**result_state, "phase": "complete"}
                                 _cached_form = result_state.get("form", {})
                                 if result_state.get("phase") == "complete":
                                     progress = 100.0
@@ -4748,9 +4761,12 @@ async def upload_form_attachment(
         },
         "updatedAt": now,
     }
+    from src.graph.pure_functions.summary import reports_with_verified_upload
+    report_value = reports_with_verified_upload(hist_diag.get("Reports", ""))
     if not str(hist_diag.get("Reports", "")).strip():
-        update_fields["form_data.History & Diagnostics.Reports"] = processing_text
-        form_data.setdefault("History & Diagnostics", {})["Reports"] = processing_text
+        report_value += "; " + processing_text
+    update_fields["form_data.History & Diagnostics.Reports"] = report_value
+    form_data.setdefault("History & Diagnostics", {})["Reports"] = report_value
 
     from app.uploads.attachments import append_attachment_urls_expression
     await run_blocking(

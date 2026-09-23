@@ -5,7 +5,7 @@ then handle the result (confirm, change, reports, etc.).
 from typing import Callable
 
 from src.graph.state import InterviewState
-from src.graph.pure_functions.summary import classify_summary_response, _fallback_summary
+from src.graph.pure_functions.summary import classify_summary_response, _fallback_summary, reports_with_verified_upload
 from src.graph.nodes.generate import required_response_before_summary
 
 
@@ -18,7 +18,14 @@ def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
         # steer a subsequent correction or approval back to outdated details.
         summary_text = _fallback_summary(state["form"])
 
-        result = classify_summary_response(user_input, summary_text, llm_complete)
+        from src.graph.pure_functions.complaint_severity import explicit_severity_updates, complaint_targets, SCORE
+        updates = explicit_severity_updates(state["form"], user_input)
+        if updates:
+            result = {"intent": "request_change", "correction_text": user_input}
+        elif SCORE.search(user_input) and len(complaint_targets(state["form"])) > 1:
+            result = {"intent": "request_change", "correction_text": None}
+        else:
+            result = classify_summary_response(user_input, summary_text, llm_complete)
         history = list(state["history"])
         history.append({"role": "user", "message": user_input})
         return {"summary_intent": result, "history": history}
@@ -75,10 +82,33 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
 
         elif intent == "has_reports":
+            updated_form = {section: dict(fields) if isinstance(fields, dict) else fields
+                            for section, fields in state["form"].items()}
+            diagnostics = updated_form.setdefault("History & Diagnostics", {})
             if state.get("reports_uploaded"):
+                diagnostics["Reports"] = reports_with_verified_upload(diagnostics.get("Reports", ""))
+            elif not summary_intent.get("upload_claimed"):
+                diagnostics["Reports"] = "Patient reports having diagnostic documents; upload not yet verified"
+            patch["form"] = updated_form
+            if state.get("reports_uploaded") and summary_intent.get("additional_reports"):
+                diagnostics["Reports"] += "; patient has additional reports to share"
+            if summary_intent.get("additional_reports") and wants_upload is not False:
                 response_text = (
-                    "Your documents are already attached to this assessment. "
-                    "There is no need to upload them again. Is the summary correct, "
+                    "You can upload the additional report here. Any documents you previously "
+                    "uploaded will remain attached to this assessment."
+                )
+                patch.update(awaiting_report_upload=True, request_attachment=True,
+                             response_text=response_text,
+                             history=state["history"] + [{"role": "agent", "message": response_text}])
+            elif state.get("reports_uploaded") and wants_upload is False and not summary_intent.get("upload_claimed"):
+                response_text = "Your uploaded documents remain attached. You can share the additional reports directly with your clinician. Is the summary otherwise correct?"
+                patch.update(awaiting_report_upload=False, request_attachment=False,
+                             response_text=response_text,
+                             history=state["history"] + [{"role": "agent", "message": response_text}])
+            elif state.get("reports_uploaded"):
+                response_text = (
+                    "The documents you just uploaded are already attached to this assessment. "
+                    "I've updated your report information to reflect the upload. Is the summary otherwise correct, "
                     "or would you like to change any information?"
                 )
                 patch["awaiting_report_upload"] = False
@@ -107,6 +137,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                     "You can upload MRI, X-ray, CT scan, or blood test reports."
                 )
                 patch["awaiting_report_upload"] = True
+                patch["request_attachment"] = True
                 patch["response_text"] = response_text
                 patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
             else:
@@ -116,6 +147,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                     "You can upload MRI, X-ray, CT scan, or blood test reports."
                 )
                 patch["awaiting_report_upload"] = True
+                patch["request_attachment"] = True
                 patch["response_text"] = response_text
                 patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
 
@@ -127,10 +159,15 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             }
             if "History & Diagnostics" in updated_form and isinstance(updated_form["History & Diagnostics"], dict):
                 updated_form["History & Diagnostics"]["Reports"] = (
+                    "Diagnostic documents uploaded and attached; no additional reports available"
+                    if state.get("reports_uploaded") else
                     "No relevant diagnostic reports available for this issue"
                 )
             patch["form"] = updated_form
-            # response_text stays empty — edges will route to generate_summary to re-show
+            response_text = "I've noted your report information. Is the summary otherwise correct, or would you like to change anything?"
+            patch.update(response_text=response_text, awaiting_report_upload=False,
+                         request_attachment=False,
+                         history=state["history"] + [{"role": "agent", "message": response_text}])
 
         elif intent == "request_change":
             # A general rejection ("this is wrong", "I want changes") does not

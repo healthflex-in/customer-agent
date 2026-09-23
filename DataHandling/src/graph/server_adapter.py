@@ -340,6 +340,8 @@ def build_interview_state_from_graph(
         "attemptId": attempt_id,
         "sectionProgress": section_progress,
         "promSteps": _all_prom_scales if _is_prom else None,
+        "status": "completed" if result_state.get("phase") == "complete" else "in_progress",
+        "locked": result_state.get("phase") == "complete",
     }
 
 
