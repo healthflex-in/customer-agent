@@ -54,6 +54,23 @@ class ComplaintSeverityTests(unittest.TestCase):
         self.assertEqual(result["Pain Assessment"]["Severity (1-10)"], "6/10")
         self.assertEqual(explicit_severity_updates(self.form, "7/10"), {})
 
+    def test_bare_score_uses_active_complaint_when_severity_was_asked(self):
+        question = "On a scale of 0 to 10, how severe is it right now?"
+        for text in ("5", "it is 5", "on 0 to 10 it is 5, movement makes it worse"):
+            with self.subTest(text=text):
+                result = reconcile_severities(
+                    self.form, self.form, text, self.section, question
+                )
+                self.assertEqual(result[self.section]["Severity (1-10)"], "5/10")
+                self.assertEqual(result["Pain Assessment"]["Severity (1-10)"], "6/10")
+
+    def test_bare_number_without_severity_question_is_not_a_rating(self):
+        result = reconcile_severities(
+            self.form, self.form, "5", self.section,
+            "How many days have you had this?",
+        )
+        self.assertEqual(result[self.section]["Severity (1-10)"], "")
+
     def test_summary_update_applies_both_without_provider(self):
         def unexpected(_):
             self.fail("Explicit scoped score must not require AI")
