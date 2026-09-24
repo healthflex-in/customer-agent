@@ -12,6 +12,24 @@ def is_explicit_symptom_addition(text):
     )
 
 
+def split_update_and_addition(text):
+    """Split `change X and I also have Y` without losing either action."""
+    match = re.search(
+        r"\b(?:and\s+)?(?:i\s+)?(?:also|additionally)\s+(?:have|feel|experience)\b",
+        text,
+        re.I,
+    )
+    if not match:
+        return None
+    update_text = text[:match.start()].strip(" ,.;")
+    addition_text = text[match.start():].strip(" ,.;")
+    if not update_text or not is_explicit_symptom_addition(addition_text):
+        return None
+    if not re.search(r"\b(?:update|change|correct|make|set|should be|instead)\b", update_text, re.I):
+        return None
+    return update_text, addition_text
+
+
 def capture_additional_complaint(form, text):
     updated = copy.deepcopy(form)
     # Keep the exact patient wording as the source of truth. Details about the
