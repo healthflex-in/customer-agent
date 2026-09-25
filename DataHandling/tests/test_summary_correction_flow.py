@@ -26,6 +26,35 @@ def _load_edges_without_langgraph():
 
 
 class SummaryCorrectionFlowTests(unittest.TestCase):
+    def test_combined_severity_update_and_new_complaint_apply_together(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        for text in (
+            "Please update pain to 7 and I also have leg pain",
+            "Please change head pain severity to 7, and I also have leg pain",
+        ):
+            with self.subTest(text=text):
+                state = get_fresh_interview_state("u", "FRM-01", "s")
+                state.update(phase="summary", user_input=text)
+                state["form"]["Present Complaint"]["Primary Complaint"] = "Head pain"
+                state["form"]["Pain Assessment"]["Primary Location of Pain"] = "Head"
+                state["form"]["Pain Assessment"]["Severity (1-10)"] = "5/10"
+
+                def unexpected_llm(_):
+                    self.fail("Clear combined actions must not require an AI call")
+
+                state.update(make_classify_summary_intent_node(unexpected_llm)(state))
+                result = make_handle_summary_response_node(unexpected_llm)(state)
+
+                self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], "7/10")
+                self.assertIn("leg pain", result["form"]["Additional Complaint 1"]["Primary Complaint"].lower())
+                self.assertEqual(result["form"]["Additional Complaint 1"]["Severity (1-10)"], "")
+                self.assertIn("updated", result["response_text"].lower())
+                self.assertIn("added", result["response_text"].lower())
+                self.assertIn("7/10", result["response_text"])
+                self.assertEqual(result["phase"], "interviewing")
+
     def test_generated_summary_cannot_omit_added_pain(self):
         from src.graph.pure_functions.summary import generate_interview_summary
         text = "I have pain in my hand as well"

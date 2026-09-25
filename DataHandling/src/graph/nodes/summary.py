@@ -19,8 +19,17 @@ def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
         summary_text = _fallback_summary(state["form"])
 
         from src.graph.pure_functions.complaint_severity import explicit_severity_updates, complaint_targets, SCORE
-        updates = explicit_severity_updates(state["form"], user_input)
-        if updates:
+        from src.graph.pure_functions.additional_complaint import split_update_and_addition
+        combined = split_update_and_addition(user_input)
+        if combined:
+            correction_text, addition_text = combined
+            updates = explicit_severity_updates(
+                state["form"], correction_text, "Pain Assessment",
+                "On a scale of 0 to 10, how severe is the pain?",
+            )
+            result = {"intent": "new_complaint", "correction_text": correction_text,
+                      "addition_text": addition_text, "severity_updates": updates}
+        elif (updates := explicit_severity_updates(state["form"], user_input)):
             result = {"intent": "request_change", "correction_text": user_input}
         elif SCORE.search(user_input) and len(complaint_targets(state["form"])) > 1:
             result = {"intent": "request_change", "correction_text": None}
@@ -44,13 +53,35 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
         if intent == "new_complaint":
             from src.graph.pure_functions.additional_complaint import capture_additional_complaint
             from src.graph.pure_functions.question_plan import question_for_missing_fields
+            import copy
+            base_form = copy.deepcopy(state["form"])
+            applied_changes = []
+            for (section, field), value in summary_intent.get("severity_updates", {}).items():
+                base_form[section][field] = value
+                label = (base_form.get("Pain Assessment", {}).get("Primary Location of Pain")
+                         or base_form.get("Present Complaint", {}).get("Primary Complaint")
+                         or "existing complaint")
+                applied_changes.append(f"{label} pain to {value}")
+            correction_text = summary_intent.get("correction_text")
+            if correction_text and not applied_changes:
+                from src.graph.pure_functions.form_extraction import detect_form_correction, apply_form_correction
+                correction = detect_form_correction(
+                    correction_text, base_form, is_summary_mode=True,
+                    llm_complete=llm_complete,
+                )
+                if correction:
+                    corrected, success, _ = apply_form_correction(correction, base_form, llm_complete)
+                    if success:
+                        base_form = corrected
+                        applied_changes.append("the requested existing information")
             updated_form, added_section = capture_additional_complaint(
-                state["form"], state["user_input"]
+                base_form, summary_intent.get("addition_text") or state["user_input"]
             )
             missing = [(added_section, field) for field, value in updated_form[added_section].items() if not value]
             response_text = (
-                "I've added what you just shared alongside your earlier concern: "
-                + state["user_input"].strip()
+                ("I've updated " + ", ".join(applied_changes) + " and added your new concern: "
+                 if applied_changes else "I've added what you just shared alongside your earlier concern: ")
+                + (summary_intent.get("addition_text") or state["user_input"]).strip()
                 + "\n\nFor this additional concern, "
                 + question_for_missing_fields(missing, {})
             )

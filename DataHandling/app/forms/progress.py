@@ -9,6 +9,14 @@ SECTION_ORDER = (
     "Referral",
 )
 
+
+def _ordered_sections(form_data):
+    """Include runtime additional complaints after the canonical intake."""
+    return [name for name in SECTION_ORDER if name in form_data] + [
+        name for name in form_data
+        if name not in SECTION_ORDER and name.startswith("Additional Complaint ")
+    ]
+
 PREVIOUS_CONSULTATIONS_FIELD = (
     "Previous Diagnosis or Advice and Prescribed Treatment Taken"
 )
@@ -47,9 +55,7 @@ def calculate_form_progress(form_data):
     total_fields = 0
     filled_fields = 0
 
-    for section_name in SECTION_ORDER:
-        if section_name not in form_data:
-            continue
+    for section_name in _ordered_sections(form_data):
 
         section_data = form_data[section_name]
         if not isinstance(section_data, dict):
@@ -106,9 +112,8 @@ def calculate_section_completion_status(form_data):
     completed_sections = []
     incomplete_sections = []
 
-    for section_name in SECTION_ORDER:
-        if section_name not in form_data:
-            continue
+    ordered_sections = _ordered_sections(form_data)
+    for section_name in ordered_sections:
 
         section_data = form_data[section_name]
         if not isinstance(section_data, dict):
@@ -171,7 +176,7 @@ def calculate_section_completion_status(form_data):
 
     # The frontend maps step state by canonical index, so completion must not
     # reorder the response.
-    order_map = {name: index for index, name in enumerate(SECTION_ORDER)}
+    order_map = {name: index for index, name in enumerate(ordered_sections)}
     all_sections = sorted(
         completed_sections + incomplete_sections,
         key=lambda section: order_map.get(section["name"], 99),
