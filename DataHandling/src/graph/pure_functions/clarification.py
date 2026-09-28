@@ -14,6 +14,27 @@ _CLARIFICATION_PATTERNS = (
     r"\bwhy (?:do|are) you (?:need|asking|ask)\b",
 )
 
+_ACTIVITY_CLEARANCE = re.compile(
+    r"\b(?:can|could|should|may|am i (?:able|allowed)|is it (?:safe|okay|ok))\b"
+    r".{0,55}\b(?:return|go back|resume|start|continue|play|do)\b"
+    r".{0,35}\b(?:sports?|exercise|workouts?|gym|running|training|football|cricket|cycling|swimming)\b",
+    re.I,
+)
+
+
+def build_activity_clearance_response(user_input: str | None) -> str | None:
+    """Safely answer return-to-activity questions without pretending to clear care."""
+    text = " ".join(str(user_input or "").split())
+    if not _ACTIVITY_CLEARANCE.search(text):
+        return None
+    return (
+        "I can't safely confirm whether you should return to sport from this intake alone. "
+        "Your clinician needs to assess your symptoms, movement and strength before giving "
+        "you return-to-sport guidance. Until then, avoid activities that reproduce or worsen "
+        "your symptoms and follow any advice already given by your clinician. When you're "
+        "ready, please answer the earlier intake questions so your clinician has the details needed."
+    )
+
 
 def build_intake_clarification(
     user_input: str | None,

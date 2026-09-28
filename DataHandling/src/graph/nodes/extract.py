@@ -204,7 +204,10 @@ def _classify_visit_context(user_input: str, llm_complete) -> str:
 
 from src.graph.pure_functions.form_extraction import extract_form_data_from_text
 from src.graph.pure_functions.form_validation import validate_section
-from src.graph.pure_functions.clarification import build_intake_clarification
+from src.graph.pure_functions.clarification import (
+    build_activity_clearance_response,
+    build_intake_clarification,
+)
 from src.graph.pure_functions.question_repetition import asks_about_answered_field
 from src.graph.pure_functions.lifestyle import merge_lifestyle_answer
 from src.graph.pure_functions.referral import (
@@ -269,6 +272,22 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     "pending_question": None,
                     "direct_response_handled": True,
                 }
+
+        activity_response = build_activity_clearance_response(user_input)
+        if activity_response:
+            # This is a question, not an answer to the compound intake prompt.
+            # Answer before classification/extraction so it cannot overwrite
+            # form data or immediately repeat the same unanswered question.
+            return {
+                "history": history + [
+                    {"role": "user", "message": user_input},
+                    {"role": "agent", "message": activity_response},
+                ],
+                "response_text": activity_response,
+                "reports_intent": {},
+                "pending_question": None,
+                "direct_response_handled": True,
+            }
 
         # ── Visit context classification (fallback only) ──────────────────────
         _visit_context_update = {}

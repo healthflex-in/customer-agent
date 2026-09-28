@@ -3,7 +3,10 @@ import types
 import unittest
 from unittest.mock import patch
 
-from src.graph.pure_functions.clarification import build_intake_clarification
+from src.graph.pure_functions.clarification import (
+    build_activity_clearance_response,
+    build_intake_clarification,
+)
 from src.graph.state import get_fresh_interview_state
 
 try:
@@ -20,6 +23,43 @@ except ModuleNotFoundError as exc:
 
 
 class IntakeClarificationTests(unittest.TestCase):
+    def test_return_to_sport_question_gets_safe_answer(self):
+        for text in (
+            "I just want to know can I return back to sports or not",
+            "Can I resume running?",
+            "Is it safe to go back to the gym?",
+        ):
+            with self.subTest(text=text):
+                response = build_activity_clearance_response(text)
+                self.assertIn("can't safely confirm", response)
+                self.assertIn("clinician", response)
+                self.assertIn("avoid activities", response)
+
+    def test_activity_statement_is_not_intercepted(self):
+        self.assertIsNone(build_activity_clearance_response("I returned to sports last week"))
+
+    def test_return_to_sport_interrupt_does_not_repeat_or_extract(self):
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="interviewing",
+            current_section="Present Complaint",
+            user_input="I just want to know can I return back to sports or not",
+            history=[{"role": "agent", "message": "How long has this issue lasted, and did it start suddenly?"}],
+        )
+
+        def unexpected(_prompt):
+            self.fail("Activity-clearance interruption must not call an AI provider")
+
+        with patch("src.graph.nodes.extract.get_stream_writer", return_value=lambda _event: None):
+            result = make_extract_node(unexpected, reasoning_llm=unexpected)(state)
+
+        self.assertTrue(result["direct_response_handled"])
+        self.assertIn("can't safely confirm", result["response_text"])
+        self.assertNotIn("How long", result["response_text"])
+        self.assertNotIn("form", result)
+        self.assertEqual(result["history"][-2]["role"], "user")
+        self.assertEqual(result["history"][-1]["role"], "agent")
+
     def test_surgery_clarification_explains_requested_details(self):
         response = build_intake_clarification(
             "What basically do you want to know about my surgery?",
