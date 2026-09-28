@@ -21,19 +21,97 @@ _ACTIVITY_CLEARANCE = re.compile(
     re.I,
 )
 
+OUT_OF_FLOW_RESPONSE = (
+    "I'm here to collect information for your clinical assessment, so I'm unable "
+    "to answer unrelated questions, provide medical advice, recommend medication, "
+    "or confirm when it's safe to return to activity. A clinician or physiotherapist "
+    "can assess your condition and advise you on what's appropriate."
+)
+
+_QUESTION_OPENING = re.compile(
+    r"^(?:can|could|should|may|would|will|do|does|did|is|are|am|what|when|where|"
+    r"why|how|which|who|tell me|explain|recommend)\b",
+    re.I,
+)
+_MEDICATION_ADVICE = re.compile(
+    r"\b(?:can|could|should|may|do|would|what|which|how much|how many)\b"
+    r".{0,60}\b(?:medicine|medication|painkillers?|tablets?|dose|dosage|"
+    r"paracetamol|acetaminophen|ibuprofen|aspirin|naproxen|diclofenac)\b",
+    re.I,
+)
+_MEDICAL_ADVICE_PHRASES = (
+    "what do you think", "your opinion", "what could it be", "what could this",
+    "what might it be", "what might this",
+    "what is wrong", "what's wrong", "likely diagnosis", "can you diagnose",
+    "is it serious", "should i be worried", "how bad is it", "what should i do",
+    "what can i do", "how do i treat", "how can i treat", "what treatment",
+    "what are the causes", "what causes", "what are the symptoms", "why does",
+    "do i need surgery", "which exercise should", "what exercise should",
+)
+_BRAND_OR_UNRELATED_TERMS = (
+    "stance health", "about stance", "your clinic", "the clinic", "clinic location",
+    "your services", "physiotherapy service", "how does stance", "about you",
+    "who are you", "what do you do", "what does stance", "stance team",
+    "stance location", "where are you located", "how many center", "how many clinic",
+    "how many branch", "book a session", "what do you offer",
+    "weather", "news", "politics", "stock price", "crypto", "sports score",
+    "tell me a joke", "movie", "song", "recipe", "homework",
+)
+_IN_FLOW_OPERATIONAL = re.compile(
+    r"\b(?:upload|attach|document|report|scan|repeat|skip|change|correct|update|"
+    r"include|mention|answer|previous question|form)\b",
+    re.I,
+)
+
 
 def build_activity_clearance_response(user_input: str | None) -> str | None:
     """Safely answer return-to-activity questions without pretending to clear care."""
     text = " ".join(str(user_input or "").split())
     if not _ACTIVITY_CLEARANCE.search(text):
         return None
-    return (
-        "I can't safely confirm whether you should return to sport from this intake alone. "
-        "Your clinician needs to assess your symptoms, movement and strength before giving "
-        "you return-to-sport guidance. Until then, avoid activities that reproduce or worsen "
-        "your symptoms and follow any advice already given by your clinician. When you're "
-        "ready, please answer the earlier intake questions so your clinician has the details needed."
-    )
+    return OUT_OF_FLOW_RESPONSE
+
+
+def build_out_of_flow_response(
+    user_input: str | None,
+    last_agent_question: str | None = None,
+) -> str | None:
+    """Return the global boundary message for questions outside intake collection.
+
+    Plain clinical answers and requests to clarify the intake question are allowed
+    through. Urgent-risk detection remains the caller's higher-priority concern.
+    """
+    text = " ".join(str(user_input or "").split())
+    lowered = text.lower()
+    if not text:
+        return None
+    if build_intake_clarification(text, last_agent_question) is not None:
+        return None
+    if _ACTIVITY_CLEARANCE.search(text) or _MEDICATION_ADVICE.search(text):
+        return OUT_OF_FLOW_RESPONSE
+
+    is_question = "?" in text or bool(_QUESTION_OPENING.search(text))
+    if not is_question:
+        return None
+    if any(phrase in lowered for phrase in _MEDICAL_ADVICE_PHRASES):
+        return OUT_OF_FLOW_RESPONSE
+    if any(term in lowered for term in _BRAND_OR_UNRELATED_TERMS):
+        return OUT_OF_FLOW_RESPONSE
+
+    # Questions about supplying or correcting intake information belong to the
+    # interview itself and must continue to the existing upload/clarification flow.
+    if _IN_FLOW_OPERATIONAL.search(text):
+        return None
+
+    # General requests for medical education or treatment guidance.
+    if any(phrase in lowered for phrase in (
+        "tell me about", "can you tell me", "can u tell me", "explain", "what is",
+        "what are", "what can", "what happens", "how does", "how do i", "info on",
+        "information on", "more about", "difference between",
+    )):
+        return OUT_OF_FLOW_RESPONSE
+    # Remaining genuine questions are outside the data-collection contract.
+    return OUT_OF_FLOW_RESPONSE if is_question else None
 
 
 def build_intake_clarification(

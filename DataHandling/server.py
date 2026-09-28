@@ -116,6 +116,7 @@ from app.clinical.escalation import (
     record_escalation,
 )
 from app.clinical.scope import assess_msk_intake_scope
+from src.graph.pure_functions.clarification import build_out_of_flow_response
 from app.ws.idempotency import RecentRequestWindow, RequestDecision
 from app.observability.privacy import env_flag, error_type, pseudonymous_id
 # Pure stateless helpers. Aliased to legacy names used throughout this file.
@@ -3385,6 +3386,40 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             continue
 
+                        # Global interview boundary. Out-of-flow, medical-advice,
+                        # medication and return-to-activity questions receive one
+                        # fixed response without changing form state or invoking AI.
+                        _last_agent_question = next(
+                            (
+                                entry.get("message", "")
+                                for entry in reversed(client_state.get("graph_history") or [])
+                                if entry.get("role") == "agent"
+                            ),
+                            "",
+                        )
+                        _boundary_response = (
+                            None
+                            if _structured_prom_answers is not None
+                            else build_out_of_flow_response(
+                                text_input, _last_agent_question
+                            )
+                        )
+                        if _boundary_response:
+                            client_state["graph_history"] = list(
+                                client_state.get("graph_history") or []
+                            ) + [
+                                {"role": "user", "message": text_input},
+                                {"role": "agent", "message": _boundary_response},
+                            ]
+                            await send_text_message(
+                                websocket,
+                                client_state,
+                                _boundary_response,
+                                await build_interview_state_async(client_state),
+                                user_response=None,
+                            )
+                            continue
+
                         # ── Off-topic question shortcut — answer WITHOUT touching the graph ──
                         # Detects two categories:
                         # 1. Brand questions → query ChromaDB (Stance brandbook)
@@ -3397,11 +3432,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # First turn (talk_mode START) is always the intake response.
                         _ti_lower = text_input.lower()
                         _word_count = len(text_input.split())
-                        _off_topic_eligible = (
-                            _structured_prom_answers is None
-                            and health_agent.talk_mode != "START"
-                            and _word_count <= 25
-                        )
+                        # Retained temporarily for compatibility, but disabled:
+                        # policy now requires the deterministic boundary above,
+                        # never an AI-generated medical or off-topic answer.
+                        _off_topic_eligible = False
 
                         # "stance" alone always means Stance Health — catch it too
                         _is_just_stance = (
