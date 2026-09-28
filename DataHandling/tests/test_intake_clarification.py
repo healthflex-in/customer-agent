@@ -26,6 +26,7 @@ class IntakeClarificationTests(unittest.TestCase):
     def test_return_to_sport_question_gets_safe_answer(self):
         for text in (
             "I just want to know can I return back to sports or not",
+            "when i can get back to the sports",
             "Can I resume running?",
             "Is it safe to go back to the gym?",
         ):

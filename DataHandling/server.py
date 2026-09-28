@@ -4015,7 +4015,10 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                             prom_snapshot=client_state.get("prom_snapshot"),
                                         )
                                 else:
-                                    _save_section = result_state.get("current_section", "")
+                                    _save_section = (
+                                        "Completed" if result_state.get("phase") == "complete"
+                                        else result_state.get("current_section", "")
+                                    )
                                     await run_blocking(
                                         _save_for_graph,
                                         _save_user_id, _save_form, _save_section, _save_form_id,

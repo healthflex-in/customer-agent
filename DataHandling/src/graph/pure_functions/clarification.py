@@ -16,7 +16,7 @@ _CLARIFICATION_PATTERNS = (
 
 _ACTIVITY_CLEARANCE = re.compile(
     r"\b(?:can|could|should|may|am i (?:able|allowed)|is it (?:safe|okay|ok))\b"
-    r".{0,55}\b(?:return|go back|resume|start|continue|play|do)\b"
+    r".{0,55}\b(?:return|get back|go back|resume|start|continue|play|do)\b"
     r".{0,35}\b(?:sports?|exercise|workouts?|gym|running|training|football|cricket|cycling|swimming)\b",
     re.I,
 )
