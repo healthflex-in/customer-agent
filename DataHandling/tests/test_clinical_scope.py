@@ -41,10 +41,13 @@ class ClinicalScopeTests(unittest.TestCase):
         source = (backend_root / "server.py").read_text(encoding="utf-8")
         urgent_gate = source.index("_escalation = assess_urgent_risk(")
         scope_gate = source.index("_scope_decision = assess_msk_intake_scope(text_input)")
+        boundary_gate = source.index("_boundary_response = (")
         off_topic = source.index("# ── Off-topic question shortcut")
         graph_path = source.index("# ── LANGGRAPH PATH")
 
         self.assertLess(urgent_gate, scope_gate)
+        self.assertLess(scope_gate, boundary_gate)
+        self.assertLess(boundary_gate, off_topic)
         self.assertLess(scope_gate, off_topic)
         self.assertLess(scope_gate, graph_path)
 
@@ -57,6 +60,17 @@ class ClinicalScopeTests(unittest.TestCase):
         self.assertNotIn("websocket.close", flow)
         self.assertNotIn('"type": "clinical_escalation"', flow)
         self.assertIn('client_state["scope_notice_sent"] = True', flow)
+
+    def test_global_boundary_preserves_form_flow_and_disables_ai_off_topic_answers(self):
+        source = (Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8")
+        start = source.index("_boundary_response = (")
+        end = source.index("if _session_processing:", start)
+        flow = source[start:end]
+
+        self.assertIn("build_out_of_flow_response(", flow)
+        self.assertIn('client_state["graph_history"]', flow)
+        self.assertIn("user_response=None", flow)
+        self.assertIn("_off_topic_eligible = False", flow)
 
 
 if __name__ == "__main__":

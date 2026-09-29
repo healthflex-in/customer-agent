@@ -207,6 +207,7 @@ from src.graph.pure_functions.form_validation import validate_section
 from src.graph.pure_functions.clarification import (
     build_activity_clearance_response,
     build_intake_clarification,
+    build_out_of_flow_response,
 )
 from src.graph.pure_functions.question_repetition import asks_about_answered_field
 from src.graph.pure_functions.lifestyle import merge_lifestyle_answer
@@ -237,6 +238,29 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         history: list = list(state["history"])
         current_section: str = state.get("current_section", "")
         awaiting_upload: bool = state.get("awaiting_report_upload", False)
+
+        last_agent_for_boundary = next(
+            (
+                entry.get("message", "")
+                for entry in reversed(history)
+                if entry.get("role") == "agent"
+            ),
+            "",
+        )
+        out_of_flow_response = build_out_of_flow_response(
+            user_input, last_agent_for_boundary
+        )
+        if out_of_flow_response:
+            return {
+                "history": history + [
+                    {"role": "user", "message": user_input},
+                    {"role": "agent", "message": out_of_flow_response},
+                ],
+                "response_text": out_of_flow_response,
+                "reports_intent": {},
+                "pending_question": None,
+                "direct_response_handled": True,
+            }
 
         # ── Brand / clinic FAQ detection (RAG) ──────────────────────────────
         # If the user asks about Stance Health (the brand, clinic, services, pricing,
