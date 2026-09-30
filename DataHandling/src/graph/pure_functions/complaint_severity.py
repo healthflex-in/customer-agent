@@ -3,6 +3,11 @@ import copy
 import re
 
 SCORE = re.compile(r"\b(10|[0-9])\s*(?:out\s+of|/)\s*10\b", re.I)
+CORRECTION_SCORE = re.compile(
+    r"\b(?:change|update|correct|set|make|increase|decrease|raise|lower)\b"
+    r".{0,55}?\b(?:to|at)\s*(10|[0-9])\b",
+    re.I,
+)
 BARE_SCORE = re.compile(r"\b(10|[0-9])\b")
 SITE = re.compile(r"\b(?:(left|right)\s+)?(head(?:ache)?|neck|back|shoulders?|arms?|hands?|wrists?|elbows?|hips?|legs?|knees?|ankles?|feet|foot|eyes?|chest|abdomen|stomach|jaw)\b", re.I)
 
@@ -37,6 +42,8 @@ def explicit_severity_updates(form, text, active_section=None, context_question=
     targets = complaint_targets(form)
     updates = {}
     score_matches = list(SCORE.finditer(text))
+    if not score_matches:
+        score_matches = list(CORRECTION_SCORE.finditer(text))
     contextual_bare_value = None
     # A bare number is safe only as a direct response to a severity question.
     # This covers voice/text replies such as "5" and "on 0 to 10 it is 5".
@@ -54,17 +61,22 @@ def explicit_severity_updates(form, text, active_section=None, context_question=
     for clause in clauses:
         sites = _sites(clause)
         clause_scores = list(SCORE.finditer(clause))
+        if not clause_scores:
+            clause_scores = list(CORRECTION_SCORE.finditer(clause))
         if not clause_scores and contextual_bare_value is not None:
             clause_scores = [score for score in BARE_SCORE.finditer(clause)
                              if score[1] == contextual_bare_value]
         for score in clause_scores:
+            is_correction_score = score.re is CORRECTION_SCORE
+            score_start = score.start(1) if is_correction_score else score.start()
+            score_end = score.end(1) if is_correction_score else score.end()
             # "7/10 for my leg" binds forward; "leg pain is 7/10" backward.
-            following = sites if re.match(r"\s+(?:for|in|on)\b", clause[score.end():], re.I) else []
-            candidates = [site for site in following if site[0] >= score.end()]
+            following = sites if re.match(r"\s+(?:for|in|on)\b", clause[score_end:], re.I) else []
+            candidates = [site for site in following if site[0] >= score_end]
             if candidates:
                 chosen = min(candidates, key=lambda site: site[0])
             else:
-                candidates = [site for site in sites if site[1] <= score.start()]
+                candidates = [site for site in sites if site[1] <= score_start]
                 chosen = max(candidates, key=lambda site: site[1]) if candidates else None
             matched = []
             if chosen:

@@ -2220,6 +2220,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     data = json.loads(message["text"])
                     msg_type = data.get("type", "")
 
+                    # Browser WebSockets cannot emit protocol-level ping frames.
+                    # This lightweight application heartbeat keeps idle patient
+                    # sessions alive through proxies/load balancers with a
+                    # one-minute idle timeout. It never changes interview state.
+                    if msg_type == "ping":
+                        await websocket.send_text(json.dumps({"type": "pong"}))
+                        continue
+
                     # A completed attempt remains read-only even if an outdated
                     # or modified client tries to send input after receiving the
                     # lock response. Starting/loading a clinician-assigned attempt

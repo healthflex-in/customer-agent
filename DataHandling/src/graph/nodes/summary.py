@@ -19,7 +19,10 @@ def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
         summary_text = _fallback_summary(state["form"])
 
         from src.graph.pure_functions.complaint_severity import explicit_severity_updates, complaint_targets, SCORE
-        from src.graph.pure_functions.additional_complaint import split_update_and_addition
+        from src.graph.pure_functions.additional_complaint import (
+            additional_complaint_replacement,
+            split_update_and_addition,
+        )
         combined = split_update_and_addition(user_input)
         if combined:
             correction_text, addition_text = combined
@@ -29,6 +32,19 @@ def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
             )
             result = {"intent": "new_complaint", "correction_text": correction_text,
                       "addition_text": addition_text, "severity_updates": updates}
+        elif replacement := additional_complaint_replacement(user_input):
+            additional_sections = [
+                name for name in state["form"]
+                if name.startswith("Additional Complaint ")
+            ]
+            if additional_sections:
+                result = {
+                    "intent": "correct_additional_complaint",
+                    "section": additional_sections[-1],
+                    "replacement": replacement,
+                }
+            else:
+                result = classify_summary_response(user_input, summary_text, llm_complete)
         elif (updates := explicit_severity_updates(state["form"], user_input)):
             result = {"intent": "request_change", "correction_text": user_input}
         elif SCORE.search(user_input) and len(complaint_targets(state["form"])) > 1:
@@ -95,6 +111,25 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                 "response_text": response_text,
                 "history": state["history"] + [{"role": "agent", "message": response_text}],
             }
+        elif intent == "correct_additional_complaint":
+            import copy
+            updated_form = copy.deepcopy(state["form"])
+            section = summary_intent.get("section")
+            replacement = str(summary_intent.get("replacement") or "").strip()
+            if section in updated_form and replacement:
+                updated_form[section]["Primary Complaint"] = replacement
+                response_text = (
+                    f"I've corrected the additional concern to {replacement}. "
+                    "Would you like to update anything else? If everything is correct, you can confirm."
+                )
+                return {
+                    "form": updated_form,
+                    "correction_applied": True,
+                    "response_text": response_text,
+                    "history": state["history"] + [
+                        {"role": "agent", "message": response_text}
+                    ],
+                }
         elif intent == "confirm":
             required_response = required_response_before_summary(
                 state, list(state["history"])

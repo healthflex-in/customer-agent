@@ -3,6 +3,27 @@ import copy
 import re
 
 
+_BODY_SITE = re.compile(
+    r"\b(?:(?:left|right)\s+)?(?:head|neck|back|shoulder|arm|hand|wrist|elbow|"
+    r"hip|leg|knee|ankle|foot|feet|chest|abdomen|stomach|jaw)s?\b",
+    re.I,
+)
+_SYMPTOM = re.compile(r"\b(?:pain|stiffness|weakness|swelling|ache|discomfort)\b", re.I)
+
+
+def _concise_complaint(text):
+    """Extract only the newly reported symptom from an addition sentence."""
+    candidate = re.sub(
+        r"^.*?\b(?:also|additionally)\s+(?:have|feel|experience)\s+",
+        "",
+        str(text),
+        flags=re.I,
+    )
+    candidate = re.split(r"\bbut\b|[.;]", candidate, maxsplit=1, flags=re.I)[0]
+    candidate = candidate.strip(" ,.'\"")
+    return candidate or str(text).strip()
+
+
 def is_explicit_symptom_addition(text):
     lowered = text.lower()
     return bool(
@@ -25,9 +46,60 @@ def split_update_and_addition(text):
     addition_text = text[match.start():].strip(" ,.;")
     if not update_text or not is_explicit_symptom_addition(addition_text):
         return None
-    if not re.search(r"\b(?:update|change|correct|make|set|should be|instead)\b", update_text, re.I):
+    if not re.search(
+        r"\b(?:update|change|correct|make|set|increase|decrease|raise|lower|"
+        r"should be|instead)\b",
+        update_text,
+        re.I,
+    ):
         return None
-    return update_text, addition_text
+    return update_text, _concise_complaint(addition_text)
+
+
+def additional_complaint_replacement(text):
+    """Return a corrected complaint label, or None for an ordinary addition."""
+    lowered = str(text).lower()
+    correction_signal = re.search(
+        r"\b(?:change|correct|update|replace|not .*additional|additional "
+        r"(?:complaint|concern|point) (?:is|should be))\b",
+        lowered,
+    )
+    if not correction_signal:
+        return None
+
+    scoped = str(text)
+    explicit = re.search(
+        r"\badditional (?:complaint|concern|point) (?:is|should be)\s+(.+?)(?:\bbut\b|[.;]|$)",
+        scoped,
+        re.I,
+    )
+    if explicit:
+        scoped = explicit.group(1)
+    matches = list(_BODY_SITE.finditer(scoped))
+    if not matches:
+        return None
+    site = matches[-1].group(0).strip()
+    symptom_matches = list(_SYMPTOM.finditer(scoped))
+    symptom = symptom_matches[-1].group(0).lower() if symptom_matches else "pain"
+    return f"{site} {symptom}".strip()
+
+
+def is_additional_complaint_cancellation(text):
+    """Recognize an explicit retraction/skip of the active added complaint."""
+    normalized = " ".join(str(text).lower().replace("’", "'").split())
+    if re.search(
+        r"\b(?:there (?:is|are)|i have|i don't have|i dont have|no)\s+"
+        r"(?:(?:no|any)\s+)?additional (?:complaint|concern|pain)s?\b",
+        normalized,
+    ):
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:let'?s\s+)?skip (?:this|it)|no need(?:,? enough)?(?: bye)?|"
+            r"remove (?:this|that)(?: additional)? (?:complaint|concern)",
+            normalized.strip(" .,!"),
+        )
+    )
 
 
 def capture_additional_complaint(form, text):

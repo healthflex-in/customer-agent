@@ -39,6 +39,15 @@ REQUIRED_FIELD_QUESTIONS = {
     ),
 }
 
+LIFESTYLE_COMPONENT_QUESTIONS = {
+    "Current Lifestyle — Work": "What is your work or usual occupation?",
+    "Current Lifestyle — Activity or Exercise": (
+        "What is your usual activity or exercise routine?"
+    ),
+    "Current Lifestyle — Smoking": "Do you smoke or use tobacco?",
+    "Current Lifestyle — Alcohol": "Do you drink alcohol?",
+}
+
 
 def question_for_missing_fields(
     missing: list[tuple[str, str]], field_labels: dict[str, str], *, max_fields: int = 4
@@ -46,7 +55,10 @@ def question_for_missing_fields(
     """Return an explicit question for each missing field in one small batch."""
 
     prompts = [
-        REQUIRED_FIELD_QUESTIONS.get(field, field_labels.get(field, field))
+        REQUIRED_FIELD_QUESTIONS.get(
+            field,
+            LIFESTYLE_COMPONENT_QUESTIONS.get(field, field_labels.get(field, field)),
+        )
         for _, field in missing[:max_fields]
     ]
     if len(prompts) == 1:

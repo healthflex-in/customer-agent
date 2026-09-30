@@ -71,6 +71,25 @@ class IntakeClarificationTests(unittest.TestCase):
         self.assertIsNone(build_out_of_flow_response("Can I upload my MRI report?"))
         self.assertIsNone(build_out_of_flow_response("Should I include an old surgery?"))
 
+    def test_qa_intake_answers_navigation_and_corrections_are_not_blocked(self):
+        allowed = (
+            (
+                "No past surgeries. I exercise two or three times a week. I don't "
+                "smoke, I rarely drink alcohol, and I want stronger muscles so I can "
+                "continue with sports."
+            ),
+            "Okay. What is the next question?",
+            "Can you please increase the leg pain rating to 10? I also have hand pain.",
+            (
+                "What is the main problem bothering you? I have persistent lower back "
+                "pain. How long has it lasted? Around three weeks. It started gradually "
+                "after working long hours at my desk."
+            ),
+        )
+        for text in allowed:
+            with self.subTest(text=text):
+                self.assertIsNone(build_out_of_flow_response(text))
+
     def test_return_to_sport_interrupt_does_not_repeat_or_extract(self):
         state = get_fresh_interview_state("u", "FRM-01", "s")
         state.update(
@@ -111,6 +130,41 @@ class IntakeClarificationTests(unittest.TestCase):
         self.assertTrue(result["direct_response_handled"])
         self.assertEqual(result["response_text"], OUT_OF_FLOW_RESPONSE)
         self.assertNotIn("form", result)
+
+    def test_active_additional_complaint_can_be_retracted_or_skipped(self):
+        for text in (
+            "there is no additional complaint",
+            "I don't have any additional complaint",
+            "lets skip this",
+            "no need enough bye",
+        ):
+            with self.subTest(text=text):
+                state = get_fresh_interview_state("u", "FRM-01", "s")
+                state.update(
+                    phase="interviewing",
+                    current_section="Additional Complaint 2",
+                    form_sections=[*state["form_sections"], "Additional Complaint 1", "Additional Complaint 2"],
+                    user_input=text,
+                )
+                state["form"]["Additional Complaint 1"] = {
+                    "Primary Complaint": "hand pain"
+                }
+                state["form"]["Additional Complaint 2"] = {
+                    "Primary Complaint": "incorrect duplicate",
+                    "Duration of the Issue": "",
+                }
+
+                def unexpected(_prompt):
+                    self.fail("Retracting an accidental complaint must not call AI")
+
+                with patch("src.graph.nodes.extract.get_stream_writer", return_value=lambda _event: None):
+                    result = make_extract_node(unexpected, reasoning_llm=unexpected)(state)
+
+                self.assertTrue(result["direct_response_handled"])
+                self.assertEqual(result["phase"], "summary")
+                self.assertNotIn("Additional Complaint 2", result["form"])
+                self.assertIn("Additional Complaint 1", result["form"])
+                self.assertIn("removed", result["response_text"].lower())
 
     def test_surgery_clarification_explains_requested_details(self):
         response = build_intake_clarification(

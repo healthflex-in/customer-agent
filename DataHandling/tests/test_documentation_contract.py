@@ -66,6 +66,7 @@ class DocumentationContractTests(unittest.TestCase):
                     inbound_types.add(comparator.value)
 
         expected = {
+            "ping",
             "start_interview",
             "start_new_form",
             "load_form",

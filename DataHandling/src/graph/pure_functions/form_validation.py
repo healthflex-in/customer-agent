@@ -106,7 +106,10 @@ def validate_section(form: dict, section: str) -> list:
         # when deciding section completion so they never block advancement.
         if "(If Any)" in field or "(Optional)" in field:
             continue
-        if value is None or (isinstance(value, str) and not value.strip()):
+        if field == "Current Lifestyle" and value and str(value).strip():
+            from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+            missing.extend(missing_lifestyle_components(str(value)))
+        elif value is None or (isinstance(value, str) and not value.strip()):
             missing.append(field)
 
     return missing

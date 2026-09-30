@@ -99,6 +99,10 @@ class ReferralFlowRegressionTests(unittest.TestCase):
         for section, fields in state["form"].items():
             for field in fields:
                 fields[field] = "Patient-provided answer"
+        state["form"]["History & Diagnostics"]["Current Lifestyle"] = (
+            "Work: developer; Activity/exercise: gym; Smoking: does not smoke; "
+            "Alcohol: does not drink alcohol"
+        )
         state["form"]["Referral"]["Source"] = "Somebody gave me a referral"
         state["referral_asked"] = False
         state["user_input"] = "And actually there is a referral somebody gave me the referral"

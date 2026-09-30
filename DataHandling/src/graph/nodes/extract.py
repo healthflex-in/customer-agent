@@ -239,6 +239,58 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         current_section: str = state.get("current_section", "")
         awaiting_upload: bool = state.get("awaiting_report_upload", False)
 
+        # An accidentally-created additional complaint must have a deterministic
+        # exit. Without this branch, "skip this" and "there is no additional
+        # complaint" are treated as missing clinical answers and the same batch
+        # is repeated forever.
+        if current_section.startswith("Additional Complaint "):
+            from src.graph.pure_functions.additional_complaint import (
+                additional_complaint_replacement,
+                is_additional_complaint_cancellation,
+            )
+            if is_additional_complaint_cancellation(user_input):
+                import copy as _copy
+                updated_form = _copy.deepcopy(form)
+                updated_form.pop(current_section, None)
+                updated_sections = [
+                    section for section in state.get("form_sections", list(updated_form))
+                    if section != current_section
+                ]
+                response = (
+                    "I've removed that additional complaint. Is the remaining "
+                    "information correct, or would you like to change anything else?"
+                )
+                return {
+                    "form": updated_form,
+                    "form_sections": updated_sections,
+                    "phase": "summary",
+                    "current_section": (
+                        updated_sections[-1] if updated_sections else "Present Complaint"
+                    ),
+                    "missing_fields": [],
+                    "history": history + [
+                        {"role": "user", "message": user_input},
+                        {"role": "agent", "message": response},
+                    ],
+                    "response_text": response,
+                    "reports_intent": {},
+                    "pending_question": None,
+                    "direct_response_handled": True,
+                }
+
+            replacement = additional_complaint_replacement(user_input)
+            if replacement:
+                import copy as _copy
+                form = _copy.deepcopy(form)
+                form[current_section]["Primary Complaint"] = replacement
+                from src.graph.pure_functions.complaint_severity import (
+                    explicit_severity_updates,
+                )
+                for (section, field), value in explicit_severity_updates(
+                    form, user_input, current_section
+                ).items():
+                    form[section][field] = value
+
         last_agent_for_boundary = next(
             (
                 entry.get("message", "")
@@ -610,10 +662,6 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                 (["surgery", "surgeries", "fracture", "operation", "past surgeries"],
                  "History & Diagnostics", "Systemic Illness and Surgical History",
                  "No past surgeries or fractures"),
-                (["lifestyle", "exercise", "smoking", "smoke", "drink", "alcohol",
-                  "job type", "physically active", "smoke or drink"],
-                 "History & Diagnostics", "Current Lifestyle",
-                 "No specific lifestyle details mentioned"),
                 (["report", "mri", "x-ray", "ct scan", "scan", "imaging", "diagnostic",
                   "blood report", "x ray"],
                  "History & Diagnostics", "Reports",

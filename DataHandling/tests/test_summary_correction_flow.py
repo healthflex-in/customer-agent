@@ -33,6 +33,7 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
         for text in (
             "Please update pain to 7 and I also have leg pain",
             "Please change head pain severity to 7, and I also have leg pain",
+            "Can you please increase it to 10 on scale the head pain, and I also have hand pain",
         ):
             with self.subTest(text=text):
                 state = get_fresh_interview_state("u", "FRM-01", "s")
@@ -47,13 +48,75 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
                 state.update(make_classify_summary_intent_node(unexpected_llm)(state))
                 result = make_handle_summary_response_node(unexpected_llm)(state)
 
-                self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], "7/10")
-                self.assertIn("leg pain", result["form"]["Additional Complaint 1"]["Primary Complaint"].lower())
+                expected_score = "10/10" if "10 on scale" in text else "7/10"
+                expected_addition = "hand pain" if "hand pain" in text else "leg pain"
+                self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], expected_score)
+                self.assertEqual(
+                    result["form"]["Additional Complaint 1"]["Primary Complaint"].lower(),
+                    expected_addition,
+                )
                 self.assertEqual(result["form"]["Additional Complaint 1"]["Severity (1-10)"], "")
                 self.assertIn("updated", result["response_text"].lower())
                 self.assertIn("added", result["response_text"].lower())
-                self.assertIn("7/10", result["response_text"])
+                self.assertIn(expected_score, result["response_text"])
                 self.assertEqual(result["phase"], "interviewing")
+
+    def test_existing_additional_complaint_label_is_corrected_not_duplicated(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(phase="summary", user_input=(
+            "Can you please change the additional point, it is only hand pain only"
+        ))
+        state["form"]["Additional Complaint 1"] = {
+            "Primary Complaint": "the whole correction sentence",
+            "Duration of the Issue": "one day",
+        }
+        state["form_sections"].append("Additional Complaint 1")
+
+        def unexpected(_):
+            self.fail("Explicit additional-complaint correction must be deterministic")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        result = make_handle_summary_response_node(unexpected)(state)
+
+        self.assertEqual(
+            result["form"]["Additional Complaint 1"]["Primary Complaint"],
+            "hand pain",
+        )
+        self.assertNotIn("Additional Complaint 2", result["form"])
+        self.assertIn("corrected", result["response_text"].lower())
+
+    def test_qa_combined_leg_score_correction_and_hand_complaint(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="summary",
+            user_input=(
+                "can you pls increase it to 10 on scale the leg pain, "
+                "I also have hand pain"
+            ),
+        )
+        state["form"]["Present Complaint"]["Primary Complaint"] = "Leg pain"
+        state["form"]["Pain Assessment"]["Primary Location of Pain"] = "Leg"
+        state["form"]["Pain Assessment"]["Severity (1-10)"] = "9/10"
+
+        def unexpected(_):
+            self.fail("The exact QA correction must be deterministic")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        result = make_handle_summary_response_node(unexpected)(state)
+
+        self.assertEqual(
+            result["form"]["Pain Assessment"]["Severity (1-10)"], "10/10"
+        )
+        self.assertEqual(
+            result["form"]["Additional Complaint 1"]["Primary Complaint"],
+            "hand pain",
+        )
 
     def test_generated_summary_cannot_omit_added_pain(self):
         from src.graph.pure_functions.summary import generate_interview_summary

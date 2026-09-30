@@ -15,7 +15,9 @@ _CLARIFICATION_PATTERNS = (
 )
 
 _ACTIVITY_CLEARANCE = re.compile(
-    r"\b(?:can|could|should|may|am i (?:able|allowed)|is it (?:safe|okay|ok))\b"
+    r"\b(?:can i|could i|should i|may i|am i (?:able|allowed)|"
+    r"is it (?:safe|okay|ok)|when (?:can|could|should) i|"
+    r"when i (?:can|could|should))\b"
     r".{0,55}\b(?:return|get back|go back|resume|start|continue|play|do)\b"
     r".{0,35}\b(?:sports?|exercise|workouts?|gym|running|training|football|cricket|cycling|swimming)\b",
     re.I,
@@ -59,9 +61,24 @@ _BRAND_OR_UNRELATED_TERMS = (
 )
 _IN_FLOW_OPERATIONAL = re.compile(
     r"\b(?:upload|attach|document|report|scan|repeat|skip|change|correct|update|"
-    r"include|mention|answer|previous question|form)\b",
+    r"increase|decrease|raise|lower|rating|score|include|mention|note down|answer|"
+    r"previous question|next question|what is required|complete (?:this|the)|form)\b",
     re.I,
 )
+
+_INTAKE_ANSWER_SIGNALS = re.compile(
+    r"\b(?:pain|injur|symptom|doctor|physio|hospital|surgery|fracture|"
+    r"week|month|year|sudden|gradual|exercise|work|smok|alcohol|"
+    r"worse|better|relief|goal|report|mri|x-?ray|ct scan)\b",
+    re.I,
+)
+
+
+def _looks_like_detailed_intake_answer(text: str) -> bool:
+    """Recognize pasted Q&A and detailed clinical replies before boundary checks."""
+
+    words = text.split()
+    return len(words) >= 12 and bool(_INTAKE_ANSWER_SIGNALS.search(text))
 
 
 def build_activity_clearance_response(user_input: str | None) -> str | None:
@@ -87,8 +104,16 @@ def build_out_of_flow_response(
         return None
     if build_intake_clarification(text, last_agent_question) is not None:
         return None
+
+    # Corrections, upload/navigation questions, and pasted clinical Q&A belong
+    # to the intake even when their wording starts with "can" or "what".
+    if _IN_FLOW_OPERATIONAL.search(text):
+        return None
+
     if _ACTIVITY_CLEARANCE.search(text) or _MEDICATION_ADVICE.search(text):
         return OUT_OF_FLOW_RESPONSE
+    if _looks_like_detailed_intake_answer(text):
+        return None
 
     is_question = "?" in text or bool(_QUESTION_OPENING.search(text))
     if not is_question:
@@ -97,11 +122,6 @@ def build_out_of_flow_response(
         return OUT_OF_FLOW_RESPONSE
     if any(term in lowered for term in _BRAND_OR_UNRELATED_TERMS):
         return OUT_OF_FLOW_RESPONSE
-
-    # Questions about supplying or correcting intake information belong to the
-    # interview itself and must continue to the existing upload/clarification flow.
-    if _IN_FLOW_OPERATIONAL.search(text):
-        return None
 
     # General requests for medical education or treatment guidance.
     if any(phrase in lowered for phrase in (
