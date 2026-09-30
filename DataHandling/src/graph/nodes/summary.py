@@ -20,11 +20,20 @@ def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
 
         from src.graph.pure_functions.complaint_severity import explicit_severity_updates, complaint_targets, SCORE
         from src.graph.pure_functions.additional_complaint import (
+            additional_complaint_removal_target,
             additional_complaint_replacement,
             split_update_and_addition,
         )
+        removal_target = additional_complaint_removal_target(
+            user_input, state["form"], state.get("current_section")
+        )
         combined = split_update_and_addition(user_input)
-        if combined:
+        if removal_target:
+            result = {
+                "intent": "remove_additional_complaint",
+                "section": removal_target,
+            }
+        elif combined:
             correction_text, addition_text = combined
             updates = explicit_severity_updates(
                 state["form"], correction_text, "Pain Assessment",
@@ -66,7 +75,42 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
 
         patch: dict = {}
 
-        if intent == "new_complaint":
+        if intent == "show_summary":
+            response_text = _fallback_summary(state["form"])
+            return {
+                "response_text": response_text,
+                "history": state["history"] + [
+                    {"role": "agent", "message": response_text}
+                ],
+            }
+        elif intent == "remove_additional_complaint":
+            import copy
+            updated_form = copy.deepcopy(state["form"])
+            section = summary_intent.get("section")
+            removed = updated_form.pop(section, None)
+            updated_sections = [
+                name for name in state.get("form_sections", list(updated_form))
+                if name != section
+            ]
+            if removed is not None:
+                response_text = (
+                    "I've removed that additional complaint. Here is the updated information:\n\n"
+                    + _fallback_summary(updated_form)
+                )
+                return {
+                    "form": updated_form,
+                    "form_sections": updated_sections,
+                    "current_section": (
+                        updated_sections[-1] if updated_sections else "Present Complaint"
+                    ),
+                    "phase": "summary",
+                    "correction_applied": True,
+                    "response_text": response_text,
+                    "history": state["history"] + [
+                        {"role": "agent", "message": response_text}
+                    ],
+                }
+        elif intent == "new_complaint":
             from src.graph.pure_functions.additional_complaint import capture_additional_complaint
             from src.graph.pure_functions.question_plan import question_for_missing_fields
             import copy

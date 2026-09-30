@@ -5,7 +5,7 @@ import re
 
 _BODY_SITE = re.compile(
     r"\b(?:(?:left|right)\s+)?(?:head|neck|back|shoulder|arm|hand|wrist|elbow|"
-    r"hip|leg|knee|ankle|foot|feet|chest|abdomen|stomach|jaw)s?\b",
+    r"forearm|hip|leg|knee|ankle|foot|feet|chest|abdomen|stomach|jaw)s?\b",
     re.I,
 )
 _SYMPTOM = re.compile(r"\b(?:pain|stiffness|weakness|swelling|ache|discomfort)\b", re.I)
@@ -60,8 +60,9 @@ def additional_complaint_replacement(text):
     """Return a corrected complaint label, or None for an ordinary addition."""
     lowered = str(text).lower()
     correction_signal = re.search(
-        r"\b(?:change|correct|update|replace|not .*additional|additional "
-        r"(?:complaint|concern|point) (?:is|should be))\b",
+        r"\b(?:change|correct|update|replace|not .*additional|"
+        r"additional (?:complaint|concern|point).{0,35}"
+        r"(?:is|should be|write|written|record|mention))\b",
         lowered,
     )
     if not correction_signal:
@@ -78,7 +79,8 @@ def additional_complaint_replacement(text):
     matches = list(_BODY_SITE.finditer(scoped))
     if not matches:
         return None
-    site = matches[-1].group(0).strip()
+    sites = list(dict.fromkeys(match.group(0).strip().lower() for match in matches))
+    site = " and ".join(sites)
     symptom_matches = list(_SYMPTOM.finditer(scoped))
     symptom = symptom_matches[-1].group(0).lower() if symptom_matches else "pain"
     return f"{site} {symptom}".strip()
@@ -93,6 +95,12 @@ def is_additional_complaint_cancellation(text):
         normalized,
     ):
         return True
+    if re.search(r"\b(?:remove|delete)\b", normalized) and re.search(
+        r"\b(?:this|that|additional)\b.{0,30}\b(?:complaint|concern|pain)\b"
+        r"|\b(?:complaint|concern|pain)\b.{0,30}\b(?:remove|delete)\b",
+        normalized,
+    ):
+        return True
     return bool(
         re.fullmatch(
             r"(?:let'?s\s+)?skip (?:this|it)|no need(?:,? enough)?(?: bye)?|"
@@ -100,6 +108,53 @@ def is_additional_complaint_cancellation(text):
             normalized.strip(" .,!"),
         )
     )
+
+
+def additional_complaint_removal_target(text, form, active_section=None):
+    """Resolve an explicit removal to one additional-complaint section only."""
+    normalized = " ".join(str(text).lower().replace("’", "'").split())
+    removal = bool(re.search(r"\b(?:remove|delete|drop)\b", normalized))
+    negated_pain = bool(re.search(
+        r"\b(?:i\s+)?(?:do not|don't|dont|no longer)\s+have\b.{0,45}"
+        r"\b(?:pain|stiffness|weakness|swelling|ache|discomfort)\b",
+        normalized,
+    ))
+    if not removal and not negated_pain and not is_additional_complaint_cancellation(text):
+        return None
+
+    sections = [
+        name for name, fields in form.items()
+        if name.startswith("Additional Complaint ") and isinstance(fields, dict)
+    ]
+    if not sections:
+        return None
+
+    mentioned_sites = {
+        match.group(0).strip().lower() for match in _BODY_SITE.finditer(normalized)
+    }
+    if mentioned_sites:
+        matches = []
+        for section in sections:
+            complaint = str(form[section].get("Primary Complaint", "")).lower()
+            complaint_sites = {
+                match.group(0).strip().lower() for match in _BODY_SITE.finditer(complaint)
+            }
+            if mentioned_sites & complaint_sites:
+                matches.append(section)
+        if len(matches) == 1:
+            return matches[0]
+        # A body site was explicitly named but it does not uniquely identify an
+        # additional complaint. Never guess: the patient may be correcting the
+        # primary complaint instead.
+        return None
+
+    if active_section in sections:
+        return active_section
+    if re.search(r"\b(?:this|that|additional)\s+(?:complaint|concern|point)\b", normalized):
+        return sections[-1]
+    if len(sections) == 1:
+        return sections[0]
+    return None
 
 
 def capture_additional_complaint(form, text):

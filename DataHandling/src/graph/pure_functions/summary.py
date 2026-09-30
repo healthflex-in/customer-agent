@@ -119,6 +119,21 @@ def classify_summary_response(
     normalized = re.sub(r"[^a-z0-9\s]", " ", user_input.lower())
     normalized = " ".join(normalized.split())
 
+    # Reviewing the assistant's own summary is an intake operation, not a
+    # request for medical advice and not a request to edit a field.
+    if re.search(
+        r"\b(?:show|share|send|repeat|see|view|read)\b.{0,45}"
+        r"\b(?:summary|information|details)\b"
+        r"|\b(?:summary|information|details)\b.{0,45}\b(?:again|updated)\b",
+        normalized,
+    ):
+        return {
+            "intent": "show_summary",
+            "correction_text": None,
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
     # New documents and acknowledgements are different actions. Check additions
     # first: a patient may have uploaded one file AND have another to share.
     report_word = r"(?:reports?|documents?|files?|x rays?|xrays?|mri|ct scans?|blood tests?)"

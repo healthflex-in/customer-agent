@@ -62,7 +62,9 @@ _BRAND_OR_UNRELATED_TERMS = (
 _IN_FLOW_OPERATIONAL = re.compile(
     r"\b(?:upload|attach|document|report|scan|repeat|skip|change|correct|update|"
     r"increase|decrease|raise|lower|rating|score|include|mention|note down|answer|"
-    r"previous question|next question|what is required|complete (?:this|the)|form)\b",
+    r"previous question|next question|summary|share (?:the )?(?:information|details)|"
+    r"information (?:you )?(?:wrote|recorded)|what is required|"
+    r"complete (?:this|the)|form)\b",
     re.I,
 )
 

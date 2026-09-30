@@ -245,16 +245,21 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         # is repeated forever.
         if current_section.startswith("Additional Complaint "):
             from src.graph.pure_functions.additional_complaint import (
+                additional_complaint_removal_target,
                 additional_complaint_replacement,
                 is_additional_complaint_cancellation,
             )
-            if is_additional_complaint_cancellation(user_input):
+            removal_target = additional_complaint_removal_target(
+                user_input, form, current_section
+            )
+            if removal_target or is_additional_complaint_cancellation(user_input):
                 import copy as _copy
                 updated_form = _copy.deepcopy(form)
-                updated_form.pop(current_section, None)
+                section_to_remove = removal_target or current_section
+                updated_form.pop(section_to_remove, None)
                 updated_sections = [
                     section for section in state.get("form_sections", list(updated_form))
-                    if section != current_section
+                    if section != section_to_remove
                 ]
                 response = (
                     "I've removed that additional complaint. Is the remaining "

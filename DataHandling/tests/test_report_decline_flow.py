@@ -201,6 +201,19 @@ class ReportDeclineFlowTests(unittest.TestCase):
         self.assertIn("walks for exercise", lifestyle.lower())
         self.assertIsNone(result["pending_question"])
 
+    def test_compact_lifestyle_answer_fills_every_subtopic(self):
+        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+
+        value = merge_lifestyle_answer(
+            "", "4 times a week, work in company, yes smoke, yes drink"
+        )
+
+        self.assertEqual(missing_lifestyle_components(value), [])
+        self.assertIn("Work:", value)
+        self.assertIn("Activity/exercise:", value)
+        self.assertIn("Smoking: Smokes", value)
+        self.assertIn("Alcohol: Drinks alcohol", value)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,7 +54,8 @@ def merge_lifestyle_answer(existing: str | None, user_input: str | None) -> str:
 
     if re.search(
         r"\b(?:i (?:work(?! out)|am working)|my (?:work|job)|work involves|job involves|"
-        r"business|office|desk job|student|retired|homemaker|unemployed|9\s*-?\s*5)\b",
+        r"work (?:in|at|for)|business|office|desk job|student|retired|homemaker|"
+        r"unemployed|9\s*-?\s*5)\b",
         text,
     ):
         facts.append(f"Work: {str(user_input).strip()}")
@@ -72,7 +73,10 @@ def merge_lifestyle_answer(existing: str | None, user_input: str | None) -> str:
     )
     if does_not_smoke:
         facts.append("Smoking: Does not smoke")
-    elif re.search(r"\bi (?:currently |occasionally |regularly )?smoke\b", text):
+    elif re.search(
+        r"\b(?:i (?:currently |occasionally |regularly )?|yes[ ,:-]*)smoke\b",
+        text,
+    ):
         facts.append("Smoking: Smokes")
 
     does_not_drink = bool(
@@ -84,7 +88,10 @@ def merge_lifestyle_answer(existing: str | None, user_input: str | None) -> str:
     )
     if does_not_drink:
         facts.append("Alcohol: Does not drink alcohol")
-    elif re.search(r"\bi (?:rarely |occasionally |regularly )?drink(?: alcohol)?\b", text):
+    elif re.search(
+        r"\b(?:i (?:rarely |occasionally |regularly )?|yes[ ,:-]*)drink(?: alcohol)?\b",
+        text,
+    ):
         facts.append("Alcohol: Drinks alcohol")
 
     if re.search(r"\bi (?:only )?walk\b", text) or "walking only" in text:

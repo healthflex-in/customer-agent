@@ -39,6 +39,15 @@ class IntakeClarificationTests(unittest.TestCase):
     def test_activity_statement_is_not_intercepted(self):
         self.assertIsNone(build_activity_clearance_response("I returned to sports last week"))
 
+    def test_summary_replay_requests_are_not_blocked_as_medical_advice(self):
+        for text in (
+            "can you pls share the information you wrote again",
+            "can you please share summary again which you have written so I can verify",
+            "pls share the updated summary",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(build_out_of_flow_response(text))
+
     def test_global_boundary_covers_advice_medication_and_unrelated_questions(self):
         for text in (
             "Can I play soccer again? Can I take a painkiller and play?",

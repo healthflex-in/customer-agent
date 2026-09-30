@@ -63,7 +63,10 @@ def after_handle_summary_response(state: InterviewState) -> str:
     intent = (state.get("summary_intent") or {}).get("intent")
     if intent == "confirm":
         return END
-    if intent in ("new_complaint", "correct_additional_complaint"):
+    if intent in (
+        "new_complaint", "correct_additional_complaint",
+        "remove_additional_complaint", "show_summary",
+    ):
         # The handler saves the addition and acknowledges it with follow-ups.
         # Do not overwrite that response with another old-form summary.
         return END
