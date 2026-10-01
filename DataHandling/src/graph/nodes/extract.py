@@ -337,8 +337,8 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             )
             return {
                 "history": history + [
-                    {"role": "user", "message": user_input},
-                    {"role": "agent", "message": out_of_flow_response},
+                    {"role": "user", "message": user_input, "clinical_extraction": False},
+                    {"role": "agent", "message": out_of_flow_response, "clinical_extraction": False},
                 ],
                 "response_text": out_of_flow_response,
                 "reports_intent": {},
@@ -370,8 +370,8 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             brand_answer = _answer_brand_question(user_input, llm_complete)
             if brand_answer:
                 new_history = history + [
-                    {"role": "user", "message": user_input},
-                    {"role": "agent", "message": brand_answer},
+                    {"role": "user", "message": user_input, "clinical_extraction": False},
+                    {"role": "agent", "message": brand_answer, "clinical_extraction": False},
                 ]
                 return {
                     "history": new_history,
@@ -388,8 +388,8 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             # form data or immediately repeat the same unanswered question.
             return {
                 "history": history + [
-                    {"role": "user", "message": user_input},
-                    {"role": "agent", "message": activity_response},
+                    {"role": "user", "message": user_input, "clinical_extraction": False},
+                    {"role": "agent", "message": activity_response, "clinical_extraction": False},
                 ],
                 "response_text": activity_response,
                 "reports_intent": {},
@@ -561,6 +561,8 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
 
         # Unpack the tagged extraction result and log it in the main thread
         _extract_method, updated_form = _extract_result if isinstance(_extract_result, tuple) else ("failed", form)
+        from src.graph.pure_functions.clinical_value_guard import sanitize_extracted_form
+        updated_form = sanitize_extracted_form(form, updated_form)
         if not _is_prom:
             from src.graph.pure_functions.complaint_severity import reconcile_severities
             updated_form = reconcile_severities(
@@ -800,6 +802,9 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                     result_extra = {"referral_asked": False}
             else:
                 result_extra = {"referral_asked": True}
+
+        # Run the guard again because fallback gap-fill also uses an LLM.
+        updated_form = sanitize_extracted_form(form, updated_form)
 
         new_history = history + [{"role": "user", "message": user_input}]
 

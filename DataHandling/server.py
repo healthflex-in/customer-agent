@@ -3472,8 +3472,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             client_state["scope_notice_sent"] = True
                             client_state["graph_history"] = list(client_state.get("graph_history") or []) + [
-                                {"role": "user", "message": text_input},
-                                {"role": "agent", "message": _scope_decision.patient_message},
+                                {"role": "user", "message": text_input, "clinical_extraction": False},
+                                {"role": "agent", "message": _scope_decision.patient_message, "clinical_extraction": False},
                             ]
                             await send_text_message(
                                 websocket, client_state, _scope_decision.patient_message,
@@ -3501,8 +3501,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             client_state["graph_history"] = list(
                                 client_state.get("graph_history") or []
                             ) + [
-                                {"role": "user", "message": text_input},
-                                {"role": "agent", "message": _boundary_response},
+                                {"role": "user", "message": text_input, "clinical_extraction": False},
+                                {"role": "agent", "message": _boundary_response, "clinical_extraction": False},
                             ]
                             await send_text_message(
                                 websocket,

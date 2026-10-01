@@ -247,6 +247,25 @@ class ReportDeclineFlowTests(unittest.TestCase):
         self.assertNotIn("Alcohol: Does not drink alcohol", value)
         self.assertEqual(value.count("Alcohol:"), 1)
 
+    def test_compound_work_and_alcohol_answer_is_split_into_correct_fields(self):
+        for answer in (
+            "I work in a company , no drink",
+            "I work in a company and I don't drink",
+            "I work in a company no drink",
+        ):
+            with self.subTest(answer=answer):
+                value = merge_lifestyle_answer(
+                    "",
+                    answer,
+                    "What is your occupation, and do you drink alcohol?",
+                )
+
+                self.assertIn("Work: I work in a company", value)
+                self.assertIn("Alcohol: Does not drink alcohol", value)
+                self.assertNotIn("drink", value.split(";", 1)[0].lower())
+                self.assertEqual(value.count("Work:"), 1)
+                self.assertEqual(value.count("Alcohol:"), 1)
+
     def test_pain_aggravation_answer_cannot_enter_lifestyle(self):
         existing = (
             "Work: Works in a company; Activity/exercise: Yoga; Smoking: Smokes; "

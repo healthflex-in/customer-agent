@@ -122,6 +122,8 @@ class IntakeClarificationTests(unittest.TestCase):
         self.assertNotIn("form", result)
         self.assertEqual(result["history"][-2]["role"], "user")
         self.assertEqual(result["history"][-1]["role"], "agent")
+        self.assertIs(result["history"][-2]["clinical_extraction"], False)
+        self.assertIs(result["history"][-1]["clinical_extraction"], False)
 
     def test_medication_question_returns_standard_boundary_without_ai(self):
         state = get_fresh_interview_state("u", "FRM-01", "s")
@@ -142,6 +144,8 @@ class IntakeClarificationTests(unittest.TestCase):
         self.assertTrue(result["response_text"].startswith(OUT_OF_FLOW_RESPONSE))
         self.assertIn("What makes the pain worse?", result["response_text"])
         self.assertNotIn("form", result)
+        self.assertIs(result["history"][-2]["clinical_extraction"], False)
+        self.assertIs(result["history"][-1]["clinical_extraction"], False)
 
     def test_return_to_play_question_is_not_saved_as_mechanism(self):
         state = get_fresh_interview_state("u", "FRM-01", "s")

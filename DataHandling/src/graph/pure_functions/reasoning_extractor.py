@@ -16,10 +16,40 @@ from app.observability.privacy import error_type
 from src.prompts import REASONING_EXTRACTOR_PROMPT, PROM_EXTRACTOR_PROMPT
 
 
+_NON_CLINICAL_AGENT_PREFIXES = (
+    "I'm here to collect information for your clinical assessment",
+    "I’m here to collect information for your clinical assessment",
+)
+
+
+def _clinical_history(history: list) -> list:
+    """Remove boundary/FAQ turns before clinical extraction.
+
+    These turns remain in the visible transcript, but must never become
+    evidence for a clinical form field. The prefix fallback also protects
+    sessions created before the explicit marker was deployed.
+    """
+    excluded: set[int] = {
+        index
+        for index, entry in enumerate(history)
+        if entry.get("clinical_extraction") is False
+    }
+    for index, entry in enumerate(history):
+        message = str(entry.get("message") or "").strip()
+        if entry.get("role") != "agent" or not message.startswith(
+            _NON_CLINICAL_AGENT_PREFIXES
+        ):
+            continue
+        excluded.add(index)
+        if index and history[index - 1].get("role") == "user":
+            excluded.add(index - 1)
+    return [entry for index, entry in enumerate(history) if index not in excluded]
+
+
 def _build_conversation_text(history: list, user_input: str) -> str:
     """Build a readable conversation string including the current user message."""
     lines = []
-    for entry in history:
+    for entry in _clinical_history(history):
         role = "Sage" if entry.get("role") == "agent" else "Patient"
         msg = (entry.get("message") or "").strip()
         if msg:

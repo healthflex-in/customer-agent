@@ -15,6 +15,40 @@ LIFESTYLE_COMPONENT_FIELDS = {
 }
 
 
+def _lifestyle_clauses(user_input: str | None) -> list[str]:
+    """Split a compact answer without mixing one lifestyle fact into another."""
+    raw = " ".join(str(user_input or "").strip().split())
+    if not raw:
+        return []
+    parts = re.split(
+        r"\s*[,;]\s*|\s+\band\b\s+(?=(?:i\s+)?(?:(?:yes|no|never|don't|dont|"
+        r"do not)\s+)?(?:work|job|"
+        r"occupation|exercise|work\s*out|walk|run|gym|smok|drink|alcohol))",
+        raw,
+        flags=re.I,
+    )
+    # Voice transcription frequently omits punctuation: "I work in a company
+    # no drink". Insert a boundary before an explicit habit answer.
+    expanded: list[str] = []
+    for part in parts:
+        expanded.extend(
+            re.split(
+                r"\s+(?=(?:i\s+)?(?:yes|no|never|don't|dont|do not)\s+"
+                r"(?:smok|drink|alcohol))",
+                part,
+                flags=re.I,
+            )
+        )
+    return [part.strip(" .") for part in expanded if part.strip(" .")]
+
+
+def _first_matching_clause(user_input: str | None, pattern: str) -> str:
+    for clause in _lifestyle_clauses(user_input):
+        if re.search(pattern, clause, re.I):
+            return clause
+    return str(user_input or "").strip()
+
+
 def format_lifestyle_value(value) -> str:
     """Normalize structured or serialized lifestyle data to readable text."""
     parsed = value
@@ -98,7 +132,12 @@ def merge_lifestyle_answer(
         r"unemployed|9\s*-?\s*5)\b",
         text,
     ):
-        facts["work"] = f"Work: {str(user_input).strip()}"
+        work_clause = _first_matching_clause(
+            user_input,
+            r"\b(?:work(?! out)|job|occupation|business|office|desk job|student|"
+            r"retired|homemaker|unemployed|9\s*-?\s*5)\b",
+        )
+        facts["work"] = f"Work: {work_clause}"
 
     pain_context = bool(re.search(
         r"\b(?:pain|worse|aggravat|relief|reliev|massage|hurt|increases?|decreases?)\b",
@@ -119,10 +158,15 @@ def merge_lifestyle_answer(
         and ("only walk" in text or lifestyle_question)
     )
     if explicit_activity or walking_as_routine:
-        facts["activity"] = f"Activity/exercise: {str(user_input).strip()}"
+        activity_clause = _first_matching_clause(
+            user_input,
+            r"\b(?:exercise|work\s*out|gym|walk|running|cycling|swimming|yoga|"
+            r"zumba|times? (?:a|per) week|days? (?:a|per) week)\b",
+        )
+        facts["activity"] = f"Activity/exercise: {activity_clause}"
 
     does_not_smoke = bool(
-        re.search(r"\b(?:i )?(?:do not|don't|dont|never) smoke\b", text)
+        re.search(r"\b(?:i )?(?:do not|don't|dont|never|no) smoke\b", text)
         or re.search(r"\bnon[- ]?smoker\b", text)
     )
     if does_not_smoke:
@@ -135,10 +179,11 @@ def merge_lifestyle_answer(
 
     does_not_drink = bool(
         re.search(
-            r"\b(?:i )?(?:do not|don't|dont|never) drink(?: alcohol)?\b",
+            r"\b(?:i )?(?:do not|don't|dont|never|no) drink(?: alcohol)?\b",
             text,
         )
         or "no alcohol" in text
+        or "not drink" in text
     )
     if does_not_drink:
         facts["alcohol"] = "Alcohol: Does not drink alcohol"

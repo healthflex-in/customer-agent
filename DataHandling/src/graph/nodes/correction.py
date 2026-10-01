@@ -76,6 +76,16 @@ def make_apply_correction_node(llm_complete):
                     "history": history + [{"role": "agent", "message": message}]}
 
         updated_form, success, message = apply_form_correction(correction_data, form, llm_complete)
+        from src.graph.pure_functions.clinical_value_guard import sanitize_extracted_form
+        guarded_form = sanitize_extracted_form(form, updated_form)
+        if guarded_form != updated_form:
+            updated_form = guarded_form
+            success = updated_form != form
+            if not success:
+                message = (
+                    "I couldn't safely determine the corrected clinical value. "
+                    "Please state the exact information you want recorded."
+                )
 
         updated_history = history + [{"role": "agent", "message": message}]
 
