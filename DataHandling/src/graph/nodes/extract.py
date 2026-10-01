@@ -561,16 +561,34 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
 
         # Unpack the tagged extraction result and log it in the main thread
         _extract_method, updated_form = _extract_result if isinstance(_extract_result, tuple) else ("failed", form)
-        from src.graph.pure_functions.clinical_value_guard import sanitize_extracted_form
+        from src.graph.pure_functions.clinical_value_guard import (
+            guard_new_pain_factor_evidence,
+            sanitize_extracted_form,
+        )
         updated_form = sanitize_extracted_form(form, updated_form)
+        updated_form = guard_new_pain_factor_evidence(
+            form,
+            updated_form,
+            user_input=user_input,
+            last_question=last_agent_q,
+            current_section=current_section,
+        )
         if not _is_prom:
             from src.graph.pure_functions.complaint_severity import reconcile_severities
             updated_form = reconcile_severities(
                 form, updated_form, user_input, current_section, last_agent_q
             )
 
+        previous_lifestyle = form.get("History & Diagnostics", {}).get(
+            "Current Lifestyle", ""
+        )
+        # Lifestyle is persisted only through the deterministic, question-aware
+        # merger.  This prevents a reasoning-model cross-field guess (for
+        # example a pain trigger written as exercise) from replacing trusted
+        # lifestyle data.  The merger also handles bare occupation answers such
+        # as "accountant", so valid answers are not lost or asked twice.
         updated_lifestyle = merge_lifestyle_answer(
-            form.get("History & Diagnostics", {}).get("Current Lifestyle", ""),
+            previous_lifestyle,
             user_input,
             last_agent_q,
         )
@@ -805,6 +823,13 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
 
         # Run the guard again because fallback gap-fill also uses an LLM.
         updated_form = sanitize_extracted_form(form, updated_form)
+        updated_form = guard_new_pain_factor_evidence(
+            form,
+            updated_form,
+            user_input=user_input,
+            last_question=last_agent_q,
+            current_section=current_section,
+        )
 
         new_history = history + [{"role": "user", "message": user_input}]
 

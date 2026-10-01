@@ -192,6 +192,11 @@ Previous Consultations:
 
 Pain Assessment:
 - Location, severity, aggravating factors, relieving factors
+- Mechanism/cause and aggravating factors are different. An activity happening
+  when the problem started (for example "it started while playing") belongs
+  only in Mechanism of Injury or Cause. Put an activity in Aggravating Factors
+  only when the patient explicitly says it now makes the problem worse or is
+  directly answering a question about what makes it worse.
 - Fill pain fields as "Not applicable — no pain reported" only when the patient
   explicitly says they have no pain or explicitly describes a general wellness
   visit without a complaint. Never infer no pain from an omitted answer.

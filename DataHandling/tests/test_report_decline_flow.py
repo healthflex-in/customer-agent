@@ -266,6 +266,52 @@ class ReportDeclineFlowTests(unittest.TestCase):
                 self.assertEqual(value.count("Work:"), 1)
                 self.assertEqual(value.count("Alcohol:"), 1)
 
+    def test_bare_job_title_answers_occupation_question(self):
+        value = merge_lifestyle_answer(
+            "",
+            "accountant",
+            "What is your work or usual occupation?",
+        )
+
+        self.assertEqual(value, "Work: accountant")
+
+    def test_reasoning_extracted_occupation_is_not_discarded(self):
+        import copy
+        import json
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="interviewing",
+            current_section="History & Diagnostics",
+            user_input="accountant",
+            history=[{
+                "role": "agent",
+                "message": "What is your work or usual occupation?",
+            }],
+        )
+        reasoned = copy.deepcopy(state["form"])
+        reasoned["History & Diagnostics"]["Current Lifestyle"] = "Accountant"
+
+        def reasoning_llm(_prompt):
+            return json.dumps(reasoned)
+
+        with patch(
+            "src.graph.nodes.extract.get_stream_writer",
+            return_value=lambda _event: None,
+        ):
+            result = make_extract_node(
+                lambda _prompt: "{}",
+                reasoning_llm=reasoning_llm,
+            )(state)
+
+        lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
+        self.assertEqual(lifestyle, "Work: accountant")
+        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+        self.assertNotIn(
+            "Current Lifestyle — Work",
+            missing_lifestyle_components(lifestyle),
+        )
+
     def test_pain_aggravation_answer_cannot_enter_lifestyle(self):
         existing = (
             "Work: Works in a company; Activity/exercise: Yoga; Smoking: Smokes; "

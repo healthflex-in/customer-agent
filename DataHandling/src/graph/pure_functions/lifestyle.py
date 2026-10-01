@@ -139,6 +139,29 @@ def merge_lifestyle_answer(
         )
         facts["work"] = f"Work: {work_clause}"
 
+    # A direct answer to an occupation question can be just a job title
+    # ("accountant", "painter") and therefore contain no work keyword.  The
+    # question supplies the field context; capture the answer as Work while
+    # excluding clauses that clearly answer a different lifestyle component.
+    asks_work = bool(re.search(
+        r"\b(?:what is your work|what do you do for work|work or usual "
+        r"occupation|your occupation|your job)\b",
+        question,
+    ))
+    if asks_work and "work" not in facts:
+        other_component = re.compile(
+            r"\b(?:smok|tobacco|drink|alcohol|exercise|work\s*out|gym|"
+            r"walking|running|cycling|swimming|yoga|zumba)\w*\b",
+            re.I,
+        )
+        work_candidates = [
+            clause for clause in _lifestyle_clauses(user_input)
+            if not other_component.search(clause)
+            and not clause.rstrip().endswith("?")
+        ]
+        if work_candidates:
+            facts["work"] = f"Work: {work_candidates[0]}"
+
     pain_context = bool(re.search(
         r"\b(?:pain|worse|aggravat|relief|reliev|massage|hurt|increases?|decreases?)\b",
         text,

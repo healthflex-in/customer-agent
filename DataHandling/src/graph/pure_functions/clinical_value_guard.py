@@ -107,3 +107,96 @@ def sanitize_extracted_form(original_form: dict, extracted_form: dict) -> dict:
                 fields[field] = previous
                 print(f"[clinical_value_guard] Rejected unsafe {section}.{field}")
     return result
+
+
+_PAIN_FACTOR_QUESTION_SIGNALS = {
+    "Aggravating Factors": re.compile(
+        r"\b(?:what|which).{0,45}(?:makes?|make).{0,20}(?:worse|painful)\b|"
+        r"\baggravat(?:e|es|ing|ing factors?)\b|"
+        r"\bactivities?.{0,30}(?:worse|increase(?:s)? (?:the )?pain)\b",
+        re.I,
+    ),
+    "Relieving Factors": re.compile(
+        r"\b(?:what|which).{0,45}(?:makes?|make).{0,20}(?:better|relief)\b|"
+        r"\b(?:reliev(?:e|es|ing)|provides? relief|gives? relief)\b",
+        re.I,
+    ),
+}
+
+_PAIN_FACTOR_ANSWER_SIGNALS = {
+    "Aggravating Factors": re.compile(
+        r"\b(?:makes? (?:it|the pain|my pain) worse|worsens?|aggravat(?:e|es|ing)|"
+        r"increase(?:s|d)? (?:the |my )?pain|pain (?:increase(?:s|d)?|gets worse)|"
+        r"triggers? (?:the |my )?pain|hurts? (?:more )?when|painful when)\b",
+        re.I,
+    ),
+    "Relieving Factors": re.compile(
+        r"\b(?:makes? (?:it|the pain|my pain) better|helps? (?:it|the pain|my pain)|"
+        r"reliev(?:e|es|ed|ing)|provides? relief|gives? relief|"
+        r"reduces? (?:the |my )?pain|eases? (?:the |my )?pain)\b",
+        re.I,
+    ),
+}
+
+
+def guard_new_pain_factor_evidence(
+    original_form: dict,
+    extracted_form: dict,
+    *,
+    user_input: str | None,
+    last_question: str | None,
+    current_section: str | None,
+) -> dict:
+    """Reject newly inferred aggravating/relieving factors without evidence.
+
+    Mechanism-of-injury phrases such as ``playing football`` are not evidence
+    that the activity currently makes pain worse.  Likewise, an answer about
+    an additional complaint must not populate the primary complaint's pain
+    factors.  A factor is accepted only when the current patient turn states
+    the relationship explicitly, or when it directly answers the matching
+    question for the same complaint scope.
+    """
+
+    result = copy.deepcopy(extracted_form)
+    answer = " ".join(str(user_input or "").split())
+    question = " ".join(str(last_question or "").split())
+    active_section = str(current_section or "")
+    active_is_additional = active_section.startswith("Additional Complaint ")
+
+    for section, fields in result.items():
+        if not isinstance(fields, dict):
+            continue
+        target_is_additional = str(section).startswith("Additional Complaint ")
+        for field in ("Aggravating Factors", "Relieving Factors"):
+            if field not in fields:
+                continue
+            previous = original_form.get(section, {}).get(field, "")
+            candidate = fields.get(field, "")
+            if candidate == previous or not str(candidate or "").strip():
+                continue
+
+            # Compound question + short answer (for example "Walking") is
+            # valid only for the complaint section currently being collected.
+            same_scope = (
+                (active_is_additional and section == active_section)
+                or (not active_is_additional and not target_is_additional)
+            )
+            answers_matching_question = bool(
+                same_scope and _PAIN_FACTOR_QUESTION_SIGNALS[field].search(question)
+            )
+            states_relationship = bool(
+                _PAIN_FACTOR_ANSWER_SIGNALS[field].search(answer)
+            )
+
+            # During an additional-complaint turn, even explicit factor words
+            # belong to that complaint unless the intake explicitly routes a
+            # correction through the correction flow.
+            explicit_in_scope = states_relationship and same_scope
+            if not answers_matching_question and not explicit_in_scope:
+                fields[field] = previous
+                print(
+                    f"[clinical_value_guard] Rejected unsupported "
+                    f"{section}.{field}"
+                )
+
+    return result
