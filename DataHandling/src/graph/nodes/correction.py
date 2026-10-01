@@ -14,16 +14,27 @@ def make_detect_correction_node(llm_complete):
         from src.graph.pure_functions.complaint_severity import explicit_severity_updates
         active_section = "Pain Assessment" if is_summary_mode else state.get("current_section")
         updates = explicit_severity_updates(form, user_input, active_section)
-        from src.graph.pure_functions.lifestyle import merge_lifestyle_answer
+        from src.graph.pure_functions.lifestyle import (
+            has_explicit_lifestyle_fact,
+            merge_lifestyle_answer,
+        )
         current_lifestyle = form.get("History & Diagnostics", {}).get(
             "Current Lifestyle", ""
         )
         lifestyle_value = merge_lifestyle_answer(current_lifestyle, user_input)
         lifestyle_changed = lifestyle_value != str(current_lifestyle or "").strip()
-        if updates or lifestyle_changed:
+        lifestyle_is_idempotent = (
+            not lifestyle_changed and has_explicit_lifestyle_fact(user_input)
+        )
+        if updates or lifestyle_changed or lifestyle_is_idempotent:
             return {"correction_data": {
                 "severity_updates": updates,
-                "lifestyle_value": lifestyle_value if lifestyle_changed else None,
+                "lifestyle_value": (
+                    lifestyle_value
+                    if lifestyle_changed or lifestyle_is_idempotent
+                    else None
+                ),
+                "lifestyle_already_current": lifestyle_is_idempotent,
             }}
         result = detect_form_correction(
             user_input, form, is_summary_mode=is_summary_mode, llm_complete=llm_complete
@@ -53,6 +64,69 @@ def make_apply_correction_node(llm_complete):
         form = state["form"]
         history = list(state["history"])
 
+        if isinstance(correction_data.get("updates"), list):
+            if correction_data.get("needs_clarification"):
+                response_text = (
+                    correction_data.get("clarification_question")
+                    or "Please clarify which information should change and its correct value."
+                )
+                return {
+                    "correction_applied": False,
+                    "response_text": response_text,
+                    "history": history + [
+                        {"role": "agent", "message": response_text}
+                    ],
+                }
+            working_form = form
+            applied = []
+            failures = []
+            from src.graph.pure_functions.clinical_value_guard import (
+                sanitize_extracted_form,
+            )
+            for update in correction_data["updates"]:
+                updated, success, detail = apply_form_correction(
+                    update, working_form, llm_complete
+                )
+                if success:
+                    guarded = sanitize_extracted_form(working_form, updated)
+                    if guarded != working_form:
+                        working_form = guarded
+                        target = update.get("field_name") or "information"
+                        applied.append(str(target))
+                    else:
+                        failures.append(
+                            "That value did not pass the clinical data checks."
+                        )
+                else:
+                    failures.append(detail)
+
+            correction_applied = working_form != form
+            if correction_applied:
+                response_text = "I've updated " + ", ".join(applied) + "."
+                if failures:
+                    response_text += (
+                        " I couldn't safely match one other requested change; "
+                        "please state that detail separately."
+                    )
+                response_text += (
+                    " Would you like to update anything else? If everything is "
+                    "correct, reply 'done' or 'yes' to confirm."
+                )
+            else:
+                response_text = (
+                    failures[0] if failures else
+                    "I couldn't identify a safe, unambiguous form update. "
+                    "Please state the detail and its correct value."
+                )
+            return {
+                "form": working_form,
+                "correction_applied": correction_applied,
+                "response_text": response_text,
+                "history": history + [
+                    {"role": "agent", "message": response_text}
+                ],
+            }
+
         if "severity_updates" in correction_data:
             import copy
             updated_form = copy.deepcopy(form)
@@ -69,7 +143,11 @@ def make_apply_correction_node(llm_complete):
                 updated_form.setdefault("History & Diagnostics", {})[
                     "Current Lifestyle"
                 ] = lifestyle_value
-                changes.append("lifestyle information")
+                changes.append(
+                    "lifestyle information (already recorded)"
+                    if correction_data.get("lifestyle_already_current")
+                    else "lifestyle information"
+                )
             message = "I've updated " + "; ".join(changes) + ". Would you like to update anything else? If everything is correct, you can confirm."
             return {"form": updated_form, "correction_applied": True,
                     "response_text": message,

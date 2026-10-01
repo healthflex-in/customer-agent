@@ -110,9 +110,11 @@ class ReferralFlowRegressionTests(unittest.TestCase):
         with patch("src.graph.nodes.generate.get_stream_writer", return_value=lambda _event: None):
             result = make_generate_question_node(lambda _prompt: summary, "unused")(state)
         self.assertEqual(result["phase"], "summary")
-        self.assertEqual(result["response_text"], summary)
+        self.assertIn("Here's a summary", result["response_text"])
+        self.assertIn("Somebody gave me a referral", result["response_text"])
+        self.assertNotEqual(result["response_text"], summary)
         self.assertTrue(result["referral_asked"])
-        self.assertEqual(result["history"][-1]["message"], summary)
+        self.assertEqual(result["history"][-1]["message"], result["response_text"])
 
 
 if __name__ == "__main__":

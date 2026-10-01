@@ -315,6 +315,14 @@ def detect_form_correction(
 
     try:
         if is_summary_mode:
+            schema_lines = []
+            for section, fields in form.items():
+                if not isinstance(fields, dict):
+                    continue
+                schema_lines.append(
+                    f"- {section}: " + ", ".join(str(field) for field in fields)
+                )
+            schema_text = "\n".join(schema_lines)
             prompt = f"""The user is reviewing their medical form summary and wants to make changes.
 
 User message: "{user_input}"
@@ -322,16 +330,30 @@ User message: "{user_input}"
 Current form data:
 {json.dumps(form, indent=2)}
 
-Analyze their message to identify which field they want to change and the new value.
+Valid form schema:
+{schema_text}
+
+Analyze the message semantically. Identify ALL independent corrections in the
+same message. A visible lifestyle detail (Work, Activity/Exercise, Smoking, or
+Alcohol) is a component of History & Diagnostics -> Current Lifestyle.
+
+Do not copy command language such as "please update", "add", or "change" into
+new_value. Store only the clinical fact the patient wants recorded. If the
+target or corrected value is genuinely ambiguous, request clarification rather
+than guessing.
 
 Respond with a JSON object:
 {{
     "is_correction": true/false,
     "confidence": "high"/"medium"/"low",
-    "old_value": "current value from form (if identifiable)",
-    "new_value": "what they want to change it to",
-    "field_name": "exact field name from form (if identifiable)",
-    "section_name": "exact section name from form (if identifiable)",
+    "updates": [
+      {{
+        "operation": "update" | "clear",
+        "section_name": "section name or visible lifestyle component container",
+        "field_name": "field name or Work/Activity/Smoking/Alcohol",
+        "new_value": "clinical value only; empty only for clear"
+      }}
+    ],
     "needs_clarification": true/false,
     "clarification_question": "question to ask if ambiguous"
 }}"""
@@ -346,6 +368,16 @@ Respond with a JSON object:
             return None
         data = json.loads(json_str)
         if data.get("is_correction", False):
+            updates = data.get("updates")
+            if isinstance(updates, list):
+                cleaned_updates = []
+                for update in updates[:8]:
+                    if not isinstance(update, dict):
+                        continue
+                    cleaned = dict(update)
+                    cleaned["source_text"] = user_input
+                    cleaned_updates.append(cleaned)
+                data["updates"] = cleaned_updates
             data["source_text"] = user_input
             return data
         return None
@@ -368,6 +400,7 @@ def apply_form_correction(
     field_name = correction_data.get("field_name", "")
     section_name = correction_data.get("section_name", "")
     new_value = correction_data.get("new_value", "")
+    operation = str(correction_data.get("operation") or "update").strip().lower()
 
     if correction_data.get("needs_clarification", False):
         q = correction_data.get("clarification_question", "")
@@ -376,6 +409,50 @@ def apply_form_correction(
     if not field_name or not section_name:
         return updated_form, False, "I'm not sure which field to update. Could you specify what you'd like to change?"
 
+    from src.graph.pure_functions.form_schema import resolve_form_target
+
+    target = resolve_form_target(updated_form, section_name, field_name)
+    if target is None:
+        return (
+            updated_form,
+            False,
+            "I couldn't uniquely match that information to the intake form. "
+            "Please name the detail you want to change.",
+        )
+
+    section_name = target.section
+    field_name = target.field
+
+    if target.component is not None:
+        from src.graph.pure_functions.lifestyle import (
+            clear_lifestyle_component,
+            update_lifestyle_component,
+        )
+
+        diagnostics = updated_form.get("History & Diagnostics")
+        if not isinstance(diagnostics, dict) or "Current Lifestyle" not in diagnostics:
+            return updated_form, False, "I couldn't find the lifestyle information to update."
+        old_value = diagnostics.get("Current Lifestyle", "")
+        changed = (
+            clear_lifestyle_component(old_value, target.component)
+            if operation == "clear"
+            else update_lifestyle_component(
+                old_value,
+                target.component,
+                new_value,
+                correction_data.get("source_text", ""),
+            )
+        )
+        if changed is None or changed == old_value:
+            return updated_form, False, "What should the correct lifestyle information be?"
+        diagnostics["Current Lifestyle"] = changed
+        msg = (
+            f"I've updated {target.component} in your lifestyle information. "
+            "Would you like to update anything else? If everything is correct, "
+            "reply 'done' or 'yes' to confirm."
+        )
+        return updated_form, True, msg
+
     if (
         section_name not in updated_form
         or not isinstance(updated_form[section_name], dict)
@@ -383,7 +460,9 @@ def apply_form_correction(
     ):
         return updated_form, False, f"I couldn't find '{field_name}' in '{section_name}'. Could you clarify?"
 
-    if new_value is None or (isinstance(new_value, str) and not new_value.strip()):
+    if operation == "clear":
+        new_value = ""
+    elif new_value is None or (isinstance(new_value, str) and not new_value.strip()):
         return updated_form, False, "What should the correct information be?"
 
     # The detection step has already selected one validated form field. Apply

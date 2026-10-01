@@ -172,7 +172,7 @@ def merge_lifestyle_answer(
     if does_not_smoke:
         facts["smoking"] = "Smoking: Does not smoke"
     elif re.search(
-        r"\b(?:i (?:currently |occasionally |regularly )?|yes[ ,:-]*)smoke\b",
+        r"\b(?:i (?:do |currently |occasionally |regularly )?|yes[ ,:-]*)smoke\b",
         text,
     ):
         facts["smoking"] = "Smoking: Smokes"
@@ -188,7 +188,8 @@ def merge_lifestyle_answer(
     if does_not_drink:
         facts["alcohol"] = "Alcohol: Does not drink alcohol"
     elif re.search(
-        r"\b(?:i (?:rarely |occasionally |regularly )?|yes[ ,:-]*)drink(?: alcohol)?\b",
+        r"\b(?:i (?:do |rarely |occasionally |regularly )?|yes[ ,:-]*)"
+        r"drink(?:s)?(?: alcohol)?\b",
         text,
     ):
         facts["alcohol"] = "Alcohol: Drinks alcohol"
@@ -230,3 +231,119 @@ def merge_lifestyle_answer(
         ]
         merged_parts.append(fact)
     return "; ".join(merged_parts)
+
+
+def has_explicit_lifestyle_fact(user_input: str | None) -> bool:
+    """Return True only when the message contains an actual habit/work value."""
+    text = " ".join(str(user_input or "").lower().replace("’", "'").split())
+    return bool(re.search(
+        r"\b(?:i\s+(?:do\s+|do not\s+|don't\s+|dont\s+|never\s+|"
+        r"occasionally\s+|rarely\s+|regularly\s+)?(?:smoke|drink)|"
+        r"(?:yes|no)\s+(?:smoke|drink|alcohol)|non[- ]?smoker|no alcohol|"
+        r"i\s+(?:work(?!\s*out)|am working)|my\s+(?:work|job)|"
+        r"i\s+(?:exercise|work\s*out|walk|run)|no exercise)\b",
+        text,
+    ))
+
+
+def update_lifestyle_component(
+    existing: str | None,
+    component_name: str | None,
+    new_value: str | None,
+    source_text: str | None = None,
+) -> str | None:
+    """Apply an LLM-resolved lifestyle subfield to the combined schema field.
+
+    ``Alcohol`` and ``Work`` are display components, not physical form fields.
+    Correction models sometimes return them as nested fields, so resolve those
+    aliases here rather than rejecting a correction that the patient stated
+    clearly.
+    """
+    aliases = {
+        "work": "work",
+        "occupation": "work",
+        "activity": "activity",
+        "activity/exercise": "activity",
+        "exercise": "activity",
+        "smoking": "smoking",
+        "smoke": "smoking",
+        "alcohol": "alcohol",
+        "drinking": "alcohol",
+    }
+    component = aliases.get(str(component_name or "").strip().lower())
+    if component is None:
+        return None
+
+    evidence = " ".join(
+        part.strip() for part in (str(source_text or ""), str(new_value or ""))
+        if part.strip()
+    )
+    current = format_lifestyle_value(existing)
+
+    if component in {"smoking", "alcohol"}:
+        merged = merge_lifestyle_answer(current, evidence)
+        if merged != current:
+            return merged
+
+    value = str(new_value or "").strip()
+    value = re.sub(
+        r"^(?:work|occupation|activity(?:/exercise)?|exercise|smoking|alcohol)\s*:\s*",
+        "",
+        value,
+        flags=re.I,
+    ).strip()
+    if not value:
+        return None
+
+    labels = {
+        "work": "Work",
+        "activity": "Activity/exercise",
+        "smoking": "Smoking",
+        "alcohol": "Alcohol",
+    }
+    prefixes = {
+        "work": ("work:",),
+        "activity": ("activity:", "activity/exercise:", "exercise:"),
+        "smoking": ("smoking:",),
+        "alcohol": ("alcohol:",),
+    }
+    parts = [part.strip() for part in current.split(";") if part.strip()]
+    parts = [
+        part for part in parts
+        if not part.lower().startswith(prefixes[component])
+    ]
+    parts.append(f"{labels[component]}: {value}")
+    return "; ".join(parts)
+
+
+def clear_lifestyle_component(
+    existing: str | None, component_name: str | None
+) -> str | None:
+    """Remove one virtual lifestyle component while preserving the others."""
+    aliases = {
+        "work": "work",
+        "occupation": "work",
+        "activity": "activity",
+        "exercise": "activity",
+        "smoking": "smoking",
+        "smoke": "smoking",
+        "alcohol": "alcohol",
+        "drinking": "alcohol",
+    }
+    component = aliases.get(str(component_name or "").strip().lower())
+    if component is None:
+        return None
+    prefixes = {
+        "work": ("work:",),
+        "activity": ("activity:", "activity/exercise:", "exercise:"),
+        "smoking": ("smoking:",),
+        "alcohol": ("alcohol:",),
+    }
+    current = format_lifestyle_value(existing)
+    parts = [part.strip() for part in current.split(";") if part.strip()]
+    remaining = [
+        part for part in parts
+        if not part.lower().startswith(prefixes[component])
+    ]
+    result = "; ".join(remaining)
+    return result if result != current else None

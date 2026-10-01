@@ -9,19 +9,43 @@ _BODY_SITE = re.compile(
     re.I,
 )
 _SYMPTOM = re.compile(r"\b(?:pain|stiffness|weakness|swelling|ache|discomfort)\b", re.I)
+_INSTRUCTION_LANGUAGE = re.compile(
+    r"\b(?:please|pls|kindly)\b.*\b(?:add|include|record|write|update|change)\b|"
+    r"\b(?:add|include|record|write|update|change)\b.*\b(?:additional|complaint|"
+    r"concern|information|form)\b",
+    re.I,
+)
 
 
-def _concise_complaint(text):
-    """Extract only the newly reported symptom from an addition sentence."""
+def concise_additional_complaint(text):
+    """Extract only the symptom label, never the patient's UI instruction."""
+    raw = str(text).strip()
+    sites = list(dict.fromkeys(
+        match.group(0).strip().lower() for match in _BODY_SITE.finditer(raw)
+    ))
+    symptoms = [match.group(0).lower() for match in _SYMPTOM.finditer(raw)]
+    if sites and symptoms:
+        return f"{' and '.join(sites)} {symptoms[-1]}"
+
     candidate = re.sub(
         r"^.*?\b(?:also|additionally)\s+(?:have|feel|experience)\s+",
         "",
-        str(text),
+        raw,
         flags=re.I,
     )
     candidate = re.split(r"\bbut\b|[.;]", candidate, maxsplit=1, flags=re.I)[0]
     candidate = candidate.strip(" ,.'\"")
-    return candidate or str(text).strip()
+    return candidate or raw
+
+
+def validated_additional_complaint(text):
+    """Return a safe clinical label or None when instruction text remains."""
+    complaint = " ".join(concise_additional_complaint(text).split()).strip(" .,!\"'")
+    if not complaint or len(complaint) > 160 or "?" in complaint:
+        return None
+    if _INSTRUCTION_LANGUAGE.search(complaint):
+        return None
+    return complaint
 
 
 def is_explicit_symptom_addition(text):
@@ -71,7 +95,7 @@ def split_update_and_addition(text):
         re.I,
     ):
         return None
-    return update_text, _concise_complaint(addition_text)
+    return update_text, concise_additional_complaint(addition_text)
 
 
 def additional_complaint_replacement(text):
@@ -185,15 +209,16 @@ def additional_complaint_removal_target(text, form, active_section=None):
 
 def capture_additional_complaint(form, text):
     updated = copy.deepcopy(form)
-    # Keep the exact patient wording as the source of truth. Details about the
-    # original complaint must not be reused for this additional symptom.
+    complaint = validated_additional_complaint(text)
+    if complaint is None:
+        return updated, None
     existing = [name for name in updated if name.startswith("Additional Complaint ")]
     for name in existing:
-        if updated[name].get("Primary Complaint") == text.strip():
+        if str(updated[name].get("Primary Complaint", "")).strip().lower() == complaint.lower():
             return updated, name
     name = f"Additional Complaint {len(existing) + 1}"
     updated[name] = {
-        "Primary Complaint": text.strip(),
+        "Primary Complaint": complaint,
         "Duration of the Issue": "",
         "Onset (Gradual or Sudden)": "",
         "Mechanism of Injury or Cause": "",
@@ -202,3 +227,20 @@ def capture_additional_complaint(form, text):
         "Relieving Factors": "",
     }
     return updated, name
+
+
+def normalize_additional_complaints(form):
+    """Repair instruction-like labels from sessions created by older code."""
+    updated = copy.deepcopy(form)
+    for section, fields in updated.items():
+        if not section.startswith("Additional Complaint ") or not isinstance(fields, dict):
+            continue
+        current = str(fields.get("Primary Complaint", "")).strip()
+        if current:
+            concise = concise_additional_complaint(current)
+            # Preserve the patient's capitalization when the stored value is
+            # already only the symptom label. Rewrite only instruction-like
+            # legacy values.
+            if concise.lower() != current.lower():
+                fields["Primary Complaint"] = concise
+    return updated
