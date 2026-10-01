@@ -202,7 +202,10 @@ class ReportDeclineFlowTests(unittest.TestCase):
         self.assertIsNone(result["pending_question"])
 
     def test_compact_lifestyle_answer_fills_every_subtopic(self):
-        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+        from src.graph.pure_functions.lifestyle import (
+            format_lifestyle_value,
+            missing_lifestyle_components,
+        )
 
         value = merge_lifestyle_answer(
             "", "4 times a week, work in company, yes smoke, yes drink"
@@ -213,6 +216,22 @@ class ReportDeclineFlowTests(unittest.TestCase):
         self.assertIn("Activity/exercise:", value)
         self.assertIn("Smoking: Smokes", value)
         self.assertIn("Alcohol: Drinks alcohol", value)
+        self.assertEqual(
+            format_lifestyle_value({
+                "Work": "Works in a company",
+                "Activity/exercise": "No exercise routine",
+                "Smoking": "Smokes",
+                "Alcohol": "Drinks alcohol",
+            }),
+            "Work: Works in a company; Activity/exercise: No exercise routine; "
+            "Smoking: Smokes; Alcohol: Drinks alcohol",
+        )
+        self.assertEqual(
+            format_lifestyle_value(
+                "{'Work': 'Works in a company', 'Smoking': 'Smokes'}"
+            ),
+            "Work: Works in a company; Smoking: Smokes",
+        )
 
 
 if __name__ == "__main__":

@@ -119,7 +119,11 @@ from app.clinical.escalation import (
 )
 from app.clinical.scope import assess_msk_intake_scope
 from app.audit.chat_history import ensure_chat_history_indexes, record_chat_message
-from src.graph.pure_functions.clarification import build_out_of_flow_response
+from src.graph.pure_functions.clarification import (
+    boundary_response_with_pending_question,
+    build_out_of_flow_response,
+    pending_intake_question,
+)
 from app.ws.idempotency import RecentRequestWindow, RequestDecision
 from app.observability.privacy import env_flag, error_type, pseudonymous_id
 # Pure stateless helpers. Aliased to legacy names used throughout this file.
@@ -3480,13 +3484,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # Global interview boundary. Out-of-flow, medical-advice,
                         # medication and return-to-activity questions receive one
                         # fixed response without changing form state or invoking AI.
-                        _last_agent_question = next(
-                            (
-                                entry.get("message", "")
-                                for entry in reversed(client_state.get("graph_history") or [])
-                                if entry.get("role") == "agent"
-                            ),
-                            "",
+                        _last_agent_question = pending_intake_question(
+                            client_state.get("graph_history") or []
                         )
                         _boundary_response = (
                             None
@@ -3496,6 +3495,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                         )
                         if _boundary_response:
+                            _boundary_response = boundary_response_with_pending_question(
+                                _boundary_response, _last_agent_question
+                            )
                             client_state["graph_history"] = list(
                                 client_state.get("graph_history") or []
                             ) + [

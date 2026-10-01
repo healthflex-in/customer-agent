@@ -31,6 +31,7 @@ class IntakeClarificationTests(unittest.TestCase):
             "when i can get back to the sports",
             "Can I resume running?",
             "Is it safe to go back to the gym?",
+            "while palming support can I get back and start palaying again",
         ):
             with self.subTest(text=text):
                 response = build_activity_clearance_response(text)
@@ -115,8 +116,8 @@ class IntakeClarificationTests(unittest.TestCase):
             result = make_extract_node(unexpected, reasoning_llm=unexpected)(state)
 
         self.assertTrue(result["direct_response_handled"])
-        self.assertEqual(result["response_text"], OUT_OF_FLOW_RESPONSE)
-        self.assertNotIn("How long", result["response_text"])
+        self.assertTrue(result["response_text"].startswith(OUT_OF_FLOW_RESPONSE))
+        self.assertIn("How long", result["response_text"])
         self.assertNotIn("form", result)
         self.assertEqual(result["history"][-2]["role"], "user")
         self.assertEqual(result["history"][-1]["role"], "agent")
@@ -137,8 +138,31 @@ class IntakeClarificationTests(unittest.TestCase):
             result = make_extract_node(unexpected, reasoning_llm=unexpected)(state)
 
         self.assertTrue(result["direct_response_handled"])
-        self.assertEqual(result["response_text"], OUT_OF_FLOW_RESPONSE)
+        self.assertTrue(result["response_text"].startswith(OUT_OF_FLOW_RESPONSE))
+        self.assertIn("What makes the pain worse?", result["response_text"])
         self.assertNotIn("form", result)
+
+    def test_return_to_play_question_is_not_saved_as_mechanism(self):
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="interviewing",
+            current_section="Present Complaint",
+            user_input="while palming support can I get back and start palaying again",
+            history=[{
+                "role": "agent",
+                "message": "What caused it or what was happening when it started?",
+            }],
+        )
+
+        def unexpected(_prompt):
+            self.fail("A patient question must be intercepted before extraction")
+
+        with patch("src.graph.nodes.extract.get_stream_writer", return_value=lambda _event: None):
+            result = make_extract_node(unexpected, reasoning_llm=unexpected)(state)
+
+        self.assertTrue(result["direct_response_handled"])
+        self.assertNotIn("form", result)
+        self.assertIn("What caused it", result["response_text"])
 
     def test_active_additional_complaint_can_be_retracted_or_skipped(self):
         for text in (
@@ -146,6 +170,9 @@ class IntakeClarificationTests(unittest.TestCase):
             "I don't have any additional complaint",
             "lets skip this",
             "no need enough bye",
+            "no need of additional complaint",
+            "no need of additional compamnt",
+            "no need of additional complaint by mistake i told u",
         ):
             with self.subTest(text=text):
                 state = get_fresh_interview_state("u", "FRM-01", "s")
@@ -170,9 +197,14 @@ class IntakeClarificationTests(unittest.TestCase):
                     result = make_extract_node(unexpected, reasoning_llm=unexpected)(state)
 
                 self.assertTrue(result["direct_response_handled"])
-                self.assertEqual(result["phase"], "summary")
+                self.assertEqual(result["phase"], "interviewing")
                 self.assertNotIn("Additional Complaint 2", result["form"])
                 self.assertIn("Additional Complaint 1", result["form"])
+                self.assertNotIn(
+                    "For this additional concern",
+                    result["response_text"],
+                )
+                self.assertIn("remaining intake", result["response_text"])
                 self.assertIn("removed", result["response_text"].lower())
 
     def test_surgery_clarification_explains_requested_details(self):

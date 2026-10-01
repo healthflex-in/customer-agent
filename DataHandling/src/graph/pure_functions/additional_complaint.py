@@ -103,7 +103,11 @@ def is_additional_complaint_cancellation(text):
         return True
     return bool(
         re.fullmatch(
-            r"(?:let'?s\s+)?skip (?:this|it)|no need(?:,? enough)?(?: bye)?|"
+            r"(?:let'?s\s+)?skip (?:this|it)|"
+            r"no need(?:\s+of|\s+for)?(?:\s+(?:this|that|the))?"
+            r"(?:\s+additional)?(?:\s+(?:compl\w*|compa\w*|concern|pain))?"
+            r"(?:\s+by mistake)?(?:\s+i told (?:you|u))?"
+            r"|no need(?:,? enough)?(?: bye)?|"
             r"remove (?:this|that)(?: additional)? (?:complaint|concern)",
             normalized.strip(" .,!"),
         )

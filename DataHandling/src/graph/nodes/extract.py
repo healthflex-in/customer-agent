@@ -205,6 +205,7 @@ def _classify_visit_context(user_input: str, llm_complete) -> str:
 from src.graph.pure_functions.form_extraction import extract_form_data_from_text
 from src.graph.pure_functions.form_validation import validate_section
 from src.graph.pure_functions.clarification import (
+    boundary_response_with_pending_question,
     build_activity_clearance_response,
     build_intake_clarification,
     build_out_of_flow_response,
@@ -261,20 +262,43 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     section for section in state.get("form_sections", list(updated_form))
                     if section != section_to_remove
                 ]
-                response = (
-                    "I've removed that additional complaint. Is the remaining "
-                    "information correct, or would you like to change anything else?"
+                base_history = history + [{"role": "user", "message": user_input}]
+                from src.graph.nodes.generate import required_response_before_summary
+                next_required = required_response_before_summary(
+                    {
+                        **state,
+                        "form": updated_form,
+                        "form_sections": updated_sections,
+                    },
+                    base_history,
                 )
+                if next_required is not None:
+                    response = (
+                        "I've removed that additional complaint. Let's continue with "
+                        "the remaining intake.\n\n" + next_required["response_text"]
+                    )
+                    next_patch = {
+                        key: value for key, value in next_required.items()
+                        if key not in {"response_text", "history"}
+                    }
+                else:
+                    from src.graph.pure_functions.summary import _fallback_summary
+                    response = (
+                        "I've removed that additional complaint. Here is the updated "
+                        "information:\n\n" + _fallback_summary(updated_form)
+                    )
+                    next_patch = {
+                        "phase": "summary",
+                        "current_section": (
+                            updated_sections[-1] if updated_sections else "Present Complaint"
+                        ),
+                        "missing_fields": [],
+                    }
                 return {
                     "form": updated_form,
                     "form_sections": updated_sections,
-                    "phase": "summary",
-                    "current_section": (
-                        updated_sections[-1] if updated_sections else "Present Complaint"
-                    ),
-                    "missing_fields": [],
-                    "history": history + [
-                        {"role": "user", "message": user_input},
+                    **next_patch,
+                    "history": base_history + [
                         {"role": "agent", "message": response},
                     ],
                     "response_text": response,
@@ -308,6 +332,9 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             user_input, last_agent_for_boundary
         )
         if out_of_flow_response:
+            out_of_flow_response = boundary_response_with_pending_question(
+                out_of_flow_response, last_agent_for_boundary
+            )
             return {
                 "history": history + [
                     {"role": "user", "message": user_input},

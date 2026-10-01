@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import ast
+import json
 
 
 LIFESTYLE_COMPONENT_FIELDS = {
@@ -13,10 +15,43 @@ LIFESTYLE_COMPONENT_FIELDS = {
 }
 
 
+def format_lifestyle_value(value) -> str:
+    """Normalize structured or serialized lifestyle data to readable text."""
+    parsed = value
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    parsed = loader(candidate)
+                    break
+                except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+                    continue
+        else:
+            return candidate
+    if not isinstance(parsed, dict):
+        return str(value or "").strip()
+    labels = {
+        "work": "Work",
+        "activity/exercise": "Activity/exercise",
+        "activity": "Activity/exercise",
+        "exercise": "Activity/exercise",
+        "smoking": "Smoking",
+        "alcohol": "Alcohol",
+    }
+    parts = []
+    for key, item in parsed.items():
+        if item is None or not str(item).strip():
+            continue
+        label = labels.get(str(key).strip().lower(), str(key).strip())
+        parts.append(f"{label}: {str(item).strip()}")
+    return "; ".join(parts)
+
+
 def lifestyle_components(value: str | None) -> set[str]:
     """Return the explicitly documented lifestyle subtopics."""
 
-    text = " ".join(str(value or "").lower().replace("’", "'").split())
+    text = " ".join(format_lifestyle_value(value).lower().replace("’", "'").split())
     found: set[str] = set()
     if re.search(
         r"\b(?:work|job|occupation|business|office|desk|student|retired|"
@@ -106,7 +141,7 @@ def merge_lifestyle_answer(existing: str | None, user_input: str | None) -> str:
     ):
         facts.append("Activity/exercise: No other regular exercise routine")
 
-    current = str(existing or "").strip()
+    current = format_lifestyle_value(existing)
     if not facts:
         return current
 

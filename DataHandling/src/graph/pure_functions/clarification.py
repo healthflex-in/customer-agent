@@ -19,9 +19,35 @@ _ACTIVITY_CLEARANCE = re.compile(
     r"is it (?:safe|okay|ok)|when (?:can|could|should) i|"
     r"when i (?:can|could|should))\b"
     r".{0,55}\b(?:return|get back|go back|resume|start|continue|play|do)\b"
-    r".{0,35}\b(?:sports?|exercise|workouts?|gym|running|training|football|cricket|cycling|swimming)\b",
+    r".{0,35}\b(?:sports?|exercise|workouts?|gym|running|training|football|cricket|"
+    r"cycling|swimming|play\w*|palay\w*)\b",
     re.I,
 )
+
+
+def pending_intake_question(history: list[dict] | None) -> str:
+    """Return the latest real intake prompt, skipping prior boundary replies."""
+    for entry in reversed(history or []):
+        if entry.get("role") != "agent":
+            continue
+        message = str(entry.get("message") or "").strip()
+        if message and not message.startswith(OUT_OF_FLOW_RESPONSE):
+            return message
+    return ""
+
+
+def boundary_response_with_pending_question(
+    response: str, pending_question: str | None
+) -> str:
+    """Decline advice and repeat the unanswered intake question in one turn."""
+    question = str(pending_question or "").strip()
+    if not question or question.startswith(OUT_OF_FLOW_RESPONSE):
+        return response
+    return (
+        response
+        + "\n\nTo continue the intake, please answer this question:\n"
+        + question
+    )
 
 OUT_OF_FLOW_RESPONSE = (
     "I'm here to collect information for your clinical assessment, so I'm unable "
