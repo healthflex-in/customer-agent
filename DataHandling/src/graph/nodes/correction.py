@@ -12,9 +12,19 @@ def make_detect_correction_node(llm_complete):
         phase = state["phase"]
         is_summary_mode = (phase == "summary")
         from src.graph.pure_functions.complaint_severity import explicit_severity_updates
-        updates = explicit_severity_updates(form, user_input)
-        if updates:
-            return {"correction_data": {"severity_updates": updates}}
+        active_section = "Pain Assessment" if is_summary_mode else state.get("current_section")
+        updates = explicit_severity_updates(form, user_input, active_section)
+        from src.graph.pure_functions.lifestyle import merge_lifestyle_answer
+        current_lifestyle = form.get("History & Diagnostics", {}).get(
+            "Current Lifestyle", ""
+        )
+        lifestyle_value = merge_lifestyle_answer(current_lifestyle, user_input)
+        lifestyle_changed = lifestyle_value != str(current_lifestyle or "").strip()
+        if updates or lifestyle_changed:
+            return {"correction_data": {
+                "severity_updates": updates,
+                "lifestyle_value": lifestyle_value if lifestyle_changed else None,
+            }}
         result = detect_form_correction(
             user_input, form, is_summary_mode=is_summary_mode, llm_complete=llm_complete
         )
@@ -54,7 +64,13 @@ def make_apply_correction_node(llm_complete):
                                updated_form.get("Pain Assessment", {}).get("Primary Location of Pain")
                                or updated_form.get("Present Complaint", {}).get("Primary Complaint"))
                 changes.append(f"{description}: {score}")
-            message = "I've updated the pain ratings separately: " + "; ".join(changes) + ". Would you like to update anything else? If everything is correct, you can confirm."
+            lifestyle_value = correction_data.get("lifestyle_value")
+            if lifestyle_value is not None:
+                updated_form.setdefault("History & Diagnostics", {})[
+                    "Current Lifestyle"
+                ] = lifestyle_value
+                changes.append("lifestyle information")
+            message = "I've updated " + "; ".join(changes) + ". Would you like to update anything else? If everything is correct, you can confirm."
             return {"form": updated_form, "correction_applied": True,
                     "response_text": message,
                     "history": history + [{"role": "agent", "message": message}]}

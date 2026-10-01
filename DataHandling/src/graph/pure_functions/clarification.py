@@ -143,6 +143,15 @@ def build_out_of_flow_response(
     if _looks_like_detailed_intake_answer(text):
         return None
 
+    # Clinical answers often begin with a subordinate "when/while" clause.
+    # They are statements, not questions, even though the first word is also a
+    # question word (for example: "When I walk, the pain gets worse").
+    if re.match(r"^(?:when|while)\s+(?:i|my|the)\b", lowered) and re.search(
+        r"\b(?:pain|hurt|ache|worse|better|relief|reliev|massage|walk|move|bend)\b",
+        lowered,
+    ):
+        return None
+
     is_question = "?" in text or bool(_QUESTION_OPENING.search(text))
     if not is_question:
         return None

@@ -26,10 +26,28 @@ def _concise_complaint(text):
 
 def is_explicit_symptom_addition(text):
     lowered = text.lower()
+    if re.search(r"\b(?:no pain|not pain|dont have|don't have|do not have)\b", lowered):
+        return False
+    symptom = r"(?:pain|stiffness|weakness|swelling|ache|discomfort)"
+    site = _BODY_SITE.pattern
     return bool(
-        re.search(r"\b(?:pain|stiffness|weakness|swelling)\b", lowered)
-        and re.search(r"\b(?:as well|aswell|also|additional|forgot|add)\b", lowered)
-        and not re.search(r"\b(?:no pain|not pain|dont have|don't have|do not have)\b", lowered)
+        re.search(
+            rf"\b(?:i\s+)?(?:also\s+|additionally\s+)?(?:have|feel|experience)\b"
+            rf".{{0,45}}(?:{symptom}).{{0,12}}\b(?:too|as\s*well)\b",
+            lowered,
+            re.I,
+        )
+        or re.search(
+            rf"\b(?:i\s+)?(?:also|additionally)\s+(?:have|feel|experience)\b"
+            rf".{{0,45}}(?:{symptom})\b",
+            lowered,
+            re.I,
+        )
+        or re.search(
+            rf"\b(?:add|additional|forgot to mention)\b.{{0,45}}{site}.{{0,20}}(?:{symptom})\b",
+            lowered,
+            re.I,
+        )
     )
 
 
@@ -59,6 +77,10 @@ def split_update_and_addition(text):
 def additional_complaint_replacement(text):
     """Return a corrected complaint label, or None for an ordinary addition."""
     lowered = str(text).lower()
+    # Never guess that a generic correction targets an additional complaint.
+    # The patient must explicitly identify the additional complaint/point.
+    if not re.search(r"\badditional (?:complaint|concern|point)\b", lowered):
+        return None
     correction_signal = re.search(
         r"\b(?:change|correct|update|replace|not .*additional|"
         r"additional (?:complaint|concern|point).{0,35}"

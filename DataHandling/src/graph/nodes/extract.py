@@ -568,10 +568,13 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             )
 
         updated_lifestyle = merge_lifestyle_answer(
-            updated_form.get("History & Diagnostics", {}).get("Current Lifestyle", ""),
+            form.get("History & Diagnostics", {}).get("Current Lifestyle", ""),
             user_input,
+            last_agent_q,
         )
-        if updated_lifestyle:
+        if updated_lifestyle or updated_form.get("History & Diagnostics", {}).get(
+            "Current Lifestyle"
+        ):
             updated_form = dict(updated_form)
             updated_form["History & Diagnostics"] = dict(
                 updated_form.get("History & Diagnostics", {})

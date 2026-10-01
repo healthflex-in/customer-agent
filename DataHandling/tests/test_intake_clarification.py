@@ -71,6 +71,7 @@ class IntakeClarificationTests(unittest.TestCase):
             "I take ibuprofen occasionally.",
             "I returned to sports last week.",
             "My pain is 5 out of 10 and walking makes it worse.",
+            "When I walk the pain increases and massage provides relief.",
         ):
             with self.subTest(text=text):
                 self.assertIsNone(build_out_of_flow_response(text))
@@ -266,10 +267,9 @@ class IntakeClarificationTests(unittest.TestCase):
 
         self.assertTrue(result["direct_response_handled"])
         self.assertIn("what procedure", result["response_text"])
-        self.assertEqual(
-            result["form"]["History & Diagnostics"]["Current Lifestyle"],
-            "Works out once a week",
-        )
+        lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
+        self.assertIn("Activity/exercise:", lifestyle)
+        self.assertIn("work out once a week", lifestyle.lower())
         self.assertEqual(result["history"][-1]["role"], "agent")
         self.assertEqual(result["history"][-1]["message"], result["response_text"])
 

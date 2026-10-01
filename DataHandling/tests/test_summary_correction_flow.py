@@ -26,6 +26,25 @@ def _load_edges_without_langgraph():
 
 
 class SummaryCorrectionFlowTests(unittest.TestCase):
+    def test_head_pain_too_is_saved_as_head_not_previous_leg(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(phase="summary", user_input="I have head pain too")
+        state["form"]["Present Complaint"]["Primary Complaint"] = "Leg pain"
+        state["form"]["Pain Assessment"]["Primary Location of Pain"] = "Leg"
+
+        def unexpected(_):
+            self.fail("Explicit additional head pain must not call AI")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        self.assertEqual(state["summary_intent"]["intent"], "new_complaint")
+        result = make_handle_summary_response_node(unexpected)(state)
+        saved = result["form"]["Additional Complaint 1"]["Primary Complaint"]
+        self.assertIn("head pain", saved.lower())
+        self.assertNotIn("leg pain", saved.lower())
+
     def test_combined_severity_update_and_new_complaint_apply_together(self):
         from src.graph.state import get_fresh_interview_state
         from src.graph.nodes.summary import make_classify_summary_intent_node

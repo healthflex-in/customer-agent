@@ -41,6 +41,10 @@ def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
             )
             result = {"intent": "new_complaint", "correction_text": correction_text,
                       "addition_text": addition_text, "severity_updates": updates}
+        elif (updates := explicit_severity_updates(
+            state["form"], user_input, "Pain Assessment"
+        )):
+            result = {"intent": "request_change", "correction_text": user_input}
         elif replacement := additional_complaint_replacement(user_input):
             additional_sections = [
                 name for name in state["form"]
@@ -54,8 +58,6 @@ def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
                 }
             else:
                 result = classify_summary_response(user_input, summary_text, llm_complete)
-        elif (updates := explicit_severity_updates(state["form"], user_input)):
-            result = {"intent": "request_change", "correction_text": user_input}
         elif SCORE.search(user_input) and len(complaint_targets(state["form"])) > 1:
             result = {"intent": "request_change", "correction_text": None}
         else:

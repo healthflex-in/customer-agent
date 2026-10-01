@@ -99,6 +99,57 @@ class ComplaintSeverityTests(unittest.TestCase):
         self.assertEqual(result["Pain Assessment"]["Severity (1-10)"], "10/10")
         self.assertEqual(result[self.section]["Severity (1-10)"], "7/10")
 
+    def test_qa_primary_leg_correction_wins_over_additional_complaint(self):
+        self.form["Present Complaint"]["Primary Complaint"] = "Leg pain"
+        self.form["Pain Assessment"]["Primary Location of Pain"] = "Leg"
+        self.form["Pain Assessment"]["Severity (1-10)"] = "9/10"
+        self.form[self.section]["Primary Complaint"] = "Head pain"
+        self.form[self.section]["Severity (1-10)"] = "5/10"
+
+        for text in (
+            "pls update leg pain to 10 from 9",
+            "please change leg pain 9→10",
+            "update leg pain rating is 10",
+        ):
+            with self.subTest(text=text):
+                updates = explicit_severity_updates(
+                    self.form, text, "Pain Assessment"
+                )
+                self.assertEqual(
+                    updates,
+                    {("Pain Assessment", "Severity (1-10)"): "10/10"},
+                )
+
+    def test_qa_summary_leg_correction_does_not_rename_additional_complaint(self):
+        from src.graph.nodes.summary import make_handle_summary_response_node
+
+        self.form["Present Complaint"]["Primary Complaint"] = "Leg pain"
+        self.form["Pain Assessment"]["Primary Location of Pain"] = "Leg"
+        self.form["Pain Assessment"]["Severity (1-10)"] = "9/10"
+        self.form[self.section]["Primary Complaint"] = "Head pain"
+        self.form[self.section]["Severity (1-10)"] = "5/10"
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            form=self.form,
+            phase="summary",
+            user_input="pls update leg pain to 10 from 9",
+        )
+
+        def unexpected(_):
+            self.fail("Explicit severity correction must not call AI")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        self.assertEqual(state["summary_intent"]["intent"], "request_change")
+        state.update(make_detect_correction_node(unexpected)(state))
+        result = make_apply_correction_node(unexpected)(state)
+        self.assertEqual(
+            result["form"]["Pain Assessment"]["Severity (1-10)"], "10/10"
+        )
+        self.assertEqual(
+            result["form"][self.section]["Primary Complaint"], "Head pain"
+        )
+        self.assertEqual(result["form"][self.section]["Severity (1-10)"], "5/10")
+
     def test_side_is_required_for_two_knee_complaints(self):
         self.form["Present Complaint"]["Primary Complaint"] = "Left knee pain"
         self.form["Pain Assessment"]["Primary Location of Pain"] = "left knee"

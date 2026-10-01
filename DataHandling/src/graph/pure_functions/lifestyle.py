@@ -81,11 +81,16 @@ def missing_lifestyle_components(value: str | None) -> list[str]:
     ]
 
 
-def merge_lifestyle_answer(existing: str | None, user_input: str | None) -> str:
+def merge_lifestyle_answer(
+    existing: str | None,
+    user_input: str | None,
+    last_question: str | None = None,
+) -> str:
     """Merge explicit smoking, alcohol, and exercise facts into one field."""
 
     text = " ".join(str(user_input or "").lower().replace("’", "'").split())
-    facts: list[str] = []
+    question = " ".join(str(last_question or "").lower().split())
+    facts: dict[str, str] = {}
 
     if re.search(
         r"\b(?:i (?:work(?! out)|am working)|my (?:work|job)|work involves|job involves|"
@@ -93,26 +98,40 @@ def merge_lifestyle_answer(existing: str | None, user_input: str | None) -> str:
         r"unemployed|9\s*-?\s*5)\b",
         text,
     ):
-        facts.append(f"Work: {str(user_input).strip()}")
+        facts["work"] = f"Work: {str(user_input).strip()}"
 
-    if re.search(
-        r"\b(?:exercise|workout|gym|i walk|walking only|running|cycling|swimming|"
+    pain_context = bool(re.search(
+        r"\b(?:pain|worse|aggravat|relief|reliev|massage|hurt|increases?|decreases?)\b",
+        text,
+    ))
+    lifestyle_question = bool(re.search(
+        r"\b(?:exercise routine|usual activity|workout|gym|physically active)\b",
+        question,
+    ))
+    explicit_activity = bool(re.search(
+        r"\b(?:exercise|work\s*out|gym|walking only|running|cycling|swimming|yoga|zumba|"
         r"no other exercise|no exercise|times? (?:a|per) week|days? (?:a|per) week)\b",
         text,
-    ):
-        facts.append(f"Activity/exercise: {str(user_input).strip()}")
+    ))
+    walking_as_routine = bool(
+        re.search(r"\bi (?:only )?walk\b", text)
+        and not pain_context
+        and ("only walk" in text or lifestyle_question)
+    )
+    if explicit_activity or walking_as_routine:
+        facts["activity"] = f"Activity/exercise: {str(user_input).strip()}"
 
     does_not_smoke = bool(
         re.search(r"\b(?:i )?(?:do not|don't|dont|never) smoke\b", text)
         or re.search(r"\bnon[- ]?smoker\b", text)
     )
     if does_not_smoke:
-        facts.append("Smoking: Does not smoke")
+        facts["smoking"] = "Smoking: Does not smoke"
     elif re.search(
         r"\b(?:i (?:currently |occasionally |regularly )?|yes[ ,:-]*)smoke\b",
         text,
     ):
-        facts.append("Smoking: Smokes")
+        facts["smoking"] = "Smoking: Smokes"
 
     does_not_drink = bool(
         re.search(
@@ -122,33 +141,47 @@ def merge_lifestyle_answer(existing: str | None, user_input: str | None) -> str:
         or "no alcohol" in text
     )
     if does_not_drink:
-        facts.append("Alcohol: Does not drink alcohol")
+        facts["alcohol"] = "Alcohol: Does not drink alcohol"
     elif re.search(
         r"\b(?:i (?:rarely |occasionally |regularly )?|yes[ ,:-]*)drink(?: alcohol)?\b",
         text,
     ):
-        facts.append("Alcohol: Drinks alcohol")
+        facts["alcohol"] = "Alcohol: Drinks alcohol"
 
-    if re.search(r"\bi (?:only )?walk\b", text) or "walking only" in text:
-        facts.append("Activity/exercise: Walks for exercise")
-    if any(
+    walks_for_exercise = walking_as_routine or "walking only" in text
+    no_other_exercise = any(
         phrase in text
         for phrase in (
             "don't have any other exercise", "dont have any other exercise",
             "do not have any other exercise", "no other exercise",
             "no exercise routine", "don't exercise", "dont exercise",
         )
-    ):
-        facts.append("Activity/exercise: No other regular exercise routine")
+    )
+    if walks_for_exercise and no_other_exercise:
+        facts["activity"] = (
+            "Activity/exercise: Walks for exercise. No other regular "
+            "exercise routine"
+        )
+    elif walks_for_exercise:
+        facts["activity"] = "Activity/exercise: Walks for exercise"
+    elif no_other_exercise:
+        facts["activity"] = "Activity/exercise: No other regular exercise routine"
 
     current = format_lifestyle_value(existing)
     if not facts:
         return current
 
     merged_parts = [part.strip() for part in current.split(";") if part.strip()]
-    normalized_existing = current.lower()
-    for fact in facts:
-        if fact.lower() not in normalized_existing:
-            merged_parts.append(fact)
-            normalized_existing += f"; {fact.lower()}"
+    prefixes = {
+        "work": ("work:",),
+        "activity": ("activity:", "activity/exercise:", "exercise:"),
+        "smoking": ("smoking:",),
+        "alcohol": ("alcohol:",),
+    }
+    for component, fact in facts.items():
+        merged_parts = [
+            part for part in merged_parts
+            if not part.lower().startswith(prefixes[component])
+        ]
+        merged_parts.append(fact)
     return "; ".join(merged_parts)

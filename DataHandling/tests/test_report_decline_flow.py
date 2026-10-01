@@ -233,6 +233,114 @@ class ReportDeclineFlowTests(unittest.TestCase):
             "Work: Works in a company; Smoking: Smokes",
         )
 
+    def test_alcohol_correction_replaces_contradictory_old_value(self):
+        existing = (
+            "Work: Works in a company; Activity/exercise: Yoga; Smoking: Smokes; "
+            "Alcohol: Does not drink alcohol"
+        )
+        value = merge_lifestyle_answer(
+            existing,
+            "can you please update I drink also and pain rating is 10",
+        )
+
+        self.assertIn("Alcohol: Drinks alcohol", value)
+        self.assertNotIn("Alcohol: Does not drink alcohol", value)
+        self.assertEqual(value.count("Alcohol:"), 1)
+
+    def test_pain_aggravation_answer_cannot_enter_lifestyle(self):
+        existing = (
+            "Work: Works in a company; Activity/exercise: Yoga; Smoking: Smokes; "
+            "Alcohol: Does not drink alcohol"
+        )
+        value = merge_lifestyle_answer(
+            existing,
+            "when I walk increases pain and massage provide relief",
+            "What makes the pain worse, and what provides relief?",
+        )
+
+        self.assertEqual(value, existing)
+        self.assertNotIn("Walks for exercise", value)
+
+    def test_extractor_cannot_write_pain_answer_into_lifestyle(self):
+        import copy
+        import json
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="interviewing",
+            current_section="Pain Assessment",
+            user_input="when I walk increases pain and massage provide relief",
+            history=[{
+                "role": "agent",
+                "message": "What makes the pain worse, and what provides relief?",
+            }],
+        )
+        existing = "Work: Company; Activity/exercise: Yoga; Smoking: Does not smoke"
+        state["form"]["History & Diagnostics"]["Current Lifestyle"] = existing
+        contaminated = copy.deepcopy(state["form"])
+        contaminated["Pain Assessment"]["Aggravating Factors"] = "Walking"
+        contaminated["Pain Assessment"]["Relieving Factors"] = "Massage"
+        contaminated["History & Diagnostics"]["Current Lifestyle"] = (
+            "Activity/exercise: hen I walk increases pain and massage provide relief; "
+            "Activity/exercise: Walks for exercise"
+        )
+
+        def reasoning_llm(_prompt):
+            return json.dumps(contaminated)
+
+        def llm_complete(_prompt):
+            return '{}'
+
+        with patch("src.graph.nodes.extract.get_stream_writer", return_value=lambda _event: None):
+            result = make_extract_node(llm_complete, reasoning_llm=reasoning_llm)(state)
+
+        self.assertEqual(
+            result["form"]["History & Diagnostics"]["Current Lifestyle"],
+            existing,
+        )
+        self.assertEqual(
+            result["form"]["Pain Assessment"]["Aggravating Factors"], "Walking"
+        )
+        self.assertEqual(
+            result["form"]["Pain Assessment"]["Relieving Factors"], "Massage"
+        )
+
+    def test_combined_alcohol_and_rating_update_applies_both_not_new_complaint(self):
+        from src.graph.nodes.correction import (
+            make_apply_correction_node,
+            make_detect_correction_node,
+        )
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="summary",
+            user_input="can you please update I drink also and pain rating is 10",
+        )
+        state["form"]["Present Complaint"]["Primary Complaint"] = "Leg pain"
+        state["form"]["Pain Assessment"]["Primary Location of Pain"] = "Leg"
+        state["form"]["Pain Assessment"]["Severity (1-10)"] = "9/10"
+        state["form"]["History & Diagnostics"]["Current Lifestyle"] = (
+            "Work: Company; Activity/exercise: Yoga; Smoking: Smokes; "
+            "Alcohol: Does not drink alcohol"
+        )
+
+        def unexpected(_):
+            self.fail("Combined explicit updates must not call AI")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        self.assertEqual(state["summary_intent"]["intent"], "request_change")
+        state.update(make_detect_correction_node(unexpected)(state))
+        result = make_apply_correction_node(unexpected)(state)
+
+        self.assertNotIn("Additional Complaint 1", result["form"])
+        self.assertEqual(
+            result["form"]["Pain Assessment"]["Severity (1-10)"], "10/10"
+        )
+        lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
+        self.assertIn("Alcohol: Drinks alcohol", lifestyle)
+        self.assertNotIn("Alcohol: Does not drink alcohol", lifestyle)
+
 
 if __name__ == "__main__":
     unittest.main()
