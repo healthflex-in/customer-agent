@@ -14,6 +14,37 @@ LIFESTYLE_COMPONENT_FIELDS = {
     "alcohol": "Current Lifestyle — Alcohol",
 }
 
+_HEALTH_DENIAL_AS_WORK = re.compile(
+    r"\b(?:no|none|not\w*|never)\b.{0,30}"
+    r"\b(?:health|cond\w*|cont\w*|ill\w*|surg\w*|fract\w*)\b",
+    re.I,
+)
+
+
+def _clean_lifestyle_component(label: str, value: object) -> str:
+    """Remove cross-field fragments from one labelled lifestyle component."""
+    cleaned = " ".join(str(value or "").strip().split())
+    key = label.strip().lower()
+    if key in {"work", "occupation"} and _HEALTH_DENIAL_AS_WORK.search(cleaned):
+        return ""
+    if key in {"activity", "activity/exercise", "exercise"}:
+        clauses = _lifestyle_clauses(cleaned)
+        activity_clause = next(
+            (
+                clause for clause in clauses
+                if re.search(
+                    r"\b(?:exercise|work\s*out|gym|walk|run|cycling|swimming|"
+                    r"yoga|zumba|times? (?:a|per) week|days? (?:a|per) week)\b",
+                    clause,
+                    re.I,
+                )
+            ),
+            "",
+        )
+        if activity_clause:
+            return activity_clause
+    return cleaned
+
 
 def _lifestyle_clauses(user_input: str | None) -> list[str]:
     """Split a compact answer without mixing one lifestyle fact into another."""
@@ -28,13 +59,14 @@ def _lifestyle_clauses(user_input: str | None) -> list[str]:
         flags=re.I,
     )
     # Voice transcription frequently omits punctuation: "I work in a company
-    # no drink". Insert a boundary before an explicit habit answer.
+    # no drink" or "I exercise three days a week I smoke". Insert a boundary
+    # before an explicit habit answer.  The yes/no qualifier is optional.
     expanded: list[str] = []
     for part in parts:
         expanded.extend(
             re.split(
-                r"\s+(?=(?:i\s+)?(?:yes|no|never|don't|dont|do not)\s+"
-                r"(?:smok|drink|alcohol))",
+                r"\s+(?=(?:i\s+)?(?:(?:yes|no|never|don't|dont|do not)\s+)?"
+                r"(?:smok|drink|alcohol)\w*\b)",
                 part,
                 flags=re.I,
             )
@@ -62,6 +94,28 @@ def format_lifestyle_value(value) -> str:
                 except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
                     continue
         else:
+            # Canonical stored values are semicolon-delimited labelled
+            # components. Re-clean them on read so previously contaminated
+            # records no longer count as completed lifestyle answers.
+            labelled_parts = []
+            recognized_label = False
+            for part in candidate.split(";"):
+                if ":" not in part:
+                    labelled_parts.append(part.strip())
+                    continue
+                label, item = part.split(":", 1)
+                if label.strip().lower() not in {
+                    "work", "occupation", "activity", "activity/exercise",
+                    "exercise", "smoking", "alcohol",
+                }:
+                    labelled_parts.append(part.strip())
+                    continue
+                recognized_label = True
+                cleaned = _clean_lifestyle_component(label, item)
+                if cleaned:
+                    labelled_parts.append(f"{label.strip()}: {cleaned}")
+            if recognized_label:
+                return "; ".join(part for part in labelled_parts if part)
             return candidate
     if not isinstance(parsed, dict):
         return str(value or "").strip()
@@ -78,7 +132,9 @@ def format_lifestyle_value(value) -> str:
         if item is None or not str(item).strip():
             continue
         label = labels.get(str(key).strip().lower(), str(key).strip())
-        parts.append(f"{label}: {str(item).strip()}")
+        cleaned = _clean_lifestyle_component(label, item)
+        if cleaned:
+            parts.append(f"{label}: {cleaned}")
     return "; ".join(parts)
 
 
@@ -148,7 +204,19 @@ def merge_lifestyle_answer(
         r"occupation|your occupation|your job)\b",
         question,
     ))
-    if asks_work and "work" not in facts:
+    # In a batched question a short answer may belong to a neighbouring topic.
+    # For example, "no other conditions" answers the health-history question,
+    # not occupation.  Only use the bare-answer fallback when no other clinical
+    # topic was asked; explicit work statements above remain safe in any batch.
+    asks_other_clinical_topic = bool(re.search(
+        r"\b(?:health conditions?|medical conditions?|surger(?:y|ies)|fractures?|"
+        r"x-?rays?|mri|ct scans?|blood reports?|seen a doctor|physiotherapist|"
+        r"hospital|diagnosis|treatment|pain|severity|makes? it worse|"
+        r"gives? relief|goals?|expectations?|how long|start(?:ed)? suddenly|"
+        r"start(?:ed)? gradually)\b",
+        question,
+    ))
+    if asks_work and not asks_other_clinical_topic and "work" not in facts:
         other_component = re.compile(
             r"\b(?:smok|tobacco|drink|alcohol|exercise|work\s*out|gym|"
             r"walking|running|cycling|swimming|yoga|zumba)\w*\b",
@@ -157,6 +225,7 @@ def merge_lifestyle_answer(
         work_candidates = [
             clause for clause in _lifestyle_clauses(user_input)
             if not other_component.search(clause)
+            and not _HEALTH_DENIAL_AS_WORK.search(clause)
             and not clause.rstrip().endswith("?")
         ]
         if work_candidates:

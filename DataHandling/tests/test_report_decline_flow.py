@@ -275,6 +275,112 @@ class ReportDeclineFlowTests(unittest.TestCase):
 
         self.assertEqual(value, "Work: accountant")
 
+    def test_health_condition_denial_in_batch_is_not_saved_as_work(self):
+        question = (
+            "Could you also tell me:\n"
+            "- Do you have any other health conditions, past surgeries, or fractures?\n"
+            "- What is your work and usual activity or exercise routine?"
+        )
+        for answer in ("no other conditions", "noter contions"):
+            with self.subTest(answer=answer):
+                value = merge_lifestyle_answer("", answer, question)
+                self.assertEqual(value, "")
+
+    def test_unpunctuated_exercise_and_smoking_are_separate_components(self):
+        value = merge_lifestyle_answer(
+            "",
+            "I exercise three days in a week I smoke",
+            "What is your exercise routine, and do you smoke?",
+        )
+
+        self.assertIn(
+            "Activity/exercise: I exercise three days in a week",
+            value,
+        )
+        self.assertIn("Smoking: Smokes", value)
+        activity = next(
+            part for part in value.split(";")
+            if part.strip().startswith("Activity/exercise:")
+        )
+        self.assertNotIn("smoke", activity.lower())
+
+    def test_existing_cross_field_lifestyle_data_is_repaired_on_read(self):
+        from src.graph.pure_functions.lifestyle import (
+            format_lifestyle_value,
+            missing_lifestyle_components,
+        )
+
+        polluted = {
+            "Work": "noter contions",
+            "Activity/exercise": "I exercise three days in a week I smoke",
+            "Smoking": "Smokes",
+            "Alcohol": "Does not drink alcohol",
+        }
+        value = format_lifestyle_value(polluted)
+
+        self.assertNotIn("noter contions", value)
+        self.assertIn("Activity/exercise: I exercise three days in a week", value)
+        self.assertNotIn("week I smoke", value)
+        self.assertIn("Smoking: Smokes", value)
+        self.assertIn(
+            "Current Lifestyle — Work",
+            missing_lifestyle_components(value),
+        )
+
+    def test_existing_labelled_string_is_repaired_before_next_merge(self):
+        polluted = (
+            "Work: no other conditions; "
+            "Activity/exercise: I exercise three days in a week I smoke; "
+            "Smoking: Smokes"
+        )
+
+        value = merge_lifestyle_answer(polluted, "I do not drink alcohol")
+
+        self.assertNotIn("Work:", value)
+        self.assertNotIn("week I smoke", value)
+        self.assertIn("Smoking: Smokes", value)
+        self.assertIn("Alcohol: Does not drink alcohol", value)
+
+    def test_reasoning_model_cannot_store_health_denial_as_occupation(self):
+        import copy
+        import json
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="interviewing",
+            current_section="History & Diagnostics",
+            user_input="noter contions",
+            history=[{
+                "role": "agent",
+                "message": (
+                    "Could you also tell me:\n"
+                    "- Do you have any other health conditions?\n"
+                    "- What is your work and usual activity or exercise routine?"
+                ),
+            }],
+        )
+        reasoned = copy.deepcopy(state["form"])
+        reasoned["History & Diagnostics"]["Current Lifestyle"] = (
+            "Work: noter contions"
+        )
+
+        def reasoning_llm(_prompt):
+            return json.dumps(reasoned)
+
+        with patch(
+            "src.graph.nodes.extract.get_stream_writer",
+            return_value=lambda _event: None,
+        ):
+            result = make_extract_node(
+                lambda _prompt: "{}",
+                reasoning_llm=reasoning_llm,
+            )(state)
+
+        self.assertEqual(
+            result["form"]["History & Diagnostics"]["Current Lifestyle"],
+            "",
+        )
+
     def test_reasoning_extracted_occupation_is_not_discarded(self):
         import copy
         import json
