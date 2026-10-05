@@ -127,11 +127,15 @@ _PAIN_FACTOR_ANSWER_SIGNALS = {
     "Aggravating Factors": re.compile(
         r"\b(?:makes? (?:it|the pain|my pain) worse|worsens?|aggravat(?:e|es|ing)|"
         r"increase(?:s|d)? (?:the |my )?pain|pain (?:increase(?:s|d)?|gets worse)|"
-        r"triggers? (?:the |my )?pain|hurts? (?:more )?when|painful when)\b",
+        r"(?:gets?|becomes?) (?:even )?worse (?:when|with|while)|"
+        r"worse (?:when|with|while)|triggers? (?:the |my )?pain|"
+        r"hurts? (?:more )?(?:when|while)|painful (?:when|while))\b",
         re.I,
     ),
     "Relieving Factors": re.compile(
         r"\b(?:makes? (?:it|the pain|my pain) better|helps? (?:it|the pain|my pain)|"
+        r"makes? it feel better|"
+        r"(?:rest|resting|ice|icing|lying|standing|sleeping)\b.{0,30}\bhelps?|"
         r"reliev(?:e|es|ed|ing)|provides? relief|gives? relief|"
         r"reduces? (?:the |my )?pain|eases? (?:the |my )?pain)\b",
         re.I,
@@ -141,13 +145,18 @@ _PAIN_FACTOR_ANSWER_SIGNALS = {
 _EXPLICIT_AGGRAVATING = re.compile(
     r"\b(?:makes? (?:it|the pain|my pain) (?:even )?worse|worsens?|"
     r"aggravat(?:e|es|ing)|increase(?:s|d)? (?:the |my )?pain|"
-    r"pain (?:increase(?:s|d)?|gets worse)|triggers? (?:the |my )?pain|"
-    r"hurts? (?:more )?when|painful when|starts? (?:to )?(?:pain|hurt)|"
+    r"pain (?:increase(?:s|d)?|gets worse)|"
+    r"(?:gets?|becomes?) (?:even )?worse (?:when|with|while)|"
+    r"worse (?:when|with|while)|triggers? (?:the |my )?pain|"
+    r"hurts? (?:more )?(?:when|while)|painful (?:when|while)|"
+    r"starts? (?:to )?(?:pain|hurt)|"
     r"starts? paining|pains? while|go(?:es)? numb|causes? (?:pain|numbness))\b",
     re.I,
 )
 _EXPLICIT_RELIEVING = re.compile(
     r"\b(?:makes? (?:it|the pain|my pain) better|helps? (?:it|the pain|my pain)|"
+    r"makes? it feel better|"
+    r"(?:rest|resting|ice|icing|lying|standing|sleeping)\b.{0,30}\bhelps?|"
     r"reliev(?:e|es|ed|ing)|provides? relief|gives? (?:any )?relief|"
     r"reduces? (?:the |my )?pain|eases? (?:the |my )?pain|"
     r"nothing .{0,50} (?:helps?|reliev(?:e|es)|gives? (?:any )?relief))\b",
