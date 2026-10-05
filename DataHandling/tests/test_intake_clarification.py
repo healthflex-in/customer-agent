@@ -8,6 +8,7 @@ from src.graph.pure_functions.clarification import (
     build_activity_clearance_response,
     build_intake_clarification,
     build_out_of_flow_response,
+    has_actionable_intake_fact,
 )
 from src.graph.state import get_fresh_interview_state
 
@@ -65,6 +66,20 @@ class IntakeClarificationTests(unittest.TestCase):
                     build_out_of_flow_response(text),
                     OUT_OF_FLOW_RESPONSE,
                 )
+
+    def test_actionable_fact_detection_is_conservative(self):
+        self.assertTrue(has_actionable_intake_fact(
+            "My knee pain is 8 out of 10. Can I take a painkiller?"
+        ))
+        self.assertTrue(has_actionable_intake_fact(
+            "I have shoulder pain; can I return to sport?"
+        ))
+        self.assertFalse(has_actionable_intake_fact(
+            "Can I take a painkiller and play soccer?"
+        ))
+        self.assertFalse(has_actionable_intake_fact(
+            "What could be causing my knee pain?"
+        ))
 
     def test_clinical_answers_and_intake_clarifications_are_not_blocked(self):
         for text in (
@@ -276,6 +291,40 @@ class IntakeClarificationTests(unittest.TestCase):
         self.assertIn("work out once a week", lifestyle.lower())
         self.assertEqual(result["history"][-1]["role"], "agent")
         self.assertEqual(result["history"][-1]["message"], result["response_text"])
+
+    def test_mixed_medication_question_saves_fact_but_keeps_safety_boundary(self):
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="interviewing",
+            current_section="Pain Assessment",
+            visit_context="specific_complaint",
+            user_input="My knee pain is 8 out of 10. Can I take a painkiller?",
+            history=[{
+                "role": "agent",
+                "message": "Where is the pain and how severe is it from 0 to 10?",
+            }],
+        )
+        reasoned_form = state["form"].copy()
+        reasoned_form["Pain Assessment"] = dict(reasoned_form["Pain Assessment"])
+        reasoned_form["Pain Assessment"]["Primary Location of Pain"] = "Knee"
+        reasoned_form["Pain Assessment"]["Severity (1-10)"] = "8/10"
+
+        def reasoning_llm(_prompt):
+            import json
+            return json.dumps(reasoned_form)
+
+        def llm_complete(_prompt):
+            return '{"has_reports": null, "wants_upload": null}'
+
+        with patch("src.graph.nodes.extract.get_stream_writer", return_value=lambda _event: None):
+            result = make_extract_node(llm_complete, reasoning_llm=reasoning_llm)(state)
+
+        self.assertTrue(result["direct_response_handled"])
+        self.assertTrue(result["response_text"].startswith(OUT_OF_FLOW_RESPONSE))
+        self.assertIn("recorded the intake information", result["response_text"])
+        self.assertEqual(
+            result["form"]["Pain Assessment"]["Severity (1-10)"], "8/10"
+        )
 
 
 if __name__ == "__main__":

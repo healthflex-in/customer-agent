@@ -9,6 +9,8 @@ or delay the clinical intake flow.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -19,6 +21,7 @@ from app.observability.privacy import error_type
 
 
 TTL_INDEX_NAME = "ttl_customer_agent_chat_history"
+EVENT_KEY_INDEX_NAME = "unique_customer_agent_chat_event"
 TYPED_INPUT_SOURCE = "typed"
 VOICE_INPUT_SOURCE = "voice_transcription"
 
@@ -109,6 +112,53 @@ def ensure_chat_history_indexes(collection: "Collection") -> None:
         name="chat_history_attempt_created_at",
         sparse=True,
     )
+    collection.create_index(
+        [("eventKey", 1)],
+        name=EVENT_KEY_INDEX_NAME,
+        unique=True,
+        sparse=True,
+    )
+
+
+def resume_event_key(
+    *,
+    user_id: object,
+    form_id: object,
+    attempt_id: object,
+    phase: str,
+    missing_field_ids: list[str],
+    form: dict[str, Any],
+) -> str:
+    """Return a stable audit key for one persisted resume state.
+
+    Reconnecting sockets may need the same state message for rendering, but the
+    transcript should contain it once. The digest contains no raw value text.
+    """
+
+    populated_field_ids = sorted(
+        f"{section}.{field}"
+        for section, fields in form.items()
+        if isinstance(fields, dict)
+        for field, value in fields.items()
+        if value is not None and str(value).strip()
+    )
+    identity = {
+        "userId": str(user_id or ""),
+        "formId": str(form_id or ""),
+        "attemptId": str(attempt_id or "legacy"),
+        "phase": str(phase),
+        "missingFieldIds": sorted(missing_field_ids),
+        "populatedFieldIds": populated_field_ids,
+        "formFingerprint": hashlib.sha256(
+            json.dumps(form, sort_keys=True, default=str, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:24],
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"resume:{identity['attemptId']}:{digest}"
 
 
 def build_chat_message_document(
@@ -131,6 +181,7 @@ def build_chat_message_document(
     transcription_id: object = None,
     audio_capture_id: object = None,
     audio_filename: object = None,
+    event_key: object = None,
     created_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Build a bounded, queryable transcript record with deterministic expiry."""
@@ -177,6 +228,7 @@ def build_chat_message_document(
         "transcriptionId": transcription_id,
         "audioCaptureId": audio_capture_id,
         "audioFilename": audio_filename,
+        "eventKey": event_key,
     }
     for key, value in optional_values.items():
         if value is not None and str(value).strip():
@@ -193,7 +245,16 @@ def record_chat_message(
     if collection is None:
         return False
     try:
-        collection.insert_one(build_chat_message_document(**message))
+        document = build_chat_message_document(**message)
+        event_key = document.get("eventKey")
+        if event_key:
+            result = collection.update_one(
+                {"eventKey": event_key},
+                {"$setOnInsert": document},
+                upsert=True,
+            )
+            return bool(result.upserted_id)
+        collection.insert_one(document)
         return True
     except Exception as exc:
         # Never print the exception payload because it may contain patient text.

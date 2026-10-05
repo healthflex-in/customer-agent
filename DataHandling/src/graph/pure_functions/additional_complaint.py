@@ -5,10 +5,16 @@ import re
 
 _BODY_SITE = re.compile(
     r"\b(?:(?:left|right)\s+)?(?:head|neck|back|shoulder|arm|hand|wrist|elbow|"
-    r"forearm|hip|leg|knee|ankle|foot|feet|chest|abdomen|stomach|jaw)s?\b",
+    r"forearm|hip|leg|knee|ankle|foot|feet|chest|abdomen|stomach|jaw|"
+    r"si[ -]?joint|sacroiliac joint)s?\b",
     re.I,
 )
-_SYMPTOM = re.compile(r"\b(?:pain|stiffness|weakness|swelling|ache|discomfort)\b", re.I)
+_SYMPTOM = re.compile(
+    r"\b(?:pain|stiffness|weakness|swelling|ache|discomfort|headache|"
+    r"numbness|numb|tingling|pins[- ]and[- ]needles|clicking|locking|tightness|"
+    r"instability|soreness|burning|cramp(?:ing)?|sprain|strain|tear)\b",
+    re.I,
+)
 _INSTRUCTION_LANGUAGE = re.compile(
     r"\b(?:please|pls|kindly)\b.*\b(?:add|include|record|write|update|change)\b|"
     r"\b(?:add|include|record|write|update|change)\b.*\b(?:additional|complaint|"
@@ -28,7 +34,7 @@ def concise_additional_complaint(text):
         return f"{' and '.join(sites)} {symptoms[-1]}"
 
     candidate = re.sub(
-        r"^.*?\b(?:also|additionally)\s+(?:have|feel|experience)\s+",
+        r"^.*?\b(?:also|additionally)\s+(?:have|feel|experience|experiencing)\s+",
         "",
         raw,
         flags=re.I,
@@ -40,10 +46,41 @@ def concise_additional_complaint(text):
 
 def validated_additional_complaint(text):
     """Return a safe clinical label or None when instruction text remains."""
-    complaint = " ".join(concise_additional_complaint(text).split()).strip(" .,!\"'")
+    raw = " ".join(str(text or "").split()).strip()
+    needs_condensing = bool(
+        _INSTRUCTION_LANGUAGE.search(raw)
+        or re.search(
+            r"\b(?:i(?:['’]ve| have)?\s+)?(?:also|additionally)\s+"
+            r"(?:have|feel|experience|(?:been\s+)?experiencing)\b",
+            raw,
+            re.I,
+        )
+    )
+    candidate = concise_additional_complaint(raw) if needs_condensing else raw
+    complaint = " ".join(candidate.split()).strip(" .,!\"'")
     if not complaint or len(complaint) > 160 or "?" in complaint:
         return None
     if _INSTRUCTION_LANGUAGE.search(complaint):
+        return None
+    # An LLM may classify a treatment preference as a new complaint merely
+    # because it contains words such as "pain pills". Require an actual symptom
+    # label and reject expectation/request language unless the patient also
+    # explicitly states that they experience a symptom.
+    has_symptom = bool(_SYMPTOM.search(complaint))
+    has_patient_assertion = bool(re.search(
+        r"\b(?:i(?:['’]ve| have)?\s+)?(?:also\s+|additionally\s+)?"
+        r"(?:have|feel|experience|experiencing|suffer(?:ing)? from|developed)\b",
+        raw,
+        re.I,
+    ))
+    preference_language = bool(re.search(
+        r"\b(?:i\s+(?:also\s+)?expect|expectation|looking for|treatment plan|"
+        r"pain pills?|painkillers?|medicine|medication|without surgery|"
+        r"want (?:a|the) plan|would like)\b",
+        raw,
+        re.I,
+    ))
+    if not has_symptom or (preference_language and not has_patient_assertion):
         return None
     return complaint
 
@@ -56,13 +93,13 @@ def is_explicit_symptom_addition(text):
     site = _BODY_SITE.pattern
     return bool(
         re.search(
-            rf"\b(?:i\s+)?(?:also\s+|additionally\s+)?(?:have|feel|experience)\b"
+            rf"\b(?:i\s+)?(?:also\s+|additionally\s+)?(?:have|feel|experience|experiencing)\b"
             rf".{{0,45}}(?:{symptom}).{{0,12}}\b(?:too|as\s*well)\b",
             lowered,
             re.I,
         )
         or re.search(
-            rf"\b(?:i\s+)?(?:also|additionally)\s+(?:have|feel|experience)\b"
+            rf"\b(?:i\s+)?(?:also|additionally)\s+(?:have|feel|experience|experiencing)\b"
             rf".{{0,45}}(?:{symptom})\b",
             lowered,
             re.I,
@@ -78,7 +115,8 @@ def is_explicit_symptom_addition(text):
 def split_update_and_addition(text):
     """Split `change X and I also have Y` without losing either action."""
     match = re.search(
-        r"\b(?:and\s+)?(?:i\s+)?(?:also|additionally)\s+(?:have|feel|experience)\b",
+        r"\b(?:and\s+)?(?:i\s+)?(?:also|additionally)\s+"
+        r"(?:have|feel|experience|experiencing)\b",
         text,
         re.I,
     )
@@ -137,7 +175,19 @@ def is_additional_complaint_cancellation(text):
     normalized = " ".join(str(text).lower().replace("’", "'").split())
     if re.search(
         r"\b(?:there (?:is|are)|i have|i don't have|i dont have|no)\s+"
-        r"(?:(?:no|any)\s+)?additional (?:complaint|concern|pain)s?\b",
+        r"(?:(?:no|any)\s+)?(?:add\w{3,12}|other) "
+        r"(?:compl\w*|concern|pain)s?\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        r"\bthe\w*\s+is\s+(?:no|o)\s+add\w{3,12}\s+compl\w*\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        r"\b(?:no|don'?t have|do not have)\s+(?:any\s+)?other\s+"
+        r"(?:compl\w*|concerns?|pain|issues?)\b",
         normalized,
     ):
         return True
@@ -154,7 +204,8 @@ def is_additional_complaint_cancellation(text):
             r"(?:\s+additional)?(?:\s+(?:compl\w*|compa\w*|concern|pain))?"
             r"(?:\s+by mistake)?(?:\s+i told (?:you|u))?"
             r"|no need(?:,? enough)?(?: bye)?|"
-            r"remove (?:this|that)(?: additional)? (?:complaint|concern)",
+            r"remove (?:this|that)(?: additional)? (?:complaint|concern)|"
+            r"(?:that'?s|that is) all|enough(?: for now)?(?: bye)?",
             normalized.strip(" .,!"),
         )
     )

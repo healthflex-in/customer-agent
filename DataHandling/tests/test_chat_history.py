@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 from app.audit.chat_history import (
+    EVENT_KEY_INDEX_NAME,
     TTL_INDEX_NAME,
     VOICE_INPUT_SOURCE,
     build_pending_voice_input,
@@ -68,7 +69,13 @@ class ChatHistoryTests(unittest.TestCase):
             [("sessionId", 1), ("createdAt", 1)],
             name="chat_history_session_created_at",
         )
-        self.assertEqual(collection.create_index.call_count, 4)
+        collection.create_index.assert_any_call(
+            [("eventKey", 1)],
+            name=EVENT_KEY_INDEX_NAME,
+            unique=True,
+            sparse=True,
+        )
+        self.assertEqual(collection.create_index.call_count, 5)
 
     def test_write_failure_is_non_fatal_and_does_not_log_content(self):
         collection = Mock()
@@ -85,6 +92,37 @@ class ChatHistoryTests(unittest.TestCase):
         )
 
         self.assertFalse(result)
+
+    def test_resume_event_is_inserted_only_once(self):
+        collection = Mock()
+        collection.update_one.return_value.upserted_id = "inserted"
+        first = record_chat_message(
+            collection,
+            user_id="patient-1",
+            session_id="session-1",
+            role="agent",
+            content="Welcome back",
+            message_type="resume_state",
+            event_key="resume:attempt:state",
+            retention_days=10,
+            created_at=self.created_at,
+        )
+        collection.update_one.return_value.upserted_id = None
+        second = record_chat_message(
+            collection,
+            user_id="patient-1",
+            session_id="session-2",
+            role="agent",
+            content="Welcome back",
+            message_type="resume_state",
+            event_key="resume:attempt:state",
+            retention_days=10,
+            created_at=self.created_at,
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(collection.update_one.call_count, 2)
 
     def test_invalid_or_internal_prompt_content_is_not_stored(self):
         collection = Mock()

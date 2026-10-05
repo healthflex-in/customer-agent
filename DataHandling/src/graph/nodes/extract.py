@@ -209,6 +209,7 @@ from src.graph.pure_functions.clarification import (
     build_activity_clearance_response,
     build_intake_clarification,
     build_out_of_flow_response,
+    has_actionable_intake_fact,
 )
 from src.graph.pure_functions.question_repetition import asks_about_answered_field
 from src.graph.pure_functions.lifestyle import merge_lifestyle_answer
@@ -331,20 +332,26 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         out_of_flow_response = build_out_of_flow_response(
             user_input, last_agent_for_boundary
         )
+        mixed_boundary_response = None
         if out_of_flow_response:
-            out_of_flow_response = boundary_response_with_pending_question(
-                out_of_flow_response, last_agent_for_boundary
-            )
-            return {
-                "history": history + [
-                    {"role": "user", "message": user_input, "clinical_extraction": False},
-                    {"role": "agent", "message": out_of_flow_response, "clinical_extraction": False},
-                ],
-                "response_text": out_of_flow_response,
-                "reports_intent": {},
-                "pending_question": None,
-                "direct_response_handled": True,
-            }
+            if has_actionable_intake_fact(user_input):
+                # Preserve explicit patient facts in a mixed message, but keep
+                # the medical-advice boundary as the response for this turn.
+                mixed_boundary_response = out_of_flow_response
+            else:
+                out_of_flow_response = boundary_response_with_pending_question(
+                    out_of_flow_response, last_agent_for_boundary
+                )
+                return {
+                    "history": history + [
+                        {"role": "user", "message": user_input, "clinical_extraction": False},
+                        {"role": "agent", "message": out_of_flow_response, "clinical_extraction": False},
+                    ],
+                    "response_text": out_of_flow_response,
+                    "reports_intent": {},
+                    "pending_question": None,
+                    "direct_response_handled": True,
+                }
 
         # ── Brand / clinic FAQ detection (RAG) ──────────────────────────────
         # If the user asks about Stance Health (the brand, clinic, services, pricing,
@@ -382,7 +389,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 }
 
         activity_response = build_activity_clearance_response(user_input)
-        if activity_response:
+        if activity_response and not mixed_boundary_response:
             # This is a question, not an answer to the compound intake prompt.
             # Answer before classification/extraction so it cannot overwrite
             # form data or immediately repeat the same unanswered question.
@@ -572,6 +579,15 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             user_input=user_input,
             last_question=last_agent_q,
             current_section=current_section,
+        )
+        from src.graph.pure_functions.clinical_value_guard import (
+            apply_explicit_pain_factor_answers,
+        )
+        updated_form = apply_explicit_pain_factor_answers(
+            updated_form,
+            active_section=current_section,
+            user_input=user_input,
+            history=history,
         )
         if not _is_prom:
             from src.graph.pure_functions.complaint_severity import reconcile_severities
@@ -842,6 +858,54 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
             "reports_intent": reports_intent,
             "pending_question": None if clarification_response else pending_q,
         }
+
+        if mixed_boundary_response:
+            # Do not let a safety refusal discard concrete intake data. Build
+            # the next step from the updated form, then combine it with the
+            # fixed boundary response. No diagnosis/advice is generated.
+            from src.graph.nodes.generate import required_response_before_summary
+            next_required = required_response_before_summary(
+                {
+                    **state,
+                    "form": updated_form,
+                    "form_sections": list(updated_form),
+                },
+                new_history,
+            )
+            if next_required is not None:
+                follow_up = next_required["response_text"]
+                next_patch = {
+                    key: value for key, value in next_required.items()
+                    if key not in {"response_text", "history"}
+                }
+            else:
+                from src.graph.pure_functions.summary import _fallback_summary
+                follow_up = _fallback_summary(updated_form)
+                next_patch = {
+                    "phase": "summary",
+                    "missing_fields": [],
+                    "question_field_ids": [],
+                }
+            combined_response = (
+                mixed_boundary_response
+                + "\n\nI've recorded the intake information you shared.\n\n"
+                + follow_up
+            )
+            result.update(
+                {
+                    **next_patch,
+                    "history": new_history + [
+                        {
+                            "role": "agent",
+                            "message": combined_response,
+                            "clinical_extraction": False,
+                        }
+                    ],
+                    "response_text": combined_response,
+                    "pending_question": None,
+                    "direct_response_handled": True,
+                }
+            )
 
         if (
             result["pending_question"]

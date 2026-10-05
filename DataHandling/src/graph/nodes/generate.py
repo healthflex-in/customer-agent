@@ -195,6 +195,9 @@ def required_response_before_summary(state: InterviewState, history: list) -> di
             "phase": "interviewing",
             "current_section": missing[0][0],
             "missing_fields": [field for _, field in missing],
+            "question_field_ids": [
+                f"{section}.{field}" for section, field in missing[:4]
+            ],
         }
 
     referral = str(state["form"].get("Referral", {}).get("Source", "")).strip()
@@ -210,6 +213,7 @@ def required_response_before_summary(state: InterviewState, history: list) -> di
             "current_section": "Referral",
             "referral_asked": True,
             "missing_fields": ["Source"],
+            "question_field_ids": ["Referral.Source"],
         }
     return None
 
@@ -289,6 +293,9 @@ def make_generate_question_node(llm_complete, system_prompt):
             history.append({"role": "agent", "message": response})
             writer({"stage": "Formulating next question", "detail": "Ready", "status": "done"})
             patch = {"response_text": response, "history": history}
+            patch["question_field_ids"] = [
+                f"{section}.{field}" for section, field in flat_missing[:4]
+            ]
             if is_referral_question(response):
                 patch["referral_asked"] = True
             return patch
@@ -309,6 +316,7 @@ def make_generate_question_node(llm_complete, system_prompt):
                 "response_text": response,
                 "history": history,
                 "referral_asked": True,
+                "question_field_ids": ["Referral.Source"],
             }
         elif referral_source_filled and not referral_asked:
             # generate_question has a terminal graph edge. A flags-only return

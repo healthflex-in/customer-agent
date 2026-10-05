@@ -184,6 +184,9 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                 "form_sections": list(updated_form),
                 "current_section": added_section,
                 "missing_fields": [field for _, field in missing],
+                "question_field_ids": [
+                    f"{section}.{field}" for section, field in missing[:4]
+                ],
                 "phase": "interviewing",
                 "visit_context": "specific_complaint",
                 "response_text": response_text,

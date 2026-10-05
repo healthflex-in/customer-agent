@@ -101,6 +101,39 @@ _INTAKE_ANSWER_SIGNALS = re.compile(
     re.I,
 )
 
+_ACTIONABLE_INTAKE_FACT = re.compile(
+    r"(?:"
+    # Explicit symptom/location statements and corrections.
+    r"\b(?:i|my)\s+(?:also\s+)?(?:have|has|had|feel|felt|experience|experienced|"
+    r"don'?t have|do not have)\b.{0,45}\b(?:pain|ache|injur|numb|tingl|stiff|swollen)|"
+    r"\b(?:pain|severity|rating|score)\b.{0,18}\b(?:is|was|to|from)\s*\d{1,2}\b|"
+    r"\b\d{1,2}\s*(?:/\s*10|out of 10)\b|"
+    # Onset, triggers and relief supplied as facts rather than requests.
+    r"\b(?:it|this|the pain|my pain)\s+(?:started|began|gets|got|becomes|became|"
+    r"feels|felt|improves|improved|worsens|worsened)\b|"
+    r"\b(?:walking|sitting|standing|moving|bending|exercise|rest|massage|ice|heat)"
+    r"\b.{0,35}\b(?:makes|made|causes|caused|helps|helped|relieves|relieved)\b|"
+    # History and lifestyle facts that must remain collectable in a mixed turn.
+    r"\bi\s+(?:work|exercise|smoke|drink|saw|visited|consulted|had surgery|"
+    r"have an?\s+(?:mri|x-?ray|ct scan|report))\b|"
+    r"\bi\s+(?:do not|don'?t|never)\s+(?:smoke|drink|exercise)\b|"
+    r"\bmy\s+(?:job|occupation|goal|expectation)\s+(?:is|was)\b"
+    r")",
+    re.I,
+)
+
+
+def has_actionable_intake_fact(user_input: str | None) -> bool:
+    """Return True when an advice question also contains a concrete patient fact.
+
+    This is intentionally conservative: generic symptom words inside a question
+    are not enough. A match requires an assertion, numeric severity, or another
+    explicit intake answer so pure medical-advice questions remain blocked.
+    """
+
+    text = " ".join(str(user_input or "").split())
+    return bool(text and _ACTIONABLE_INTAKE_FACT.search(text))
+
 
 def _looks_like_detailed_intake_answer(text: str) -> bool:
     """Recognize pasted Q&A and detailed clinical replies before boundary checks."""
