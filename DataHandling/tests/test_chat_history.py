@@ -4,9 +4,12 @@ from unittest.mock import Mock
 
 from app.audit.chat_history import (
     TTL_INDEX_NAME,
+    VOICE_INPUT_SOURCE,
+    build_pending_voice_input,
     build_chat_message_document,
     ensure_chat_history_indexes,
     record_chat_message,
+    resolve_patient_input_provenance,
 )
 
 
@@ -29,6 +32,10 @@ class ChatHistoryTests(unittest.TestCase):
             section="Pain Assessment",
             request_id="request-1",
             question_id="severity",
+            input_source="voice_transcription",
+            transcription_id="TRN-test",
+            audio_capture_id="capture-test",
+            audio_filename="capture-test.webm",
             retention_days=10,
             created_at=self.created_at,
         )
@@ -38,6 +45,10 @@ class ChatHistoryTests(unittest.TestCase):
         self.assertEqual(document["attemptId"], "attempt-1")
         self.assertEqual(document["role"], "patient")
         self.assertEqual(document["content"], "My knee pain is five out of ten.")
+        self.assertEqual(document["inputSource"], "voice_transcription")
+        self.assertEqual(document["transcriptionId"], "TRN-test")
+        self.assertEqual(document["audioCaptureId"], "capture-test")
+        self.assertEqual(document["audioFilename"], "capture-test.webm")
         self.assertEqual(document["createdAt"], self.created_at)
         self.assertEqual(
             document["expiresAt"], self.created_at + timedelta(days=10)
@@ -90,6 +101,77 @@ class ChatHistoryTests(unittest.TestCase):
 
         self.assertFalse(result)
         collection.insert_one.assert_not_called()
+
+    def test_unchanged_transcript_is_recognized_for_legacy_clients(self):
+        pending = build_pending_voice_input(
+            transcript="My knee pain is five out of ten.",
+            transcription_id="TRN-test",
+            audio_capture_id="capture-test",
+            audio_filename="/tmp/debug/capture-test.webm",
+        )
+
+        result = resolve_patient_input_provenance(
+            content="  my knee pain is five out of ten. ",
+            payload={},
+            pending_voice_input=pending,
+        )
+
+        self.assertEqual(result["inputSource"], VOICE_INPUT_SOURCE)
+        self.assertEqual(result["transcriptionId"], "TRN-test")
+        self.assertEqual(result["audioCaptureId"], "capture-test")
+        self.assertEqual(result["audioFilename"], "capture-test.webm")
+
+    def test_transcription_id_preserves_voice_source_after_patient_edit(self):
+        pending = build_pending_voice_input(
+            transcript="My knee pain is five.",
+            transcription_id="TRN-test",
+            audio_capture_id="capture-test",
+            audio_filename="capture-test.webm",
+        )
+
+        result = resolve_patient_input_provenance(
+            content="My right knee pain is six.",
+            payload={
+                "transcriptionId": "TRN-test",
+                # Client-provided file metadata must never override server state.
+                "audioFilename": "spoofed.webm",
+            },
+            pending_voice_input=pending,
+        )
+
+        self.assertEqual(result["inputSource"], VOICE_INPUT_SOURCE)
+        self.assertEqual(result["audioFilename"], "capture-test.webm")
+
+    def test_legacy_client_keeps_voice_source_when_transcript_is_edited(self):
+        pending = build_pending_voice_input(
+            transcript="Discarded transcript",
+            transcription_id="TRN-test",
+        )
+
+        result = resolve_patient_input_provenance(
+            content="Patient edited the transcript before sending",
+            payload={},
+            pending_voice_input=pending,
+        )
+
+        self.assertEqual(result["inputSource"], VOICE_INPUT_SOURCE)
+        self.assertEqual(result["transcriptionId"], "TRN-test")
+
+    def test_stale_transcription_id_cannot_claim_current_audio_file(self):
+        pending = build_pending_voice_input(
+            transcript="Current transcript",
+            transcription_id="TRN-current",
+            audio_capture_id="capture-current",
+            audio_filename="capture-current.webm",
+        )
+
+        result = resolve_patient_input_provenance(
+            content="Stale transcript",
+            payload={"transcriptionId": "TRN-old"},
+            pending_voice_input=pending,
+        )
+
+        self.assertEqual(result, {"inputSource": "typed"})
 
 
 if __name__ == "__main__":

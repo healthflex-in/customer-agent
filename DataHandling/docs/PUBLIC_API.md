@@ -79,7 +79,7 @@ Control messages are UTF-8 JSON. Recorded audio chunks are binary frames.
 | `start_interview` | `userId` required; `formId`/`attemptId` optional | Validates the user and resumes a `draft`/`in_progress` attempt. A completed attempt returns `form_completed` without invoking AI. |
 | `start_new_form` | — | Rejected on the public patient socket with `CLINICIAN_ASSIGNMENT_REQUIRED`. New attempts must be created by the consultant/dashboard workflow first. |
 | `load_form` | `formId` required; `attemptId` optional | Loads an active exact/latest attempt. A completed attempt is returned as read-only and is never hydrated into the interview agent. |
-| `text_input` | `text`; optional `requestId`, `questionId`, `inputMode` | Processes one typed/transcribed answer. `inputMode: "structured_prom"` is accepted only when its validated metadata matches the active PROM question(s). |
+| `text_input` | `text`; optional `requestId`, `questionId`, `inputMode`, `transcriptionId` | Processes one typed/transcribed answer. After a `transcription` response, clients should return its `transcriptionId` so an edited transcript remains linked to its audio capture. `inputMode: "structured_prom"` is accepted only when its validated metadata matches the active PROM question(s). |
 | `audio_start` | Timestamp is accepted but not trusted | Opens a server-timed, size-limited recording window. |
 | binary frame | Raw browser audio bytes | Appended only while recording; cumulative bytes and elapsed time are bounded. |
 | `audio_end` | Optional declared `duration` | Transcribes accumulated audio. The server sends the transcript but does not submit it as an interview answer automatically. |
@@ -98,7 +98,7 @@ returns an error. This window is bounded and process-local.
 | `text_message` | `text`, `session_id`, `interview_state`, `request_attachment`, optional `question_meta` | Primary assistant/welcome/question/summary response. |
 | `token` | `content` | Incremental display token where the graph path can provide it. Some paths synthesize tokens after a complete response, so this does not always indicate provider streaming. |
 | `thought_update` | `thoughts[]` containing `stage`, `detail`, `status` | UI progress labels for graph processing stages; not model chain-of-thought. |
-| `transcription` | `text`, `timestamp` | Gemini transcription or Google Speech fallback result after `audio_end`. |
+| `transcription` | `text`, `timestamp`, `inputSource: "voice_transcription"`, `transcriptionId`; optional `audioCaptureId`, `audioFilename` | Gemini transcription or Google Speech fallback result after `audio_end`. Capture fields are present only when QA audio capture is enabled. Return `transcriptionId` with the subsequent `text_input`. |
 | `form_loaded` | `text`, `session_id`, `interview_state`, `form_data` | Confirmation/state sent by `load_form`; normally followed by `text_message`. |
 | `form_completed` | `text`, `formId`, `attemptId`, `status`, `completedAt`, `interview_state.locked` | Deterministic read-only response for a completed attempt. The client disables all answer/audio controls; no AI call is made. |
 | `submission_ack` | `status: "duplicate"`, `requestId` | A retry was recognized and not processed again. |

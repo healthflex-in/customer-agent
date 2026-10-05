@@ -80,6 +80,33 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _boolean_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+# Disabled by default. QA may retain original audio + paired STT output inside
+# the Docker container to investigate transcription problems.
+DEBUG_AUDIO_CAPTURE: bool = _boolean_env("DEBUG_AUDIO_CAPTURE", False)
+DEBUG_AUDIO_DIR: str = os.getenv(
+    "DEBUG_AUDIO_DIR", "/tmp/customer-agent-audio-debug"
+)
+DEBUG_AUDIO_RETENTION_HOURS: int = _positive_int_env(
+    "DEBUG_AUDIO_RETENTION_HOURS", 24
+)
+DEBUG_AUDIO_MAX_TOTAL_MB: int = _positive_int_env(
+    "DEBUG_AUDIO_MAX_TOTAL_MB", 250
+)
+DEBUG_AUDIO_MAX_TOTAL_BYTES: int = DEBUG_AUDIO_MAX_TOTAL_MB * 1024 * 1024
+
+
 CHAT_HISTORY_RETENTION_DAYS: int = _positive_int_env(
     "CHAT_HISTORY_RETENTION_DAYS", 10
 )
