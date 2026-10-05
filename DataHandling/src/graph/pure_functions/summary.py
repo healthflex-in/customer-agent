@@ -27,73 +27,21 @@ def generate_interview_summary(
     history: list,
     llm_complete: Callable[[str], str],
 ) -> str:
+    """Render the one canonical summary format used for initial and replay views.
+
+    Summary rendering must be idempotent: identical form data always produces
+    identical text. Using a narrative model here caused format drift and could
+    reintroduce stale facts after corrections.
     """
-    Generate a patient-friendly narrative summary of the filled form.
-    Extracted from HealthAgent.generate_summary().
-    """
-    form_json = json.dumps(form, indent=2, ensure_ascii=False)
-    prompt = f"""You are an empathetic medical assistant. Convert the structured medical intake
-form below into a short, patient-friendly summary.
-
-FORM DATA (JSON):
-{form_json}
-
-Write the summary as if you are explaining it to the patient in simple, everyday language:
-1. Start with 1-2 short paragraphs narrating the overall story (main problem, duration, onset,
-   pain details, past consultations, health history, goals).
-2. Add a Key points section with 3-7 bullet points.
-3. Avoid technical language. Prefer plain phrases.
-4. NEVER leave raw field names in brackets.
-5. Do NOT use markdown bold (**) or backticks.
-6. Use "- " for bullet points.
-7. End with exactly: "Is this information correct, or would you like to make any changes?"
-8. NEVER say "The form is complete" or any variation.
-9. Do not add, assume, or infer any detail that is not explicitly present in FORM DATA.
-
-CRITICAL — handle empty/negative field values honestly:
-- Fields with values like "None", "No specific goals", "Not mentioned", "Not applicable", "No past surgeries", "No goals mentioned", "nothing" → summarize as ABSENCE, not presence.
-  e.g. "You haven't mentioned any specific treatment goals" NOT "you have clear goals"
-  e.g. "No past surgeries or health conditions were mentioned" NOT "your health history is clear"
-- NEVER infer positive attributes from empty or negative field values.
-- Only state something as a fact if the form field contains a real positive value.
-
-Return ONLY the summary text."""
-
-    try:
-        _t0 = _time.perf_counter()
-        summary = llm_complete(prompt).strip().replace("**", "")
-        print(f"[timing] generate_summary_llm={(_time.perf_counter() - _t0) * 1000:.0f}ms")
-        forbidden = ["the form is complete", "no further questions are needed",
-                     "all fields are filled", "the interview is finished"]
-        if any(p in summary.lower() for p in forbidden):
-            summary = _fallback_summary(form)
-        # Do not let a narrative model silently omit newly added complaints.
-        # Preserve the patient's own wording as explicit additional key points.
-        additions = [
-            str(fields.get("Primary Complaint", "")).strip()
-            for section, fields in form.items()
-            if section.startswith("Additional Complaint ") and isinstance(fields, dict)
-            and fields.get("Primary Complaint")
-        ]
-        if additions and summary:
-            approval = "Is this information correct, or would you like to make any changes?"
-            summary = summary.replace(approval, "").rstrip()
-            summary += "\n\nAdditional key points you shared:\n" + "\n".join(
-                f'- You also told us: "{text}"' for text in additions
-            )
-            summary += "\n\n" + approval
-        reports = str(form.get("History & Diagnostics", {}).get("Reports", "")).strip()
-        if reports and re.search(r"\b(?:uploaded|attached)\b", reports.lower()) and summary:
-            approval = "Is this information correct, or would you like to make any changes?"
-            summary = summary.replace(approval, "").rstrip()
-            summary += "\n\nReport information:\n- " + reports + "\n\n" + approval
-        return summary or _fallback_summary(form)
-    except Exception as e:
-        print(f"[generate_interview_summary] Failed: {error_type(e)}")
-        return _fallback_summary(form)
+    return _fallback_summary(form)
 
 
 def _fallback_summary(form: dict) -> str:
+    from src.graph.pure_functions.additional_complaint import (
+        normalize_additional_complaints,
+    )
+
+    form = normalize_additional_complaints(form)
     parts = ["Here's a summary of the information you've provided:\n"]
     for section, fields in form.items():
         if isinstance(fields, dict):
@@ -118,6 +66,21 @@ def classify_summary_response(
     """
     normalized = re.sub(r"[^a-z0-9\s]", " ", user_input.lower())
     normalized = " ".join(normalized.split())
+
+    # Reviewing the assistant's own summary is an intake operation, not a
+    # request for medical advice and not a request to edit a field.
+    if re.search(
+        r"\b(?:show|share|send|repeat|see|view|read)\b.{0,45}"
+        r"\b(?:summary|information|details)\b"
+        r"|\b(?:summary|information|details)\b.{0,45}\b(?:again|updated)\b",
+        normalized,
+    ):
+        return {
+            "intent": "show_summary",
+            "correction_text": None,
+            "has_reports": None,
+            "wants_upload": None,
+        }
 
     # New documents and acknowledgements are different actions. Check additions
     # first: a patient may have uploaded one file AND have another to share.
@@ -162,9 +125,25 @@ def classify_summary_response(
             "wants_upload": None,
         }
 
+    # Explicit habit corrections are schema-aware updates. Alcohol/smoking are
+    # components inside Current Lifestyle, not new complaints or questions.
+    if re.search(r"\b(?:update|change|correct|actually|but)\b", normalized) and re.search(
+        r"\b(?:smoke|smoking|drink|drinks|drinking|alcohol)\b", normalized
+    ):
+        return {
+            "intent": "request_change",
+            "correction_text": user_input.strip(),
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
     from src.graph.pure_functions.additional_complaint import is_explicit_symptom_addition
     if is_explicit_symptom_addition(user_input):
+        from src.graph.pure_functions.additional_complaint import (
+            concise_additional_complaint,
+        )
         return {"intent": "new_complaint", "correction_text": None,
+                "addition_text": concise_additional_complaint(user_input),
                 "has_reports": None, "wants_upload": None}
 
     # A direct channel answer at summary time commonly follows a referral
@@ -212,6 +191,8 @@ Classify their intent. Choose EXACTLY ONE intent from below:
 - "new_complaint": patient reveals an ADDITIONAL specific health issue, pain, or symptom that was NOT in the summary
   Use when: patient says "i have neck pain", "actually my knee hurts", "i forgot to mention my back", "i have a complaint", "wait i have pain" etc.
   This means they want to ADD new medical information, not correct existing data.
+  Set addition_text to ONLY the concise clinical complaint (for example
+  "tingling in the left fingers"), never the patient's instruction words.
 - "request_change": patient wants to CORRECT or UPDATE something already stated in the summary
   CRITICAL: "no" in response to "Is this correct?" → request_change (no, it is NOT correct)
   Also: "not right", "wrong", "incorrect", "change X to Y", "actually it was X"
@@ -230,6 +211,7 @@ Respond ONLY with compact JSON:
 {{
   "intent": "confirm" | "new_complaint" | "request_change" | "has_reports" | "no_reports" | "question",
   "correction_text": string | null,
+  "addition_text": string | null,
   "has_reports": true | false | null,
   "wants_upload": true | false | null
 }}"""
@@ -249,6 +231,7 @@ Respond ONLY with compact JSON:
         return {
             "intent": data["intent"],
             "correction_text": data.get("correction_text"),
+            "addition_text": data.get("addition_text"),
             "has_reports": data.get("has_reports"),
             "wants_upload": data.get("wants_upload"),
         }

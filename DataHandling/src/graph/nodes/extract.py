@@ -205,6 +205,7 @@ def _classify_visit_context(user_input: str, llm_complete) -> str:
 from src.graph.pure_functions.form_extraction import extract_form_data_from_text
 from src.graph.pure_functions.form_validation import validate_section
 from src.graph.pure_functions.clarification import (
+    boundary_response_with_pending_question,
     build_activity_clearance_response,
     build_intake_clarification,
     build_out_of_flow_response,
@@ -239,6 +240,86 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         current_section: str = state.get("current_section", "")
         awaiting_upload: bool = state.get("awaiting_report_upload", False)
 
+        # An accidentally-created additional complaint must have a deterministic
+        # exit. Without this branch, "skip this" and "there is no additional
+        # complaint" are treated as missing clinical answers and the same batch
+        # is repeated forever.
+        if current_section.startswith("Additional Complaint "):
+            from src.graph.pure_functions.additional_complaint import (
+                additional_complaint_removal_target,
+                additional_complaint_replacement,
+                is_additional_complaint_cancellation,
+            )
+            removal_target = additional_complaint_removal_target(
+                user_input, form, current_section
+            )
+            if removal_target or is_additional_complaint_cancellation(user_input):
+                import copy as _copy
+                updated_form = _copy.deepcopy(form)
+                section_to_remove = removal_target or current_section
+                updated_form.pop(section_to_remove, None)
+                updated_sections = [
+                    section for section in state.get("form_sections", list(updated_form))
+                    if section != section_to_remove
+                ]
+                base_history = history + [{"role": "user", "message": user_input}]
+                from src.graph.nodes.generate import required_response_before_summary
+                next_required = required_response_before_summary(
+                    {
+                        **state,
+                        "form": updated_form,
+                        "form_sections": updated_sections,
+                    },
+                    base_history,
+                )
+                if next_required is not None:
+                    response = (
+                        "I've removed that additional complaint. Let's continue with "
+                        "the remaining intake.\n\n" + next_required["response_text"]
+                    )
+                    next_patch = {
+                        key: value for key, value in next_required.items()
+                        if key not in {"response_text", "history"}
+                    }
+                else:
+                    from src.graph.pure_functions.summary import _fallback_summary
+                    response = (
+                        "I've removed that additional complaint. Here is the updated "
+                        "information:\n\n" + _fallback_summary(updated_form)
+                    )
+                    next_patch = {
+                        "phase": "summary",
+                        "current_section": (
+                            updated_sections[-1] if updated_sections else "Present Complaint"
+                        ),
+                        "missing_fields": [],
+                    }
+                return {
+                    "form": updated_form,
+                    "form_sections": updated_sections,
+                    **next_patch,
+                    "history": base_history + [
+                        {"role": "agent", "message": response},
+                    ],
+                    "response_text": response,
+                    "reports_intent": {},
+                    "pending_question": None,
+                    "direct_response_handled": True,
+                }
+
+            replacement = additional_complaint_replacement(user_input)
+            if replacement:
+                import copy as _copy
+                form = _copy.deepcopy(form)
+                form[current_section]["Primary Complaint"] = replacement
+                from src.graph.pure_functions.complaint_severity import (
+                    explicit_severity_updates,
+                )
+                for (section, field), value in explicit_severity_updates(
+                    form, user_input, current_section
+                ).items():
+                    form[section][field] = value
+
         last_agent_for_boundary = next(
             (
                 entry.get("message", "")
@@ -251,10 +332,13 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             user_input, last_agent_for_boundary
         )
         if out_of_flow_response:
+            out_of_flow_response = boundary_response_with_pending_question(
+                out_of_flow_response, last_agent_for_boundary
+            )
             return {
                 "history": history + [
-                    {"role": "user", "message": user_input},
-                    {"role": "agent", "message": out_of_flow_response},
+                    {"role": "user", "message": user_input, "clinical_extraction": False},
+                    {"role": "agent", "message": out_of_flow_response, "clinical_extraction": False},
                 ],
                 "response_text": out_of_flow_response,
                 "reports_intent": {},
@@ -286,8 +370,8 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             brand_answer = _answer_brand_question(user_input, llm_complete)
             if brand_answer:
                 new_history = history + [
-                    {"role": "user", "message": user_input},
-                    {"role": "agent", "message": brand_answer},
+                    {"role": "user", "message": user_input, "clinical_extraction": False},
+                    {"role": "agent", "message": brand_answer, "clinical_extraction": False},
                 ]
                 return {
                     "history": new_history,
@@ -304,8 +388,8 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             # form data or immediately repeat the same unanswered question.
             return {
                 "history": history + [
-                    {"role": "user", "message": user_input},
-                    {"role": "agent", "message": activity_response},
+                    {"role": "user", "message": user_input, "clinical_extraction": False},
+                    {"role": "agent", "message": activity_response, "clinical_extraction": False},
                 ],
                 "response_text": activity_response,
                 "reports_intent": {},
@@ -477,17 +561,40 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
 
         # Unpack the tagged extraction result and log it in the main thread
         _extract_method, updated_form = _extract_result if isinstance(_extract_result, tuple) else ("failed", form)
+        from src.graph.pure_functions.clinical_value_guard import (
+            guard_new_pain_factor_evidence,
+            sanitize_extracted_form,
+        )
+        updated_form = sanitize_extracted_form(form, updated_form)
+        updated_form = guard_new_pain_factor_evidence(
+            form,
+            updated_form,
+            user_input=user_input,
+            last_question=last_agent_q,
+            current_section=current_section,
+        )
         if not _is_prom:
             from src.graph.pure_functions.complaint_severity import reconcile_severities
             updated_form = reconcile_severities(
                 form, updated_form, user_input, current_section, last_agent_q
             )
 
-        updated_lifestyle = merge_lifestyle_answer(
-            updated_form.get("History & Diagnostics", {}).get("Current Lifestyle", ""),
-            user_input,
+        previous_lifestyle = form.get("History & Diagnostics", {}).get(
+            "Current Lifestyle", ""
         )
-        if updated_lifestyle:
+        # Lifestyle is persisted only through the deterministic, question-aware
+        # merger.  This prevents a reasoning-model cross-field guess (for
+        # example a pain trigger written as exercise) from replacing trusted
+        # lifestyle data.  The merger also handles bare occupation answers such
+        # as "accountant", so valid answers are not lost or asked twice.
+        updated_lifestyle = merge_lifestyle_answer(
+            previous_lifestyle,
+            user_input,
+            last_agent_q,
+        )
+        if updated_lifestyle or updated_form.get("History & Diagnostics", {}).get(
+            "Current Lifestyle"
+        ):
             updated_form = dict(updated_form)
             updated_form["History & Diagnostics"] = dict(
                 updated_form.get("History & Diagnostics", {})
@@ -610,10 +717,6 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                 (["surgery", "surgeries", "fracture", "operation", "past surgeries"],
                  "History & Diagnostics", "Systemic Illness and Surgical History",
                  "No past surgeries or fractures"),
-                (["lifestyle", "exercise", "smoking", "smoke", "drink", "alcohol",
-                  "job type", "physically active", "smoke or drink"],
-                 "History & Diagnostics", "Current Lifestyle",
-                 "No specific lifestyle details mentioned"),
                 (["report", "mri", "x-ray", "ct scan", "scan", "imaging", "diagnostic",
                   "blood report", "x ray"],
                  "History & Diagnostics", "Reports",
@@ -717,6 +820,16 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                     result_extra = {"referral_asked": False}
             else:
                 result_extra = {"referral_asked": True}
+
+        # Run the guard again because fallback gap-fill also uses an LLM.
+        updated_form = sanitize_extracted_form(form, updated_form)
+        updated_form = guard_new_pain_factor_evidence(
+            form,
+            updated_form,
+            user_input=user_input,
+            last_question=last_agent_q,
+            current_section=current_section,
+        )
 
         new_history = history + [{"role": "user", "message": user_input}]
 

@@ -102,6 +102,37 @@ class RequiredIntakeCoverageTests(unittest.TestCase):
             [],
         )
 
+    def test_partial_lifestyle_answer_cannot_complete_compound_requirement(self):
+        form = self.definition.empty_form()
+        form["History & Diagnostics"]["Systemic Illness and Surgical History"] = (
+            "No known conditions or surgeries"
+        )
+        form["History & Diagnostics"]["Reports"] = "No reports"
+        form["History & Diagnostics"]["Current Lifestyle"] = (
+            "Work: software developer; Activity/exercise: gym three times per week; "
+            "Smoking: does not smoke"
+        )
+
+        missing = validate_section(form, "History & Diagnostics")
+
+        self.assertEqual(missing, ["Current Lifestyle — Alcohol"])
+        question = question_for_missing_fields(
+            [("History & Diagnostics", missing[0])],
+            self.definition.field_labels,
+        )
+        self.assertEqual(question, "Do you drink alcohol?")
+
+    def test_all_lifestyle_subtopics_are_required_and_can_complete(self):
+        form = self.definition.empty_form()
+        form["History & Diagnostics"]["Systemic Illness and Surgical History"] = "None"
+        form["History & Diagnostics"]["Reports"] = "None"
+        form["History & Diagnostics"]["Current Lifestyle"] = (
+            "Work: software developer; Activity/exercise: gym three times per week; "
+            "Smoking: does not smoke; Alcohol: rarely drinks alcohol"
+        )
+
+        self.assertEqual(validate_section(form, "History & Diagnostics"), [])
+
     def test_summary_and_confirmation_have_the_same_required_field_gate(self):
         backend_root = Path(__file__).resolve().parents[1]
         generate_source = (backend_root / "src" / "graph" / "nodes" / "generate.py").read_text(

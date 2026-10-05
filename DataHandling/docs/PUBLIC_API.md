@@ -75,6 +75,7 @@ Control messages are UTF-8 JSON. Recorded audio chunks are binary frames.
 
 | Type | Fields | Behavior |
 |---|---|---|
+| `ping` | — | Application heartbeat for browser clients. The server replies with `pong` without changing interview state. |
 | `start_interview` | `userId` required; `formId`/`attemptId` optional | Validates the user and resumes a `draft`/`in_progress` attempt. A completed attempt returns `form_completed` without invoking AI. |
 | `start_new_form` | — | Rejected on the public patient socket with `CLINICIAN_ASSIGNMENT_REQUIRED`. New attempts must be created by the consultant/dashboard workflow first. |
 | `load_form` | `formId` required; `attemptId` optional | Loads an active exact/latest attempt. A completed attempt is returned as read-only and is never hydrated into the interview agent. |
@@ -93,6 +94,7 @@ returns an error. This window is bounded and process-local.
 
 | Type | Important fields | Meaning |
 |---|---|---|
+| `pong` | — | Acknowledges a browser heartbeat; clients do not render it. |
 | `text_message` | `text`, `session_id`, `interview_state`, `request_attachment`, optional `question_meta` | Primary assistant/welcome/question/summary response. |
 | `token` | `content` | Incremental display token where the graph path can provide it. Some paths synthesize tokens after a complete response, so this does not always indicate provider streaming. |
 | `thought_update` | `thoughts[]` containing `stage`, `detail`, `status` | UI progress labels for graph processing stages; not model chain-of-thought. |

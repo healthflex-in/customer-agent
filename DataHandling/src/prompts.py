@@ -192,6 +192,11 @@ Previous Consultations:
 
 Pain Assessment:
 - Location, severity, aggravating factors, relieving factors
+- Mechanism/cause and aggravating factors are different. An activity happening
+  when the problem started (for example "it started while playing") belongs
+  only in Mechanism of Injury or Cause. Put an activity in Aggravating Factors
+  only when the patient explicitly says it now makes the problem worse or is
+  directly answering a question about what makes it worse.
 - Fill pain fields as "Not applicable — no pain reported" only when the patient
   explicitly says they have no pain or explicitly describes a general wellness
   visit without a complaint. Never infer no pain from an omitted answer.
@@ -218,6 +223,16 @@ Referral:
 - Store NEGATIVE answers: "no pain" → mark pain fields as "No pain reported" or "Not applicable"
 - Use clinical intelligence, not literal matching: patients speak conversationally and voice-to-text introduces errors. Understand what the patient MEANT from context — the same way an experienced clinician reading the transcript would. Fill fields based on meaning, not exact wording.
 - Interpret goals, desires, and aspirations broadly: anything the patient wants to achieve, feel, or be able to do is a treatment goal.
+- A question asking Sage for medical advice, medication guidance, diagnosis, or
+  return-to-activity clearance is NOT a patient answer and is NEVER a treatment
+  goal or expectation. Do not store any part of such a question in the form.
+- Store only patient facts. Never add your own uncertainty, explanation, or
+  commentary (for example "likely referring to..." or "not specific enough").
+  If a body location or answer is ambiguous, leave its field empty so Sage can
+  ask a clarification question.
+- Do not copy transcription noise or future-time fragments into duration. A
+  duration must state how long the issue has existed (for example "two weeks"
+  or "since yesterday"); otherwise leave it empty.
 - For general_assessment visits, pre-fill complaint and pain sections with "Not applicable — general visit"
 - Leave truly unknown fields as empty string ""
 - Never convert a missing answer into a negative answer. For example, do not

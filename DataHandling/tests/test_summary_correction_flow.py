@@ -5,7 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.graph.nodes.correction import make_apply_correction_node
+from src.graph.nodes.correction import (
+    make_apply_correction_node,
+    make_detect_correction_node,
+)
 from src.graph.nodes.summary import make_handle_summary_response_node
 from src.graph.pure_functions.form_extraction import apply_form_correction
 from src.graph.pure_functions.summary import classify_summary_response
@@ -26,6 +29,25 @@ def _load_edges_without_langgraph():
 
 
 class SummaryCorrectionFlowTests(unittest.TestCase):
+    def test_head_pain_too_is_saved_as_head_not_previous_leg(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(phase="summary", user_input="I have head pain too")
+        state["form"]["Present Complaint"]["Primary Complaint"] = "Leg pain"
+        state["form"]["Pain Assessment"]["Primary Location of Pain"] = "Leg"
+
+        def unexpected(_):
+            self.fail("Explicit additional head pain must not call AI")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        self.assertEqual(state["summary_intent"]["intent"], "new_complaint")
+        result = make_handle_summary_response_node(unexpected)(state)
+        saved = result["form"]["Additional Complaint 1"]["Primary Complaint"]
+        self.assertIn("head pain", saved.lower())
+        self.assertNotIn("leg pain", saved.lower())
+
     def test_combined_severity_update_and_new_complaint_apply_together(self):
         from src.graph.state import get_fresh_interview_state
         from src.graph.nodes.summary import make_classify_summary_intent_node
@@ -33,6 +55,7 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
         for text in (
             "Please update pain to 7 and I also have leg pain",
             "Please change head pain severity to 7, and I also have leg pain",
+            "Can you please increase it to 10 on scale the head pain, and I also have hand pain",
         ):
             with self.subTest(text=text):
                 state = get_fresh_interview_state("u", "FRM-01", "s")
@@ -47,13 +70,75 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
                 state.update(make_classify_summary_intent_node(unexpected_llm)(state))
                 result = make_handle_summary_response_node(unexpected_llm)(state)
 
-                self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], "7/10")
-                self.assertIn("leg pain", result["form"]["Additional Complaint 1"]["Primary Complaint"].lower())
+                expected_score = "10/10" if "10 on scale" in text else "7/10"
+                expected_addition = "hand pain" if "hand pain" in text else "leg pain"
+                self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], expected_score)
+                self.assertEqual(
+                    result["form"]["Additional Complaint 1"]["Primary Complaint"].lower(),
+                    expected_addition,
+                )
                 self.assertEqual(result["form"]["Additional Complaint 1"]["Severity (1-10)"], "")
                 self.assertIn("updated", result["response_text"].lower())
                 self.assertIn("added", result["response_text"].lower())
-                self.assertIn("7/10", result["response_text"])
+                self.assertIn(expected_score, result["response_text"])
                 self.assertEqual(result["phase"], "interviewing")
+
+    def test_existing_additional_complaint_label_is_corrected_not_duplicated(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(phase="summary", user_input=(
+            "Can you please change the additional point, it is only hand pain only"
+        ))
+        state["form"]["Additional Complaint 1"] = {
+            "Primary Complaint": "the whole correction sentence",
+            "Duration of the Issue": "one day",
+        }
+        state["form_sections"].append("Additional Complaint 1")
+
+        def unexpected(_):
+            self.fail("Explicit additional-complaint correction must be deterministic")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        result = make_handle_summary_response_node(unexpected)(state)
+
+        self.assertEqual(
+            result["form"]["Additional Complaint 1"]["Primary Complaint"],
+            "hand pain",
+        )
+        self.assertNotIn("Additional Complaint 2", result["form"])
+        self.assertIn("corrected", result["response_text"].lower())
+
+    def test_qa_combined_leg_score_correction_and_hand_complaint(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="summary",
+            user_input=(
+                "can you pls increase it to 10 on scale the leg pain, "
+                "I also have hand pain"
+            ),
+        )
+        state["form"]["Present Complaint"]["Primary Complaint"] = "Leg pain"
+        state["form"]["Pain Assessment"]["Primary Location of Pain"] = "Leg"
+        state["form"]["Pain Assessment"]["Severity (1-10)"] = "9/10"
+
+        def unexpected(_):
+            self.fail("The exact QA correction must be deterministic")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        result = make_handle_summary_response_node(unexpected)(state)
+
+        self.assertEqual(
+            result["form"]["Pain Assessment"]["Severity (1-10)"], "10/10"
+        )
+        self.assertEqual(
+            result["form"]["Additional Complaint 1"]["Primary Complaint"],
+            "hand pain",
+        )
 
     def test_generated_summary_cannot_omit_added_pain(self):
         from src.graph.pure_functions.summary import generate_interview_summary
@@ -65,7 +150,8 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
         response = generate_interview_summary(
             form, [], lambda _: "You have head pain.\nKey points:\n- Head pain.\nIs this information correct, or would you like to make any changes?"
         )
-        self.assertIn(text, response)
+        self.assertIn("hand pain", response.lower())
+        self.assertNotIn("i have pain in my hand as well", response.lower())
         self.assertEqual(response.count("Is this information correct"), 1)
 
     def test_additional_pain_is_saved_acknowledged_and_requires_followup(self):
@@ -97,7 +183,8 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
                 updated = {**state, **result}
                 for section, fields in original.items():
                     self.assertEqual(updated["form"][section], fields)
-                self.assertEqual(updated["form"]["Additional Complaint 1"]["Primary Complaint"], text)
+                saved_complaint = updated["form"]["Additional Complaint 1"]["Primary Complaint"]
+                self.assertRegex(saved_complaint.lower(), r"^(?:hand|arms?) pain$")
                 self.assertIn("I've added", result["response_text"])
                 self.assertNotIn("Key points", result["response_text"])
                 self.assertEqual(self.edges.after_handle_summary_response(updated), "__end__")
@@ -329,6 +416,309 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
         self.assertFalse(success)
         self.assertEqual(updated, form)
         self.assertIn("correct information", message)
+
+    def test_summary_can_be_reshared_without_advice_refusal_or_ai(self):
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = {
+            "user_input": "can you please share summary again which you have written so I can verify",
+            "form": {
+                "Present Complaint": {"Primary Complaint": "Knee pain"},
+                "Referral": {"Source": "Google"},
+            },
+            "history": [{"role": "agent", "message": "Is this correct?"}],
+        }
+
+        def unexpected(_prompt):
+            self.fail("A summary replay must not call the AI classifier")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        self.assertEqual(state["summary_intent"]["intent"], "show_summary")
+        result = make_handle_summary_response_node(unexpected)(state)
+        self.assertIn("Knee pain", result["response_text"])
+        self.assertIn("Google", result["response_text"])
+        self.assertNotIn("medical advice", result["response_text"].lower())
+
+    def test_initial_and_replayed_summary_use_identical_format(self):
+        from src.graph.pure_functions.summary import generate_interview_summary
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        form = {
+            "Present Complaint": {"Primary Complaint": "Knee pain"},
+            "Referral": {"Source": "Google"},
+        }
+
+        def unexpected(_prompt):
+            self.fail("Canonical summary rendering must not call AI")
+
+        initial = generate_interview_summary(form, [], unexpected)
+        for request in ("please share the summary again", "show updated summary"):
+            with self.subTest(request=request):
+                state = {
+                    "user_input": request,
+                    "form": form,
+                    "history": [{"role": "agent", "message": initial}],
+                }
+                state.update(make_classify_summary_intent_node(unexpected)(state))
+                replay = make_handle_summary_response_node(unexpected)(state)
+                self.assertEqual(replay["response_text"], initial)
+
+    def test_exact_alcohol_correction_updates_combined_lifestyle_field(self):
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = {
+            "phase": "summary",
+            "current_section": "History & Diagnostics",
+            "user_input": "thanks but I do drink pls update",
+            "form": {
+                "History & Diagnostics": {
+                    "Current Lifestyle": (
+                        "Work: I work in a company; Alcohol: Does not drink alcohol"
+                    )
+                }
+            },
+            "history": [{"role": "agent", "message": "Is this correct?"}],
+        }
+
+        def unexpected(_prompt):
+            self.fail("Explicit alcohol correction must not call AI")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        self.assertEqual(state["summary_intent"]["intent"], "request_change")
+        state.update(make_handle_summary_response_node(unexpected)(state))
+        state.update(make_detect_correction_node(unexpected)(state))
+        result = make_apply_correction_node(unexpected)(state)
+
+        lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
+        self.assertIn("Alcohol: Drinks alcohol", lifestyle)
+        self.assertNotIn("Does not drink alcohol", lifestyle)
+        self.assertTrue(result["correction_applied"])
+
+        # A retried delivery must be idempotent and must never fall back to the
+        # invalid Current Lifestyle -> Alcohol field path.
+        retry_state = {
+            **state,
+            **result,
+            "phase": "summary",
+            "user_input": "thanks but I do drink pls update",
+        }
+        retry_state.update(make_detect_correction_node(unexpected)(retry_state))
+        retry = make_apply_correction_node(unexpected)(retry_state)
+        self.assertTrue(retry["correction_applied"])
+        self.assertIn("already recorded", retry["response_text"])
+        self.assertEqual(
+            retry["form"]["History & Diagnostics"]["Current Lifestyle"],
+            lifestyle,
+        )
+
+    def test_lifestyle_alias_from_correction_model_maps_to_real_schema_field(self):
+        form = {
+            "History & Diagnostics": {
+                "Current Lifestyle": "Work: Company; Alcohol: Does not drink alcohol"
+            }
+        }
+        correction = {
+            "section_name": "Current Lifestyle",
+            "field_name": "Alcohol",
+            "new_value": "Drinks alcohol",
+            "source_text": "thanks but I do drink pls update",
+            "needs_clarification": False,
+        }
+
+        updated, success, _ = apply_form_correction(correction, form, lambda _: "")
+
+        self.assertTrue(success)
+        self.assertIn(
+            "Alcohol: Drinks alcohol",
+            updated["History & Diagnostics"]["Current Lifestyle"],
+        )
+
+    def test_additional_complaint_instruction_stores_only_symptom(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="summary",
+            user_input="so pls add hand pain as additional compamnt",
+        )
+        state["form"]["Present Complaint"]["Primary Complaint"] = "Knee pain"
+
+        def unexpected(_prompt):
+            self.fail("Explicit additional complaint must not call AI")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        result = make_handle_summary_response_node(unexpected)(state)
+
+        self.assertEqual(
+            result["form"]["Additional Complaint 1"]["Primary Complaint"],
+            "hand pain",
+        )
+        self.assertIn("concern: hand pain", result["response_text"].lower())
+        self.assertNotIn("so pls add", result["response_text"].lower())
+
+    def test_legacy_instruction_like_complaint_is_repaired_before_summary_replay(self):
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = {
+            "user_input": "please share the summary again",
+            "form": {
+                "Present Complaint": {"Primary Complaint": "Knee pain"},
+                "Additional Complaint 1": {
+                    "Primary Complaint": "so pls add hand pain as additional compamnt"
+                },
+            },
+            "history": [{"role": "agent", "message": "Is this correct?"}],
+        }
+
+        def unexpected(_prompt):
+            self.fail("Summary replay and legacy repair must not call AI")
+
+        patch = make_classify_summary_intent_node(unexpected)(state)
+        state.update(patch)
+        result = make_handle_summary_response_node(unexpected)(state)
+
+        self.assertEqual(
+            state["form"]["Additional Complaint 1"]["Primary Complaint"],
+            "hand pain",
+        )
+        self.assertIn("hand pain", result["response_text"].lower())
+        self.assertNotIn("so pls add", result["response_text"].lower())
+
+    def test_unfamiliar_complaint_uses_validated_model_label_not_instruction(self):
+        from src.graph.state import get_fresh_interview_state
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="summary",
+            user_input=(
+                "There is another weird pins-and-needles feeling near my left "
+                "fingers, put that in too"
+            ),
+        )
+        model_result = {
+            "intent": "new_complaint",
+            "correction_text": None,
+            "addition_text": "Pins-and-needles sensation in the left fingers",
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
+        state.update(make_classify_summary_intent_node(
+            lambda _prompt: __import__("json").dumps(model_result)
+        )(state))
+        result = make_handle_summary_response_node(lambda _: "unused")(state)
+
+        self.assertEqual(
+            result["form"]["Additional Complaint 1"]["Primary Complaint"],
+            "Pins-and-needles sensation in the left fingers",
+        )
+        self.assertNotIn("put that", result["response_text"].lower())
+
+    def test_instruction_like_model_complaint_is_rejected_before_write(self):
+        from src.graph.state import get_fresh_interview_state
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="summary",
+            user_input="add something else",
+            summary_intent={
+                "intent": "new_complaint",
+                "addition_text": "please add this as an additional complaint",
+            },
+        )
+        result = make_handle_summary_response_node(lambda _: "unused")(state)
+
+        self.assertNotIn("form", result)
+        self.assertFalse(result["correction_applied"])
+        self.assertIn("couldn't identify the symptom", result["response_text"])
+
+    def test_additional_complaint_delete_never_edits_primary_complaint(self):
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        for text in (
+            "I dont have any hand pain please remove",
+            "remove this dont need additional complaint",
+            "I do not have hand pain",
+        ):
+            with self.subTest(text=text):
+                state = {
+                    "user_input": text,
+                    "phase": "summary",
+                    "current_section": "Additional Complaint 1",
+                    "form_sections": ["Present Complaint", "Additional Complaint 1"],
+                    "form": {
+                        "Present Complaint": {"Primary Complaint": "Knee pain"},
+                        "Additional Complaint 1": {
+                            "Primary Complaint": "Hand pain",
+                            "Severity (1-10)": "5/10",
+                        },
+                    },
+                    "history": [{"role": "agent", "message": "Is this correct?"}],
+                }
+
+                def unexpected(_prompt):
+                    self.fail("An explicit deletion must not call AI")
+
+                state.update(make_classify_summary_intent_node(unexpected)(state))
+                self.assertEqual(
+                    state["summary_intent"]["intent"],
+                    "remove_additional_complaint",
+                )
+                result = make_handle_summary_response_node(unexpected)(state)
+                self.assertNotIn("Additional Complaint 1", result["form"])
+                self.assertEqual(
+                    result["form"]["Present Complaint"]["Primary Complaint"],
+                    "Knee pain",
+                )
+                self.assertNotIn("don't have hand pain", str(result["form"]).lower())
+                self.assertIn("removed", result["response_text"].lower())
+
+    def test_additional_complaint_wording_updates_only_additional_section(self):
+        from src.graph.nodes.summary import make_classify_summary_intent_node
+
+        state = {
+            "user_input": (
+                "you have written additional point right in that write forearm and hand"
+            ),
+            "phase": "summary",
+            "current_section": "Additional Complaint 1",
+            "form": {
+                "Present Complaint": {"Primary Complaint": "Knee pain"},
+                "Additional Complaint 1": {"Primary Complaint": "Arm pain"},
+            },
+            "history": [{"role": "agent", "message": "Is this correct?"}],
+        }
+
+        def unexpected(_prompt):
+            self.fail("An explicit additional-complaint edit must not call AI")
+
+        state.update(make_classify_summary_intent_node(unexpected)(state))
+        result = make_handle_summary_response_node(unexpected)(state)
+        self.assertEqual(
+            result["form"]["Additional Complaint 1"]["Primary Complaint"],
+            "forearm and hand pain",
+        )
+        self.assertEqual(
+            result["form"]["Present Complaint"]["Primary Complaint"],
+            "Knee pain",
+        )
+
+    def test_removal_never_deletes_a_different_complaint(self):
+        from src.graph.pure_functions.additional_complaint import (
+            additional_complaint_removal_target,
+        )
+
+        form = {
+            "Present Complaint": {"Primary Complaint": "Knee pain"},
+            "Additional Complaint 1": {"Primary Complaint": "Hand pain"},
+        }
+        self.assertIsNone(
+            additional_complaint_removal_target(
+                "remove the knee pain", form, "Additional Complaint 1"
+            )
+        )
 
 
 if __name__ == "__main__":

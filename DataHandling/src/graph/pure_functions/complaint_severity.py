@@ -3,6 +3,15 @@ import copy
 import re
 
 SCORE = re.compile(r"\b(10|[0-9])\s*(?:out\s+of|/)\s*10\b", re.I)
+CORRECTION_SCORE = re.compile(
+    r"\b(?:change|update|correct|set|make|increase|decrease|raise|lower)\b"
+    r".{0,65}?(?:\b(?:to|at|is)\s*|(?:->|→)\s*)(10|[0-9])\b",
+    re.I,
+)
+RATING_SCORE = re.compile(
+    r"\b(?:pain\s+)?(?:rating|severity|score)\s*(?:is|to|at|=)?\s*(10|[0-9])\b",
+    re.I,
+)
 BARE_SCORE = re.compile(r"\b(10|[0-9])\b")
 SITE = re.compile(r"\b(?:(left|right)\s+)?(head(?:ache)?|neck|back|shoulders?|arms?|hands?|wrists?|elbows?|hips?|legs?|knees?|ankles?|feet|foot|eyes?|chest|abdomen|stomach|jaw)\b", re.I)
 
@@ -37,6 +46,10 @@ def explicit_severity_updates(form, text, active_section=None, context_question=
     targets = complaint_targets(form)
     updates = {}
     score_matches = list(SCORE.finditer(text))
+    if not score_matches:
+        score_matches = list(CORRECTION_SCORE.finditer(text))
+    if not score_matches:
+        score_matches = list(RATING_SCORE.finditer(text))
     contextual_bare_value = None
     # A bare number is safe only as a direct response to a severity question.
     # This covers voice/text replies such as "5" and "on 0 to 10 it is 5".
@@ -54,17 +67,24 @@ def explicit_severity_updates(form, text, active_section=None, context_question=
     for clause in clauses:
         sites = _sites(clause)
         clause_scores = list(SCORE.finditer(clause))
+        if not clause_scores:
+            clause_scores = list(CORRECTION_SCORE.finditer(clause))
+        if not clause_scores:
+            clause_scores = list(RATING_SCORE.finditer(clause))
         if not clause_scores and contextual_bare_value is not None:
             clause_scores = [score for score in BARE_SCORE.finditer(clause)
                              if score[1] == contextual_bare_value]
         for score in clause_scores:
+            is_named_score = score.re in (CORRECTION_SCORE, RATING_SCORE)
+            score_start = score.start(1) if is_named_score else score.start()
+            score_end = score.end(1) if is_named_score else score.end()
             # "7/10 for my leg" binds forward; "leg pain is 7/10" backward.
-            following = sites if re.match(r"\s+(?:for|in|on)\b", clause[score.end():], re.I) else []
-            candidates = [site for site in following if site[0] >= score.end()]
+            following = sites if re.match(r"\s+(?:for|in|on)\b", clause[score_end:], re.I) else []
+            candidates = [site for site in following if site[0] >= score_end]
             if candidates:
                 chosen = min(candidates, key=lambda site: site[0])
             else:
-                candidates = [site for site in sites if site[1] <= score.start()]
+                candidates = [site for site in sites if site[1] <= score_start]
                 chosen = max(candidates, key=lambda site: site[1]) if candidates else None
             matched = []
             if chosen:
@@ -76,6 +96,33 @@ def explicit_severity_updates(form, text, active_section=None, context_question=
                            if section == active_section]
                 if len(targets) == 1:
                     matched = [(targets[0][0], targets[0][1])]
+            if len(matched) > 1:
+                # If bad historical data contains the same location in both the
+                # primary and an additional complaint, unqualified wording means
+                # the primary complaint. Additional data must be named explicitly.
+                matching_sides = {
+                    site[2]
+                    for section, _field, known in targets
+                    if any(item[0] == section for item in matched)
+                    for site in known
+                    if chosen and site[3] == chosen[3] and site[2]
+                }
+                directional_ambiguity = bool(
+                    chosen and not chosen[2] and len(matching_sides) > 1
+                )
+                if directional_ambiguity:
+                    matched = []
+                else:
+                    preferred_section = (
+                        None if re.search(
+                            r"\badditional (?:complaint|concern|pain)\b",
+                            clause,
+                            re.I,
+                        )
+                        else "Pain Assessment"
+                    )
+                    preferred = [item for item in matched if item[0] == preferred_section]
+                    matched = preferred if len(preferred) == 1 else []
             if len(matched) == 1:
                 updates[matched[0]] = score[1] + "/10"
     return updates

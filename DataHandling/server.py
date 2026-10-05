@@ -43,6 +43,7 @@ from app.config import (
     MONGO_CUSTOMER_INFO_COLLECTION,
     MONGO_REPORT_JOBS_COLLECTION,
     MONGO_CLINICAL_ESCALATIONS_COLLECTION,
+    MONGO_CHAT_HISTORY_COLLECTION,
     MONGO_TLS_CA_FILE,
     CORS_ALLOWED_ORIGINS,
     AUDIO_RATE as RATE,
@@ -62,6 +63,7 @@ from app.config import (
     REPORT_JOB_RETRY_BASE_SECONDS,
     REPORT_JOB_RETRY_MAX_SECONDS,
     GEMINI_REQUEST_TIMEOUT_MS,
+    CHAT_HISTORY_RETENTION_DAYS,
     UPLOAD_TRIGGER_PHRASE,
 )
 from app.db.connection import create_verified_mongo_client
@@ -116,7 +118,12 @@ from app.clinical.escalation import (
     record_escalation,
 )
 from app.clinical.scope import assess_msk_intake_scope
-from src.graph.pure_functions.clarification import build_out_of_flow_response
+from app.audit.chat_history import ensure_chat_history_indexes, record_chat_message
+from src.graph.pure_functions.clarification import (
+    boundary_response_with_pending_question,
+    build_out_of_flow_response,
+    pending_intake_question,
+)
 from app.ws.idempotency import RecentRequestWindow, RequestDecision
 from app.observability.privacy import env_flag, error_type, pseudonymous_id
 # Pure stateless helpers. Aliased to legacy names used throughout this file.
@@ -507,6 +514,7 @@ customer_info_collection: Optional[Collection] = None
 tagged_questions_collection: Optional[Collection] = None
 report_jobs_collection: Optional[Collection] = None
 clinical_escalations_collection: Optional[Collection] = None
+chat_history_collection: Optional[Collection] = None
 
 
 # normalize_user_id moved to app.db.serializers (imported above).
@@ -514,7 +522,7 @@ clinical_escalations_collection: Optional[Collection] = None
 
 def init_mongo():
     """Initialize MongoDB client for user directory lookups and customer info."""
-    global mongo_client, users_collection, customer_info_collection, tagged_questions_collection, report_jobs_collection, clinical_escalations_collection
+    global mongo_client, users_collection, customer_info_collection, tagged_questions_collection, report_jobs_collection, clinical_escalations_collection, chat_history_collection
 
     if not MONGO_URI:
         print("MONGO_URI not set. User suggestions and customer info endpoints will be disabled.")
@@ -532,6 +540,7 @@ def init_mongo():
         tagged_questions_collection = db["tagged-questions"]
         report_jobs_collection = db[MONGO_REPORT_JOBS_COLLECTION]
         clinical_escalations_collection = db[MONGO_CLINICAL_ESCALATIONS_COLLECTION]
+        chat_history_collection = db[MONGO_CHAT_HISTORY_COLLECTION]
 
         # A formId identifies a questionnaire; attemptId identifies one intake.
         # This migration preserves legacy records while allowing repeat intakes.
@@ -542,9 +551,21 @@ def init_mongo():
         ensure_form_lifecycle_ttl_index(customer_info_collection)
         ensure_report_job_indexes(report_jobs_collection)
         ensure_escalation_indexes(clinical_escalations_collection)
+        try:
+            ensure_chat_history_indexes(chat_history_collection)
+        except Exception as chat_index_error:
+            # Transcript persistence is diagnostic only. A bad/missing audit
+            # index must not make the patient intake database unavailable.
+            _log.error(
+                "chat_history_index_initialization_failed",
+                error_type=error_type(chat_index_error),
+            )
 
         print(
-            f"Connected to MongoDB collections: {MONGO_DB_NAME}.{MONGO_USERS_COLLECTION}, {MONGO_DB_NAME}.{MONGO_CUSTOMER_INFO_COLLECTION}"
+            "Connected to MongoDB collections: "
+            f"{MONGO_DB_NAME}.{MONGO_USERS_COLLECTION}, "
+            f"{MONGO_DB_NAME}.{MONGO_CUSTOMER_INFO_COLLECTION}, "
+            f"{MONGO_DB_NAME}.{MONGO_CHAT_HISTORY_COLLECTION}"
         )
     except Exception as e:
         mongo_client = None
@@ -553,6 +574,7 @@ def init_mongo():
         tagged_questions_collection = None
         report_jobs_collection = None
         clinical_escalations_collection = None
+        chat_history_collection = None
         print(f"MongoDB connection failed: {error_type(e)}")
 
 
@@ -1864,6 +1886,43 @@ def message_requires_attachment(
     return False
 
 
+def _record_chat_audit(
+    client_state: dict,
+    *,
+    role: str,
+    content: str,
+    message_type: str = "text_message",
+    request_id: object = None,
+    question_id: object = None,
+    error_code: object = None,
+    phase: object = None,
+    section: object = None,
+) -> bool:
+    """Persist one short-lived transcript message without exposing it to logs."""
+
+    return record_chat_message(
+        chat_history_collection,
+        user_id=client_state.get("user_id"),
+        session_id=client_state.get("session_id"),
+        form_id=client_state.get("form_id"),
+        attempt_id=client_state.get("attempt_id"),
+        interview_id=client_state.get("interview_id"),
+        role=role,
+        content=content,
+        message_type=message_type,
+        phase=phase if phase is not None else client_state.get("graph_phase"),
+        section=(
+            section
+            if section is not None
+            else client_state.get("graph_current_section")
+        ),
+        request_id=request_id,
+        question_id=question_id,
+        error_code=error_code,
+        retention_days=CHAT_HISTORY_RETENTION_DAYS,
+    )
+
+
 async def send_text_message(
     websocket: WebSocket,
     client_state: dict,
@@ -1924,6 +1983,16 @@ async def send_text_message(
     if question_meta and question_meta.get("type") and question_meta.get("type") != "text":
         payload["question_meta"] = question_meta
     await websocket.send_text(json.dumps(payload))
+    await run_blocking(
+        _record_chat_audit,
+        client_state,
+        role="agent",
+        content=text,
+        message_type="text_message",
+        question_id=(question_meta or {}).get("questionId"),
+        phase=resolved_interview_state.get("status"),
+        section=resolved_interview_state.get("section"),
+    )
 
 
 COMPLETED_FORM_MESSAGE = (
@@ -1976,6 +2045,15 @@ async def send_completed_form(websocket: WebSocket, client_state: dict, form: di
     client_state["received_audio_buffer"].clear()
     client_state["recording_start_time"] = None
     await websocket.send_text(json.dumps(build_completed_form_payload(client_state, form)))
+    await run_blocking(
+        _record_chat_audit,
+        client_state,
+        role="agent",
+        content=COMPLETED_FORM_MESSAGE,
+        message_type="form_completed",
+        phase=FORM_COMPLETED,
+        section="Completed",
+    )
 
 
 def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, agent=None):
@@ -2145,6 +2223,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 try:
                     data = json.loads(message["text"])
                     msg_type = data.get("type", "")
+
+                    # Browser WebSockets cannot emit protocol-level ping frames.
+                    # This lightweight application heartbeat keeps idle patient
+                    # sessions alive through proxies/load balancers with a
+                    # one-minute idle timeout. It never changes interview state.
+                    if msg_type == "ping":
+                        await websocket.send_text(json.dumps({"type": "pong"}))
+                        continue
 
                     # A completed attempt remains read-only even if an outdated
                     # or modified client tries to send input after receiving the
@@ -3297,6 +3383,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                         print(f"[text_input] Received patient input ({len(text_input)} chars)")
                         print(f"[text_input] Current talk_mode: {health_agent.talk_mode}, history length: {len(health_agent.history)}")
+                        await run_blocking(
+                            _record_chat_audit,
+                            client_state,
+                            role="patient",
+                            content=text_input,
+                            message_type="text_input",
+                            request_id=data.get("requestId"),
+                            question_id=data.get("questionId"),
+                        )
 
                         # Identify only fully validated multi-answer UI payloads.
                         # Voice/free-form input remains on the existing AI path.
@@ -3377,8 +3472,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                             client_state["scope_notice_sent"] = True
                             client_state["graph_history"] = list(client_state.get("graph_history") or []) + [
-                                {"role": "user", "message": text_input},
-                                {"role": "agent", "message": _scope_decision.patient_message},
+                                {"role": "user", "message": text_input, "clinical_extraction": False},
+                                {"role": "agent", "message": _scope_decision.patient_message, "clinical_extraction": False},
                             ]
                             await send_text_message(
                                 websocket, client_state, _scope_decision.patient_message,
@@ -3389,13 +3484,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # Global interview boundary. Out-of-flow, medical-advice,
                         # medication and return-to-activity questions receive one
                         # fixed response without changing form state or invoking AI.
-                        _last_agent_question = next(
-                            (
-                                entry.get("message", "")
-                                for entry in reversed(client_state.get("graph_history") or [])
-                                if entry.get("role") == "agent"
-                            ),
-                            "",
+                        _last_agent_question = pending_intake_question(
+                            client_state.get("graph_history") or []
                         )
                         _boundary_response = (
                             None
@@ -3405,11 +3495,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             )
                         )
                         if _boundary_response:
+                            _boundary_response = boundary_response_with_pending_question(
+                                _boundary_response, _last_agent_question
+                            )
                             client_state["graph_history"] = list(
                                 client_state.get("graph_history") or []
                             ) + [
-                                {"role": "user", "message": text_input},
-                                {"role": "agent", "message": _boundary_response},
+                                {"role": "user", "message": text_input, "clinical_extraction": False},
+                                {"role": "agent", "message": _boundary_response, "clinical_extraction": False},
                             ]
                             await send_text_message(
                                 websocket,
@@ -3570,7 +3663,16 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                 print(f"[off_topic] Error: {_bre} — falling through to graph")
 
                         if _session_processing:
-                            await websocket.send_text(json.dumps({"type": "error", "text": "Please wait for the previous response."}))
+                            _busy_message = "Please wait for the previous response."
+                            await websocket.send_text(json.dumps({"type": "error", "text": _busy_message}))
+                            await run_blocking(
+                                _record_chat_audit,
+                                client_state,
+                                role="system",
+                                content=_busy_message,
+                                message_type="error",
+                                error_code="turn_already_processing",
+                            )
                             continue
                         _session_processing = True
                         try:
@@ -4159,8 +4261,17 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                             if not is_disconnect:
                                 print(f"[text_input] Processing failed: {error_type(e)}")
                                 try:
+                                    _processing_error_message = "Unable to process that response. Please try again."
                                     await websocket.send_text(
-                                        json.dumps({"type": "error", "text": "Unable to process that response. Please try again."})
+                                        json.dumps({"type": "error", "text": _processing_error_message})
+                                    )
+                                    await run_blocking(
+                                        _record_chat_audit,
+                                        client_state,
+                                        role="system",
+                                        content=_processing_error_message,
+                                        message_type="error",
+                                        error_code=error_type(e),
                                     )
                                 except Exception:
                                     pass  # socket already closed

@@ -99,6 +99,10 @@ class ReferralFlowRegressionTests(unittest.TestCase):
         for section, fields in state["form"].items():
             for field in fields:
                 fields[field] = "Patient-provided answer"
+        state["form"]["History & Diagnostics"]["Current Lifestyle"] = (
+            "Work: developer; Activity/exercise: gym; Smoking: does not smoke; "
+            "Alcohol: does not drink alcohol"
+        )
         state["form"]["Referral"]["Source"] = "Somebody gave me a referral"
         state["referral_asked"] = False
         state["user_input"] = "And actually there is a referral somebody gave me the referral"
@@ -106,9 +110,11 @@ class ReferralFlowRegressionTests(unittest.TestCase):
         with patch("src.graph.nodes.generate.get_stream_writer", return_value=lambda _event: None):
             result = make_generate_question_node(lambda _prompt: summary, "unused")(state)
         self.assertEqual(result["phase"], "summary")
-        self.assertEqual(result["response_text"], summary)
+        self.assertIn("Here's a summary", result["response_text"])
+        self.assertIn("Somebody gave me a referral", result["response_text"])
+        self.assertNotEqual(result["response_text"], summary)
         self.assertTrue(result["referral_asked"])
-        self.assertEqual(result["history"][-1]["message"], summary)
+        self.assertEqual(result["history"][-1]["message"], result["response_text"])
 
 
 if __name__ == "__main__":

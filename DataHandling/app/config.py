@@ -27,6 +27,9 @@ MONGO_REPORT_JOBS_COLLECTION: str = os.getenv(
 MONGO_CLINICAL_ESCALATIONS_COLLECTION: str = os.getenv(
     "MONGO_CLINICAL_ESCALATIONS_COLLECTION", "customer-agent-clinical-escalations"
 )
+MONGO_CHAT_HISTORY_COLLECTION: str = os.getenv(
+    "MONGO_CHAT_HISTORY_COLLECTION", "customer-agent-chat-history"
+)
 MONGO_TLS_CA_FILE: str | None = os.getenv("MONGO_TLS_CA_FILE")
 
 
@@ -75,6 +78,11 @@ def _positive_int_env(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+CHAT_HISTORY_RETENTION_DAYS: int = _positive_int_env(
+    "CHAT_HISTORY_RETENTION_DAYS", 10
+)
 
 ALLOWED_ATTACHMENT_TYPES: dict[str, str] = {
     "mri": "MRI Scan",

@@ -169,8 +169,11 @@ def _fill_unanswered_fields(form: dict) -> dict:
     compatibility with the summary call sites, but deliberately preserves empty
     fields so an omitted answer can never become clinical record content.
     """
-    import copy
-    return copy.deepcopy(form)
+    from src.graph.pure_functions.additional_complaint import (
+        normalize_additional_complaints,
+    )
+
+    return normalize_additional_complaints(form)
 
 
 def required_response_before_summary(state: InterviewState, history: list) -> dict | None:
