@@ -166,6 +166,12 @@ def build_out_of_flow_response(
     if build_intake_clarification(text, last_agent_question) is not None:
         return None
 
+    # A short upload deferral answers the active reports question. Let report
+    # intent handling record it and continue instead of returning a refusal.
+    from src.graph.pure_functions.summary import is_report_upload_deferral
+    if is_report_upload_deferral(text, last_agent_question):
+        return None
+
     # Corrections, upload/navigation questions, and pasted clinical Q&A belong
     # to the intake even when their wording starts with "can" or "what".
     if _IN_FLOW_OPERATIONAL.search(text):
@@ -180,7 +186,8 @@ def build_out_of_flow_response(
     # They are statements, not questions, even though the first word is also a
     # question word (for example: "When I walk, the pain gets worse").
     if re.match(r"^(?:when|while)\s+(?:i|my|the)\b", lowered) and re.search(
-        r"\b(?:pain|hurt|ache|worse|better|relief|reliev|massage|walk|move|bend)\b",
+        r"\b(?:pain|hurt|ache|worse|better|relief|reliev|massage|walk|move|bend|"
+        r"stand|feel|fine|normal|okay|ok)\b",
         lowered,
     ):
         return None

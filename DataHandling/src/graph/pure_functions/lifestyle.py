@@ -52,9 +52,10 @@ def _lifestyle_clauses(user_input: str | None) -> list[str]:
     if not raw:
         return []
     parts = re.split(
-        r"\s*[,;]\s*|\s+\band\b\s+(?=(?:i\s+)?(?:(?:yes|no|never|don't|dont|"
+        r"\s*[,;]\s*|\s+\band\b\s+(?=(?:i\s+)?(?:(?:yes|no|never|don't|dont|dnt|"
         r"do not)\s+)?(?:work|job|"
-        r"occupation|exercise|work\s*out|walk|run|gym|smok|drink|alcohol))",
+        r"occupation|exercise|work\s*out|walk|run|gym|smok|drink|alcohol|"
+        r"go(?:es|ing)?\s+to\s+(?:the\s+)?gym))",
         raw,
         flags=re.I,
     )
@@ -65,7 +66,7 @@ def _lifestyle_clauses(user_input: str | None) -> list[str]:
     for part in parts:
         expanded.extend(
             re.split(
-                r"\s+(?=(?:i\s+)?(?:(?:yes|no|never|don't|dont|do not)\s+)?"
+                r"\s+(?=(?:i\s+)?(?:(?:yes|no|never|don't|dont|dnt|do not)\s+)?"
                 r"(?:smok|drink|alcohol)\w*\b)",
                 part,
                 flags=re.I,
@@ -179,6 +180,10 @@ def merge_lifestyle_answer(
     """Merge explicit smoking, alcohol, and exercise facts into one field."""
 
     text = " ".join(str(user_input or "").lower().replace("’", "'").split())
+    # Normalize common typed/transcribed contractions for matching only. The
+    # original patient wording is still used for stored occupation/activity.
+    text = re.sub(r"\bdnt\b", "don't", text)
+    text = re.sub(r"\bdo\s+n\s*'?t\b", "don't", text)
     question = " ".join(str(last_question or "").lower().split())
     facts: dict[str, str] = {}
 
@@ -257,8 +262,30 @@ def merge_lifestyle_answer(
         )
         facts["activity"] = f"Activity/exercise: {activity_clause}"
 
+    asks_smoking = bool(re.search(r"\b(?:smok\w*|tobacco)\b", question))
+    asks_alcohol = bool(re.search(r"\b(?:drink(?:ing)? alcohol|alcohol)\b", question))
+    short_negative = text.strip(" .,!?-") in {
+        "no", "nope", "never", "none", "not at all", "nah",
+    }
+    shared_habit_negation = bool(
+        re.search(
+            r"\b(?:i\s+)?(?:do not|don't|dont|never|no)\s+"
+            r"(?:smoke|use tobacco)\s+(?:or|and)\s+"
+            r"(?:drink|consume)(?: alcohol)?\b",
+            text,
+        )
+        or re.search(
+            r"\b(?:i\s+)?(?:do not|don't|dont|never|no)\s+"
+            r"(?:drink|consume)(?: alcohol)?\s+(?:or|and)\s+"
+            r"(?:smoke|use tobacco)\b",
+            text,
+        )
+    )
+
     does_not_smoke = bool(
-        re.search(r"\b(?:i )?(?:do not|don't|dont|never|no) smoke\b", text)
+        shared_habit_negation
+        or (short_negative and asks_smoking)
+        or re.search(r"\b(?:i )?(?:do not|don't|dont|never|no) smoke\b", text)
         or re.search(r"\bnon[- ]?smoker\b", text)
     )
     if does_not_smoke:
@@ -270,7 +297,9 @@ def merge_lifestyle_answer(
         facts["smoking"] = "Smoking: Smokes"
 
     does_not_drink = bool(
-        re.search(
+        shared_habit_negation
+        or (short_negative and asks_alcohol)
+        or re.search(
             r"\b(?:i )?(?:do not|don't|dont|never|no) drink(?: alcohol)?\b",
             text,
         )
@@ -280,8 +309,8 @@ def merge_lifestyle_answer(
     if does_not_drink:
         facts["alcohol"] = "Alcohol: Does not drink alcohol"
     elif re.search(
-        r"\b(?:i (?:do |rarely |occasionally |regularly )?|yes[ ,:-]*)"
-        r"drink(?:s)?(?: alcohol)?\b",
+        r"\b(?:i\s+(?:do\s+|rarely\s+|occasionally\s+|regularly\s+)?|"
+        r"yes[ ,:-]*(?:i\s+)?)drink(?:s)?(?: alcohol)?\b",
         text,
     ):
         facts["alcohol"] = "Alcohol: Drinks alcohol"
@@ -328,6 +357,7 @@ def merge_lifestyle_answer(
 def has_explicit_lifestyle_fact(user_input: str | None) -> bool:
     """Return True only when the message contains an actual habit/work value."""
     text = " ".join(str(user_input or "").lower().replace("’", "'").split())
+    text = re.sub(r"\bdnt\b", "don't", text)
     return bool(re.search(
         r"\b(?:i\s+(?:do\s+|do not\s+|don't\s+|dont\s+|never\s+|"
         r"occasionally\s+|rarely\s+|regularly\s+)?(?:smoke|drink)|"

@@ -137,7 +137,8 @@ _PAIN_FACTOR_ANSWER_SIGNALS = {
         r"makes? it feel better|"
         r"(?:rest|resting|ice|icing|lying|standing|sleeping)\b.{0,30}\bhelps?|"
         r"reliev(?:e|es|ed|ing)|provides? relief|gives? relief|"
-        r"reduces? (?:the |my )?pain|eases? (?:the |my )?pain)\b",
+        r"reduces? (?:the |my )?pain|eases? (?:the |my )?pain|"
+        r"(?:when|while)\b.{0,55}\bfeel(?:s)? (?:fine|normal|okay|ok|better))\b",
         re.I,
     ),
 }
@@ -159,7 +160,8 @@ _EXPLICIT_RELIEVING = re.compile(
     r"(?:rest|resting|ice|icing|lying|standing|sleeping)\b.{0,30}\bhelps?|"
     r"reliev(?:e|es|ed|ing)|provides? relief|gives? (?:any )?relief|"
     r"reduces? (?:the |my )?pain|eases? (?:the |my )?pain|"
-    r"nothing .{0,50} (?:helps?|reliev(?:e|es)|gives? (?:any )?relief))\b",
+    r"nothing .{0,50} (?:helps?|reliev(?:e|es)|gives? (?:any )?relief)|"
+    r"(?:when|while)\b.{0,55}\bfeel(?:s)? (?:fine|normal|okay|ok|better))\b",
     re.I,
 )
 _ALREADY_ANSWERED = re.compile(
@@ -190,6 +192,14 @@ def explicit_pain_factor_values(text: str) -> dict[str, str]:
     ]
     aggravating = [clause for clause in clauses if _EXPLICIT_AGGRAVATING.search(clause)]
     relieving = [clause for clause in clauses if _EXPLICIT_RELIEVING.search(clause)]
+    # A comma often separates a leading relationship clause from its outcome:
+    # "When I stand normally, I feel fine." The generic clause splitter cannot
+    # retain that relationship, so fall back to the complete sentence only when
+    # the same strict evidence regex matches it.
+    if not aggravating and _EXPLICIT_AGGRAVATING.search(normalized):
+        aggravating = [normalized.strip(" ,.;")]
+    if not relieving and _EXPLICIT_RELIEVING.search(normalized):
+        relieving = [normalized.strip(" ,.;")]
     result: dict[str, str] = {}
     if aggravating:
         result["Aggravating Factors"] = "; ".join(dict.fromkeys(aggravating))

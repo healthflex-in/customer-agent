@@ -47,6 +47,18 @@ class ProductionAttemptRegressionTests(unittest.TestCase):
         )
         self.assertIn("What makes it feel better", plan.message)
 
+    def test_resume_does_not_repeat_completed_lifestyle_components(self):
+        form = completed_form()
+        form["Treatment Goals"]["Specific Expectations from Treatment"] = ""
+
+        plan = build_resume_plan(form, "Treatment Goals")
+
+        self.assertEqual(plan.phase, "interviewing")
+        self.assertNotIn("occupation", plan.message.lower())
+        self.assertNotIn("smoke", plan.message.lower())
+        self.assertNotIn("alcohol", plan.message.lower())
+        self.assertIn("expectations from treatment", plan.message.lower())
+
     def test_case_5_all_required_values_resume_to_summary(self):
         plan = build_resume_plan(completed_form(), "Treatment Goals")
 

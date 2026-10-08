@@ -310,6 +310,28 @@ class ClinicalValueGuardTests(unittest.TestCase):
         self.assertEqual(explicit_pain_factor_values("I played football"), {})
         self.assertEqual(explicit_pain_factor_values("I usually climb stairs"), {})
 
+    def test_contextual_normal_standing_answer_is_relief_not_a_question(self):
+        from src.graph.pure_functions.clarification import build_out_of_flow_response
+
+        text = "When I stand normally, I feel fine."
+        question = "What makes it feel better or gives relief?"
+
+        self.assertIsNone(build_out_of_flow_response(text, question))
+        self.assertEqual(
+            explicit_pain_factor_values(text),
+            {"Relieving Factors": "When I stand normally, I feel fine"},
+        )
+
+        updated = apply_explicit_pain_factor_answers(
+            self.form,
+            active_section="Pain Assessment",
+            user_input=text,
+        )
+        self.assertEqual(
+            updated["Pain Assessment"]["Relieving Factors"],
+            "When I stand normally, I feel fine",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

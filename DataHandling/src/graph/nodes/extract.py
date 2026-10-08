@@ -639,10 +639,16 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 _report_label = "CT scan reports"
             else:
                 _report_label = "Diagnostic reports"
-            updated_form["History & Diagnostics"]["Reports"] = (
-                f"{_report_label} available; patient will share them directly with "
-                "the clinician and declined in-app upload."
-            )
+            if reports_intent.get("deferred_upload"):
+                updated_form["History & Diagnostics"]["Reports"] = (
+                    f"{_report_label} available; patient deferred upload and will "
+                    "share them later."
+                )
+            else:
+                updated_form["History & Diagnostics"]["Reports"] = (
+                    f"{_report_label} available; patient will share them directly with "
+                    "the clinician and declined in-app upload."
+                )
         _filled_count = sum(1 for sec in updated_form.values() if isinstance(sec, dict)
                             for v in sec.values() if v and str(v).strip())
         print(f"[extract_node] {_extract_method}: {_filled_count} fields filled")

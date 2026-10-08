@@ -96,6 +96,65 @@ class ReportDeclineFlowTests(unittest.TestCase):
         self.assertIn("Walks for exercise", value)
         self.assertIn("No other regular exercise routine", value)
 
+    def test_shared_habit_negation_and_common_typo_fill_both_fields(self):
+        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+
+        for answer in (
+            "I dnt smoke or drink.",
+            "I don't smoke or drink alcohol.",
+            "I do not drink or smoke.",
+        ):
+            with self.subTest(answer=answer):
+                value = merge_lifestyle_answer(
+                    "", answer, "Do you smoke or drink alcohol?"
+                )
+                self.assertIn("Smoking: Does not smoke", value)
+                self.assertIn("Alcohol: Does not drink alcohol", value)
+                self.assertNotIn(
+                    "Current Lifestyle — Smoking",
+                    missing_lifestyle_components(value),
+                )
+                self.assertNotIn(
+                    "Current Lifestyle — Alcohol",
+                    missing_lifestyle_components(value),
+                )
+
+    def test_short_habit_denial_uses_active_question_context(self):
+        smoking = merge_lifestyle_answer(
+            "", "Never.", "Do you smoke or use tobacco?"
+        )
+        alcohol = merge_lifestyle_answer(
+            smoking, "No.", "Do you drink alcohol?"
+        )
+
+        self.assertIn("Smoking: Does not smoke", alcohol)
+        self.assertIn("Alcohol: Does not drink alcohol", alcohol)
+
+    def test_combined_occupation_and_exercise_do_not_contaminate_each_other(self):
+        value = merge_lifestyle_answer(
+            "",
+            "I work as a firmware engineer and go to the gym four times a week.",
+            "What is your work and usual activity or exercise routine?",
+        )
+
+        self.assertIn("Work: I work as a firmware engineer", value)
+        self.assertIn(
+            "Activity/exercise: go to the gym four times a week", value
+        )
+        work, activity = value.split(";", 1)
+        self.assertNotIn("gym", work.lower())
+        self.assertNotIn("firmware", activity.lower())
+
+        with_habits = merge_lifestyle_answer(
+            "",
+            "I am a doctor and dnt smoke or drink.",
+            "What is your occupation? Do you smoke or drink alcohol?",
+        )
+        self.assertIn("Work: I am a doctor", with_habits)
+        self.assertIn("Smoking: Does not smoke", with_habits)
+        self.assertIn("Alcohol: Does not drink alcohol", with_habits)
+        self.assertNotIn("smoke", with_habits.split(";", 1)[0].lower())
+
     def test_report_and_direct_clinician_share_are_deterministic(self):
         def unexpected_llm(_prompt):
             self.fail("Clear report/upload intent must not require an LLM call")
@@ -107,6 +166,49 @@ class ReportDeclineFlowTests(unittest.TestCase):
             context_question="Do you have X-rays for this injury?",
         )
         self.assertEqual(result, {"has_reports": True, "wants_upload": False})
+
+    def test_report_upload_deferral_is_recorded_and_does_not_reprompt(self):
+        from src.graph.pure_functions.clarification import build_out_of_flow_response
+
+        question = "Do you have any related X-rays, MRI, CT scans, or blood reports?"
+        self.assertIsNone(build_out_of_flow_response("Will share later.", question))
+
+        def unexpected_llm(_prompt):
+            self.fail("Contextual report deferral must not call an AI provider")
+
+        self.assertEqual(
+            classify_reports_intent("Will share later.", unexpected_llm, question),
+            {
+                "has_reports": True,
+                "wants_upload": False,
+                "deferred_upload": True,
+            },
+        )
+
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="interviewing",
+            current_section="History & Diagnostics",
+            visit_context="specific_complaint",
+            user_input="Will share later.",
+            history=[{"role": "agent", "message": question}],
+        )
+
+        def reasoning_llm(_prompt):
+            import json
+            return json.dumps(state["form"])
+
+        with patch(
+            "src.graph.nodes.extract.get_stream_writer",
+            return_value=lambda _event: None,
+        ):
+            result = make_extract_node(
+                unexpected_llm, reasoning_llm=reasoning_llm
+            )(state)
+
+        reports = result["form"]["History & Diagnostics"]["Reports"]
+        self.assertIn("deferred upload", reports)
+        self.assertIn("share them later", reports)
 
     def test_transcribed_report_word_uses_question_context(self):
         def unexpected_llm(_prompt):
