@@ -127,16 +127,124 @@ _PAIN_FACTOR_ANSWER_SIGNALS = {
     "Aggravating Factors": re.compile(
         r"\b(?:makes? (?:it|the pain|my pain) worse|worsens?|aggravat(?:e|es|ing)|"
         r"increase(?:s|d)? (?:the |my )?pain|pain (?:increase(?:s|d)?|gets worse)|"
-        r"triggers? (?:the |my )?pain|hurts? (?:more )?when|painful when)\b",
+        r"(?:gets?|becomes?) (?:even )?worse (?:when|with|while)|"
+        r"worse (?:when|with|while)|triggers? (?:the |my )?pain|"
+        r"hurts? (?:more )?(?:when|while)|painful (?:when|while))\b",
         re.I,
     ),
     "Relieving Factors": re.compile(
         r"\b(?:makes? (?:it|the pain|my pain) better|helps? (?:it|the pain|my pain)|"
+        r"makes? it feel better|"
+        r"(?:rest|resting|ice|icing|lying|standing|sleeping)\b.{0,30}\bhelps?|"
         r"reliev(?:e|es|ed|ing)|provides? relief|gives? relief|"
-        r"reduces? (?:the |my )?pain|eases? (?:the |my )?pain)\b",
+        r"reduces? (?:the |my )?pain|eases? (?:the |my )?pain|"
+        r"(?:when|while)\b.{0,55}\bfeel(?:s)? (?:fine|normal|okay|ok|better))\b",
         re.I,
     ),
 }
+
+_EXPLICIT_AGGRAVATING = re.compile(
+    r"\b(?:makes? (?:it|the pain|my pain) (?:even )?worse|worsens?|"
+    r"aggravat(?:e|es|ing)|increase(?:s|d)? (?:the |my )?pain|"
+    r"pain (?:increase(?:s|d)?|gets worse)|"
+    r"(?:gets?|becomes?) (?:even )?worse (?:when|with|while)|"
+    r"worse (?:when|with|while)|triggers? (?:the |my )?pain|"
+    r"hurts? (?:more )?(?:when|while)|painful (?:when|while)|"
+    r"starts? (?:to )?(?:pain|hurt)|"
+    r"starts? paining|pains? while|go(?:es)? numb|causes? (?:pain|numbness))\b",
+    re.I,
+)
+_EXPLICIT_RELIEVING = re.compile(
+    r"\b(?:makes? (?:it|the pain|my pain) better|helps? (?:it|the pain|my pain)|"
+    r"makes? it feel better|"
+    r"(?:rest|resting|ice|icing|lying|standing|sleeping)\b.{0,30}\bhelps?|"
+    r"reliev(?:e|es|ed|ing)|provides? relief|gives? (?:any )?relief|"
+    r"reduces? (?:the |my )?pain|eases? (?:the |my )?pain|"
+    r"nothing .{0,50} (?:helps?|reliev(?:e|es)|gives? (?:any )?relief)|"
+    r"(?:when|while)\b.{0,55}\bfeel(?:s)? (?:fine|normal|okay|ok|better))\b",
+    re.I,
+)
+_ALREADY_ANSWERED = re.compile(
+    r"\b(?:i (?:already|just) (?:answered|told|said|gave)|"
+    r"already (?:answered|told|provided|shared)|i did that)\b",
+    re.I,
+)
+
+
+def is_already_answered_response(text: str) -> bool:
+    return bool(_ALREADY_ANSWERED.search(" ".join(str(text or "").split())))
+
+
+def explicit_pain_factor_values(text: str) -> dict[str, str]:
+    """Extract only explicitly stated worse/better relationships.
+
+    This is deliberately not a general NLP extractor. It provides a reliable
+    fallback for direct answers that the model occasionally leaves blank.
+    """
+
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized:
+        return {}
+    clauses = [
+        clause.strip(" ,.;")
+        for clause in re.split(r"(?<=[.!?;])\s+|\s*,\s*(?=[A-Z])", normalized)
+        if clause.strip(" ,.;")
+    ]
+    aggravating = [clause for clause in clauses if _EXPLICIT_AGGRAVATING.search(clause)]
+    relieving = [clause for clause in clauses if _EXPLICIT_RELIEVING.search(clause)]
+    # A comma often separates a leading relationship clause from its outcome:
+    # "When I stand normally, I feel fine." The generic clause splitter cannot
+    # retain that relationship, so fall back to the complete sentence only when
+    # the same strict evidence regex matches it.
+    if not aggravating and _EXPLICIT_AGGRAVATING.search(normalized):
+        aggravating = [normalized.strip(" ,.;")]
+    if not relieving and _EXPLICIT_RELIEVING.search(normalized):
+        relieving = [normalized.strip(" ,.;")]
+    result: dict[str, str] = {}
+    if aggravating:
+        result["Aggravating Factors"] = "; ".join(dict.fromkeys(aggravating))
+    if relieving:
+        result["Relieving Factors"] = "; ".join(dict.fromkeys(relieving))
+    return result
+
+
+def apply_explicit_pain_factor_answers(
+    form: dict,
+    *,
+    active_section: str,
+    user_input: str,
+    history: list | None = None,
+) -> dict:
+    """Fill explicit factor answers into the active complaint only."""
+
+    if active_section != "Pain Assessment" and not active_section.startswith(
+        "Additional Complaint "
+    ):
+        return copy.deepcopy(form)
+
+    source_text = user_input
+    if is_already_answered_response(user_input) and history:
+        source_text = next(
+            (
+                str(entry.get("message") or "")
+                for entry in reversed(history)
+                if entry.get("role") == "user"
+                and not is_already_answered_response(entry.get("message", ""))
+            ),
+            user_input,
+        )
+    values = explicit_pain_factor_values(source_text)
+    if not values:
+        return copy.deepcopy(form)
+
+    result = copy.deepcopy(form)
+    target = result.get(active_section)
+    if not isinstance(target, dict):
+        return result
+    for field, value in values.items():
+        if field in target and not str(target.get(field) or "").strip():
+            target[field] = value
+    return result
 
 
 def guard_new_pain_factor_evidence(

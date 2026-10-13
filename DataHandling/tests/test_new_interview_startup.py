@@ -2,6 +2,8 @@ from pathlib import Path
 import unittest
 
 from app.forms.lifecycle import has_meaningful_form_data
+from src.forms.loader import load_form
+from src.graph.pure_functions.resume import build_resume_plan
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -50,15 +52,13 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
         self.assertIn("continue", recovery)
 
     def test_empty_reserved_draft_uses_single_opening_prompt(self):
+        plan = build_resume_plan(load_form("FRM-01").empty_form())
+        self.assertEqual(plan.phase, "interviewing")
+        self.assertEqual(plan.current_section, "Present Complaint")
+        self.assertIn("what brings you in today", plan.message)
+
         source = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
         start = source.index("# Resume must be deterministic.")
-        end = source.index("await send_text_message(", start)
-        selection = source[start:end]
-
-        self.assertIn("elif not _saved_patient_content:", selection)
-        self.assertLess(selection.index("elif not _saved_patient_content:"), selection.index("elif not _required_missing:"))
-        self.assertIn("resume_message = INITIAL_INTAKE_PROMPT", selection)
-
         resume_start = source.index("client_state[\"graph_history\"]", start)
         next_question = source.index("continue\n                            else:", resume_start)
         empty_draft_guard = source[resume_start:next_question]
@@ -76,7 +76,7 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
 
         self.assertNotIn("health_agent.generate_summary", resume_flow)
         self.assertNotIn("health_agent.talk_to_user", resume_flow)
-        self.assertIn("contextual_resume_question", resume_flow)
+        self.assertIn("_resume_plan.message", resume_flow)
 
     def test_short_clinical_first_reply_is_not_treated_as_confirmation(self):
         source = (
