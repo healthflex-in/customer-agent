@@ -7,8 +7,9 @@ import copy
 import time as _time
 from typing import Callable, Optional
 
+from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
-from src.prompts import TEMPLATE_PROMPT, CORRECTION_DETECTION_PROMPT, CORRECTION_APPLY_PROMPT
+from src.prompts import TEMPLATE_PROMPT, CORRECTION_DETECTION_PROMPT
 
 
 def _llm_check_no_prior_consultations(user_input: str, llm_complete: Callable[[str], str] = None) -> bool:
@@ -70,7 +71,7 @@ def extract_form_data_from_text(
         llm_response = llm_complete(enhanced_prompt)
         _extract_ms = (_time.perf_counter() - _t0) * 1000
         print(f"[timing] form_extraction_llm={_extract_ms:.0f}ms section={current_section!r}")
-        print("LLM FORMATTING RESPONSE:\n", llm_response)
+        print(f"[form_extraction] LLM response received ({len(llm_response)} chars)")
         json_str = extract_json_from_response(llm_response)
 
         if not json_str:
@@ -109,16 +110,18 @@ def extract_form_data_from_text(
         # The function guards itself: if Source is already filled it returns immediately.
         updated_form = _post_process_referral_from_input(updated_form, user_input)
 
-        print("Updated form sections after formatting:")
-        for section, fields in updated_form.items():
-            non_empty = {k: v for k, v in fields.items() if v}
-            if non_empty:
-                print(f"  {section}: {non_empty}")
+        filled_count = sum(
+            1
+            for fields in updated_form.values()
+            for value in fields.values()
+            if value
+        )
+        print(f"[form_extraction] Updated form ({filled_count} filled fields)")
 
         return updated_form
 
     except Exception as e:
-        print(f"Error in extract_form_data_from_text: {e}")
+        print(f"Form extraction failed: {error_type(e)}")
         return updated_form
 
 
@@ -243,11 +246,11 @@ def _post_process_referral_from_input(form: dict, user_input: str) -> dict:
 
     if matched_channel:
         form["Referral"]["Source"] = matched_channel
-        print(f"[referral_fill] Source extracted as channel: '{matched_channel}'")
+        print("[referral_fill] Source normalized to a known channel")
     elif user_lower not in {"no", "nope", "nah", "none", "nothing", "n/a"}:
         # Any other non-negative answer: store as-is and let validate_section decide
         form["Referral"]["Source"] = user_input.strip()
-        print(f"[referral_fill] Source filled from input (fallback): '{user_input.strip()}'")
+        print("[referral_fill] Source filled using deterministic fallback")
     return form
 
 
@@ -287,8 +290,39 @@ def detect_form_correction(
     Returns correction dict or None.
     Extracted from HealthAgent.detect_correction().
     """
+    if is_summary_mode:
+        from src.graph.pure_functions.correction_consistency import (
+            detect_pain_location_correction,
+        )
+        from src.graph.pure_functions.referral import normalize_referral_source
+
+        pain_location_correction = detect_pain_location_correction(user_input, form)
+        if pain_location_correction:
+            return pain_location_correction
+
+        referral_source = normalize_referral_source(user_input)
+        if referral_source:
+            return {
+                "is_correction": True,
+                "confidence": "high",
+                "old_value": form.get("Referral", {}).get("Source", ""),
+                "new_value": referral_source,
+                "field_name": "Source",
+                "section_name": "Referral",
+                "needs_clarification": False,
+                "clarification_question": "",
+            }
+
     try:
         if is_summary_mode:
+            schema_lines = []
+            for section, fields in form.items():
+                if not isinstance(fields, dict):
+                    continue
+                schema_lines.append(
+                    f"- {section}: " + ", ".join(str(field) for field in fields)
+                )
+            schema_text = "\n".join(schema_lines)
             prompt = f"""The user is reviewing their medical form summary and wants to make changes.
 
 User message: "{user_input}"
@@ -296,16 +330,30 @@ User message: "{user_input}"
 Current form data:
 {json.dumps(form, indent=2)}
 
-Analyze their message to identify which field they want to change and the new value.
+Valid form schema:
+{schema_text}
+
+Analyze the message semantically. Identify ALL independent corrections in the
+same message. A visible lifestyle detail (Work, Activity/Exercise, Smoking, or
+Alcohol) is a component of History & Diagnostics -> Current Lifestyle.
+
+Do not copy command language such as "please update", "add", or "change" into
+new_value. Store only the clinical fact the patient wants recorded. If the
+target or corrected value is genuinely ambiguous, request clarification rather
+than guessing.
 
 Respond with a JSON object:
 {{
     "is_correction": true/false,
     "confidence": "high"/"medium"/"low",
-    "old_value": "current value from form (if identifiable)",
-    "new_value": "what they want to change it to",
-    "field_name": "exact field name from form (if identifiable)",
-    "section_name": "exact section name from form (if identifiable)",
+    "updates": [
+      {{
+        "operation": "update" | "clear",
+        "section_name": "section name or visible lifestyle component container",
+        "field_name": "field name or Work/Activity/Smoking/Alcohol",
+        "new_value": "clinical value only; empty only for clear"
+      }}
+    ],
     "needs_clarification": true/false,
     "clarification_question": "question to ask if ambiguous"
 }}"""
@@ -320,10 +368,21 @@ Respond with a JSON object:
             return None
         data = json.loads(json_str)
         if data.get("is_correction", False):
+            updates = data.get("updates")
+            if isinstance(updates, list):
+                cleaned_updates = []
+                for update in updates[:8]:
+                    if not isinstance(update, dict):
+                        continue
+                    cleaned = dict(update)
+                    cleaned["source_text"] = user_input
+                    cleaned_updates.append(cleaned)
+                data["updates"] = cleaned_updates
+            data["source_text"] = user_input
             return data
         return None
     except Exception as e:
-        print(f"[detect_form_correction] Error: {e}")
+        print(f"[detect_form_correction] Failed: {error_type(e)}")
         return None
 
 
@@ -340,8 +399,8 @@ def apply_form_correction(
     updated_form = copy.deepcopy(form)
     field_name = correction_data.get("field_name", "")
     section_name = correction_data.get("section_name", "")
-    old_value = correction_data.get("old_value", "")
     new_value = correction_data.get("new_value", "")
+    operation = str(correction_data.get("operation") or "update").strip().lower()
 
     if correction_data.get("needs_clarification", False):
         q = correction_data.get("clarification_question", "")
@@ -350,29 +409,84 @@ def apply_form_correction(
     if not field_name or not section_name:
         return updated_form, False, "I'm not sure which field to update. Could you specify what you'd like to change?"
 
-    if section_name not in updated_form or field_name not in updated_form[section_name]:
+    from src.graph.pure_functions.form_schema import resolve_form_target
+
+    target = resolve_form_target(updated_form, section_name, field_name)
+    if target is None:
+        return (
+            updated_form,
+            False,
+            "I couldn't uniquely match that information to the intake form. "
+            "Please name the detail you want to change.",
+        )
+
+    section_name = target.section
+    field_name = target.field
+
+    if target.component is not None:
+        from src.graph.pure_functions.lifestyle import (
+            clear_lifestyle_component,
+            update_lifestyle_component,
+        )
+
+        diagnostics = updated_form.get("History & Diagnostics")
+        if not isinstance(diagnostics, dict) or "Current Lifestyle" not in diagnostics:
+            return updated_form, False, "I couldn't find the lifestyle information to update."
+        old_value = diagnostics.get("Current Lifestyle", "")
+        changed = (
+            clear_lifestyle_component(old_value, target.component)
+            if operation == "clear"
+            else update_lifestyle_component(
+                old_value,
+                target.component,
+                new_value,
+                correction_data.get("source_text", ""),
+            )
+        )
+        if changed is None or changed == old_value:
+            return updated_form, False, "What should the correct lifestyle information be?"
+        diagnostics["Current Lifestyle"] = changed
+        msg = (
+            f"I've updated {target.component} in your lifestyle information. "
+            "Would you like to update anything else? If everything is correct, "
+            "reply 'done' or 'yes' to confirm."
+        )
+        return updated_form, True, msg
+
+    if (
+        section_name not in updated_form
+        or not isinstance(updated_form[section_name], dict)
+        or field_name not in updated_form[section_name]
+    ):
         return updated_form, False, f"I couldn't find '{field_name}' in '{section_name}'. Could you clarify?"
 
-    try:
-        prompt = CORRECTION_APPLY_PROMPT.format(
-            field_name, section_name, old_value, new_value,
-            json.dumps(updated_form, indent=2),
-            section_name, field_name, new_value,
-        )
-        raw = llm_complete(prompt)
-        json_str = extract_json_from_response(raw)
-        if json_str:
-            new_form = json.loads(json_str)
-            if section_name in new_form and field_name in new_form[section_name]:
-                if new_form[section_name][field_name] != new_value:
-                    new_form[section_name][field_name] = new_value
-                updated_form = new_form
-            else:
-                updated_form[section_name][field_name] = new_value
-        else:
-            updated_form[section_name][field_name] = new_value
-    except Exception:
-        updated_form[section_name][field_name] = new_value
+    if operation == "clear":
+        new_value = ""
+    elif new_value is None or (isinstance(new_value, str) and not new_value.strip()):
+        return updated_form, False, "What should the correct information be?"
 
-    msg = f"I've updated '{field_name}' from '{old_value or '(empty)'}' to '{new_value}'."
+    # The detection step has already selected one validated form field. Apply
+    # only that value locally; accepting an LLM-generated copy of the complete
+    # form could alter unrelated clinical information.
+    old_value = updated_form[section_name][field_name]
+    updated_form[section_name][field_name] = new_value
+
+    from src.graph.pure_functions.correction_consistency import (
+        reconcile_pain_location_dependencies,
+    )
+
+    updated_form, related_changes = reconcile_pain_location_dependencies(
+        updated_form, correction_data
+    )
+    msg = f"I've updated {field_name} to '{new_value}'."
+    if related_changes:
+        if len(related_changes) == 1:
+            related_text = related_changes[0]
+        else:
+            related_text = ", ".join(related_changes[:-1]) + f", and {related_changes[-1]}"
+        msg += f" I also {related_text} so the record stays consistent."
+    msg += (
+        " Would you like to update anything else? If everything is correct, "
+        "reply 'done' or 'yes' to confirm."
+    )
     return updated_form, True, msg

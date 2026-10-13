@@ -64,12 +64,25 @@ def upload_bytes_to_s3(
     return f"https://{S3_BUCKET_NAME}.{base_host}/{key}"
 
 
-def download_bytes_from_s3(key: str) -> bytes:
+def download_bytes_from_s3(key: str, max_bytes: int | None = None) -> bytes:
     """Download file bytes from S3 using the object key."""
+    if max_bytes is not None and max_bytes <= 0:
+        raise ValueError("S3 download limit must be positive")
     client = get_s3_client()
     try:
         response = client.get_object(Bucket=S3_BUCKET_NAME, Key=key)
-        return response["Body"].read()
+        body = response["Body"]
+        if max_bytes is None:
+            return body.read()
+        data = bytearray()
+        while True:
+            remaining = max_bytes - len(data)
+            chunk = body.read(min(64 * 1024, remaining + 1))
+            if not chunk:
+                return bytes(data)
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise ValueError("S3 report exceeds the download size limit")
     except (ClientError, BotoCoreError) as exc:
         raise RuntimeError(f"Failed to download from S3: {exc}") from exc
 
@@ -86,4 +99,3 @@ def download_bytes_from_s3_url(s3_url: str) -> bytes:
         # https://bucket.s3.region.amazonaws.com/key format
         key = s3_url.split(f"{S3_BUCKET_NAME}/", 1)[1] if f"{S3_BUCKET_NAME}/" in s3_url else s3_url
         return download_bytes_from_s3(key)
-

@@ -12,13 +12,44 @@ import copy
 import json
 from typing import Callable, Optional
 
+from app.observability.privacy import error_type
 from src.prompts import REASONING_EXTRACTOR_PROMPT, PROM_EXTRACTOR_PROMPT
+
+
+_NON_CLINICAL_AGENT_PREFIXES = (
+    "I'm here to collect information for your clinical assessment",
+    "I’m here to collect information for your clinical assessment",
+)
+
+
+def _clinical_history(history: list) -> list:
+    """Remove boundary/FAQ turns before clinical extraction.
+
+    These turns remain in the visible transcript, but must never become
+    evidence for a clinical form field. The prefix fallback also protects
+    sessions created before the explicit marker was deployed.
+    """
+    excluded: set[int] = {
+        index
+        for index, entry in enumerate(history)
+        if entry.get("clinical_extraction") is False
+    }
+    for index, entry in enumerate(history):
+        message = str(entry.get("message") or "").strip()
+        if entry.get("role") != "agent" or not message.startswith(
+            _NON_CLINICAL_AGENT_PREFIXES
+        ):
+            continue
+        excluded.add(index)
+        if index and history[index - 1].get("role") == "user":
+            excluded.add(index - 1)
+    return [entry for index, entry in enumerate(history) if index not in excluded]
 
 
 def _build_conversation_text(history: list, user_input: str) -> str:
     """Build a readable conversation string including the current user message."""
     lines = []
-    for entry in history:
+    for entry in _clinical_history(history):
         role = "Sage" if entry.get("role") == "agent" else "Patient"
         msg = (entry.get("message") or "").strip()
         if msg:
@@ -51,6 +82,13 @@ def reasoning_extract(
             current_form=form_structure,
             form_structure=form_structure,
         )
+        if any(section.startswith("Additional Complaint ") for section in current_form):
+            prompt += (
+                "\nAdditional Complaint sections describe separate symptoms. Retain their exact Primary Complaint text. "
+                "Fill their details ONLY from patient statements about that particular additional symptom. "
+                "Never copy duration, severity, cause, or triggers from the original complaint. "
+                "Leave unprovided details empty."
+            )
 
         import time as _time
         _t0 = _time.perf_counter()
@@ -74,6 +112,8 @@ def reasoning_extract(
             if section in result and isinstance(fields, dict):
                 for field, value in fields.items():
                     if field in result[section]:
+                        if section.startswith("Additional Complaint ") and field == "Primary Complaint":
+                            continue
                         # Accept any non-null value including explicit "None" strings
                         if value is not None:
                             result[section][field] = str(value).strip() if value != "" else ""
@@ -86,5 +126,5 @@ def reasoning_extract(
         return result
 
     except Exception as e:
-        print(f"[reasoning_extract] Failed ({e}), falling back to regular extraction")
+        print(f"[reasoning_extract] Failed with {error_type(e)}; using regular extraction")
         return None

@@ -5,6 +5,8 @@ from typing import List, Optional
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
+from app.observability.ai_usage import bedrock_usage, tracked_ai_call
+from app.observability.privacy import error_type
 
 load_dotenv()
 
@@ -116,13 +118,19 @@ def query_bedrock(prompt: str, images_b64: Optional[List[str]] = None) -> str:
     print(f"[DEBUG] Number of images: {len(images_b64) if images_b64 else 0}")
     
     try:
-        response = client.converse(
-            modelId=inference_profile_id,
-            messages=[{"role": "user", "content": content}],
-            inferenceConfig={"maxTokens": 2000, "temperature": 0.3},
+        response = tracked_ai_call(
+            provider="aws_bedrock",
+            model=BEDROCK_MODEL_ID,
+            operation="report_summary",
+            call=lambda: client.converse(
+                modelId=inference_profile_id,
+                messages=[{"role": "user", "content": content}],
+                inferenceConfig={"maxTokens": 2000, "temperature": 0.3},
+            ),
+            usage_extractor=bedrock_usage,
         )
     except Exception as e:
-        error_msg = f"Bedrock API error: {str(e)}"
+        error_msg = f"Bedrock API error: {error_type(e)}"
         print(f"[DEBUG] {error_msg}")
         raise Exception(error_msg) from e
 
@@ -147,4 +155,3 @@ def query_bedrock(prompt: str, images_b64: Optional[List[str]] = None) -> str:
     # If we get here, no text block was found
     print(f"[DEBUG] No text block found in output_content: {output_content}")
     return ""
-

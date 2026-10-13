@@ -1,6 +1,8 @@
 # Secrets
 .env
 .env.*
+!.env.example
+!DataHandling/.env.example
 *.pem
 *.key
 config/
@@ -12,15 +14,28 @@ __pycache__/
 *.pyd
 .Python
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 dist/
 build/
 .venv/
 venv/
 env/
 
+# Runtime/session and diagnostic artifacts
+*.ses
+*.log
+*.tmp
+*.temp
+
 # macOS
 .DS_Store
 ._*
+Thumbs.db
 
 # Audio / media (runtime files)
 received_audio/

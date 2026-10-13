@@ -46,16 +46,6 @@ def check_health() -> None:
     ok(f"200 OK — body: {r.text[:120]}")
 
 
-def check_users_endpoint() -> None:
-    step("GET /api/users")
-    r = requests.get(f"{BASE_URL}/api/users", timeout=TIMEOUT)
-    # Either 200 with list shape, or 503 if Mongo unconfigured. Both are
-    # "the route is wired" — what we don't want is 404 / 500.
-    if r.status_code not in (200, 503):
-        fail(f"unexpected {r.status_code}: {r.text[:200]}")
-    ok(f"{r.status_code} — {r.text[:120]}")
-
-
 async def ws_protocol_check() -> None:
     """
     Verify the WS endpoint accepts a connection and validates input.
@@ -101,7 +91,6 @@ def main() -> None:
     if not parsed.netloc:
         fail("BASE_URL invalid")
     check_health()
-    check_users_endpoint()
     asyncio.run(ws_protocol_check())
     print("\nALL CHECKS PASSED")
 

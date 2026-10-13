@@ -1,0 +1,40 @@
+# Direct production dependencies. Compile this file to requirements-docker.txt
+# with the command documented in docs/LOCAL_DEV.md. Do not add libraries merely
+# because they existed in the legacy environment; every entry must have an
+# active runtime import or provide the selected ASGI/WebSocket server backend.
+
+# API and WebSocket server
+fastapi==0.141.1
+uvicorn==0.23.2
+websockets>=13.0,<15.1
+python-multipart>=0.0.18,<1
+
+# Configuration and persistence
+python-dotenv==1.2.3
+pymongo>=4.10,<5
+
+# AI conversation and graph orchestration
+google-genai>=1.7,<2
+llama-index-core==0.14.24
+llama-index-llms-google-genai==0.11.0
+langgraph==1.2.11
+
+# Audio transcription and decoding
+google-cloud-speech==2.31.1
+pydub==0.25.1
+
+# Report upload, validation, rendering, and summarization
+boto3>=1.37,<2
+Pillow==12.3.0
+pdf2image==1.17.0
+requests>=2.32,<3
+
+# Active brand/medical RAG collections
+chromadb==1.5.9
+
+# Operational telemetry
+prometheus-client>=0.19,<1
+starlette-prometheus>=0.10,<1
+structlog>=25.2,<26
+langfuse>=2,<3
+openinference-instrumentation-llama-index>=3,<4

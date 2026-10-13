@@ -3,10 +3,49 @@ LLM-powered summary generation and intent classification.
 Extracted from HealthAgent — no self.* references.
 """
 import json
+import re
 import time as _time
 from typing import Callable, Optional
 
+from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
+
+
+_REPORT_UPLOAD_DEFERRAL = re.compile(
+    r"^(?:i\s+)?(?:will|shall|can)\s+(?:share|upload|attach|send)"
+    r"(?:\s+(?:it|them|the\s+reports?))?\s+later\b|"
+    r"^(?:i['’]?ll\s+)?(?:share|upload|attach|send)"
+    r"(?:\s+(?:it|them|the\s+reports?))?\s+later\b|"
+    r"^(?:not\s+now|later)\b",
+    re.I,
+)
+
+
+def is_report_upload_deferral(
+    user_input: str | None, context_question: str | None
+) -> bool:
+    """Recognize a short deferral only in explicit report/upload context."""
+
+    question = " ".join(str(context_question or "").lower().split())
+    if not re.search(
+        r"\b(?:reports?|documents?|x[ -]?rays?|mri|ct scans?|blood reports?|"
+        r"scans?|upload|attach)\b",
+        question,
+    ):
+        return False
+    answer = " ".join(str(user_input or "").strip().split())
+    return bool(_REPORT_UPLOAD_DEFERRAL.search(answer))
+
+
+def reports_with_verified_upload(value: str) -> str:
+    """Keep extracted report findings, replacing obsolete absence claims."""
+    text = str(value or "").strip()
+    if re.search(r"^(?:none|not mentioned|not applicable|no (?:(?:relevant|related|diagnostic) ){0,3}(?:reports?|documents?|scans?)\b)", text.lower()) or re.search(r"\b(?:reports?|documents?) (?:are )?(?:not available|unavailable)\b", text.lower()):
+        text = ""
+    receipt = "Diagnostic documents uploaded and attached to this assessment"
+    if receipt.lower() in text.lower():
+        return text
+    return f"{text}; {receipt}" if text else receipt
 
 
 def generate_interview_summary(
@@ -14,52 +53,21 @@ def generate_interview_summary(
     history: list,
     llm_complete: Callable[[str], str],
 ) -> str:
+    """Render the one canonical summary format used for initial and replay views.
+
+    Summary rendering must be idempotent: identical form data always produces
+    identical text. Using a narrative model here caused format drift and could
+    reintroduce stale facts after corrections.
     """
-    Generate a patient-friendly narrative summary of the filled form.
-    Extracted from HealthAgent.generate_summary().
-    """
-    form_json = json.dumps(form, indent=2, ensure_ascii=False)
-    prompt = f"""You are an empathetic medical assistant. Convert the structured medical intake
-form below into a short, patient-friendly summary.
-
-FORM DATA (JSON):
-{form_json}
-
-Write the summary as if you are explaining it to the patient in simple, everyday language:
-1. Start with 1-2 short paragraphs narrating the overall story (main problem, duration, onset,
-   pain details, past consultations, health history, goals).
-2. Add a Key points section with 3-7 bullet points.
-3. Avoid technical language. Prefer plain phrases.
-4. NEVER leave raw field names in brackets.
-5. Do NOT use markdown bold (**) or backticks.
-6. Use "- " for bullet points.
-7. End with exactly: "Is this information correct, or would you like to make any changes?"
-8. NEVER say "The form is complete" or any variation.
-
-CRITICAL — handle empty/negative field values honestly:
-- Fields with values like "None", "No specific goals", "Not mentioned", "Not applicable", "No past surgeries", "No goals mentioned", "nothing" → summarize as ABSENCE, not presence.
-  e.g. "You haven't mentioned any specific treatment goals" NOT "you have clear goals"
-  e.g. "No past surgeries or health conditions were mentioned" NOT "your health history is clear"
-- NEVER infer positive attributes from empty or negative field values.
-- Only state something as a fact if the form field contains a real positive value.
-
-Return ONLY the summary text."""
-
-    try:
-        _t0 = _time.perf_counter()
-        summary = llm_complete(prompt).strip().replace("**", "")
-        print(f"[timing] generate_summary_llm={(_time.perf_counter() - _t0) * 1000:.0f}ms")
-        forbidden = ["the form is complete", "no further questions are needed",
-                     "all fields are filled", "the interview is finished"]
-        if any(p in summary.lower() for p in forbidden):
-            summary = _fallback_summary(form)
-        return summary or _fallback_summary(form)
-    except Exception as e:
-        print(f"[generate_interview_summary] Error: {e}")
-        return _fallback_summary(form)
+    return _fallback_summary(form)
 
 
 def _fallback_summary(form: dict) -> str:
+    from src.graph.pure_functions.additional_complaint import (
+        normalize_additional_complaints,
+    )
+
+    form = normalize_additional_complaints(form)
     parts = ["Here's a summary of the information you've provided:\n"]
     for section, fields in form.items():
         if isinstance(fields, dict):
@@ -82,30 +90,154 @@ def classify_summary_response(
     Extracted from HealthAgent.classify_summary_response().
     Returns dict with keys: intent, correction_text, has_reports, wants_upload.
     """
+    normalized = re.sub(r"[^a-z0-9\s]", " ", user_input.lower())
+    normalized = " ".join(normalized.split())
+
+    # Reviewing the assistant's own summary is an intake operation, not a
+    # request for medical advice and not a request to edit a field.
+    if re.search(
+        r"\b(?:show|share|send|repeat|see|view|read)\b.{0,45}"
+        r"\b(?:summary|information|details)\b"
+        r"|\b(?:summary|information|details)\b.{0,45}\b(?:again|updated)\b",
+        normalized,
+    ):
+        return {
+            "intent": "show_summary",
+            "correction_text": None,
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
+    # New documents and acknowledgements are different actions. Check additions
+    # first: a patient may have uploaded one file AND have another to share.
+    report_word = r"(?:reports?|documents?|files?|x rays?|xrays?|mri|ct scans?|blood tests?)"
+    additional = bool(re.search(
+        rf"\b(?:other|another|additional|more|new|second)\s+(?:\w+\s+){{0,2}}{report_word}\b",
+        normalized,
+    )) and not re.search(r"\b(?:no|not have|dont have|don t have|do not have)\s+(?:any )?(?:other|another|additional|more|new|second)\b", normalized)
+    if additional:
+        declined = bool(re.search(r"\b(?:share|show|give).*\b(?:doctor|clinician)\b|\b(?:dont|don t|do not|not|won t|will not).*\bupload\b", normalized))
+        return {"intent": "has_reports", "has_reports": True,
+                "additional_reports": True, "wants_upload": not declined,
+                "correction_text": None}
+
+    if re.search(r"\b(?:already attach(?:ed)?|u(?:p)?loaded|u loaded|done uploading)\b", normalized) and not re.search(
+        r"\b(?:not|never|dont|don t|do not|haven t|have not)\b", normalized
+    ):
+        return {"intent": "has_reports", "wants_upload": False,
+                "upload_claimed": True, "correction_text": None}
+
+    if normalized in {
+        "yes", "correct", "looks good", "that is right", "thats right",
+        "done", "ok done", "okay done", "all done", "finished",
+        "yes done", "yes correct",
+    }:
+        return {
+            "intent": "confirm",
+            "correction_text": None,
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
+    from src.graph.pure_functions.correction_consistency import (
+        detect_pain_location_correction,
+    )
+
+    if detect_pain_location_correction(user_input, {}):
+        return {
+            "intent": "request_change",
+            "correction_text": user_input.strip(),
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
+    # Explicit habit corrections are schema-aware updates. Alcohol/smoking are
+    # components inside Current Lifestyle, not new complaints or questions.
+    if re.search(r"\b(?:update|change|correct|actually|but)\b", normalized) and re.search(
+        r"\b(?:smoke|smoking|drink|drinks|drinking|alcohol)\b", normalized
+    ):
+        return {
+            "intent": "request_change",
+            "correction_text": user_input.strip(),
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
+    from src.graph.pure_functions.additional_complaint import is_explicit_symptom_addition
+    if is_explicit_symptom_addition(user_input):
+        from src.graph.pure_functions.additional_complaint import (
+            concise_additional_complaint,
+        )
+        return {"intent": "new_complaint", "correction_text": None,
+                "addition_text": concise_additional_complaint(user_input),
+                "has_reports": None, "wants_upload": None}
+
+    # A direct channel answer at summary time commonly follows a referral
+    # question that was displayed just before a reconnect/race. Treat it as a
+    # concrete field update, never as an ambiguous generic correction.
+    from src.graph.pure_functions.referral import normalize_referral_source
+
+    if normalize_referral_source(user_input):
+        return {
+            "intent": "request_change",
+            "correction_text": user_input.strip(),
+            "has_reports": None,
+            "wants_upload": None,
+        }
+    vague_change_responses = {
+        "no", "nope", "incorrect", "wrong", "not correct", "not right",
+        "this is incorrect", "this is wrong", "this is not correct",
+        "that is incorrect", "that is wrong", "that is not correct",
+        "it is incorrect", "it is wrong", "it is not correct",
+        "i want to make changes", "i want some changes", "i want a change",
+        "want to make changes", "want some changes", "make changes",
+        "i would like to make changes", "i would like to make some changes",
+        "i would like to make any changes", "i need to change something",
+        "change something",
+    }
+    if normalized in vague_change_responses:
+        return {
+            "intent": "request_change",
+            "correction_text": None,
+            "has_reports": None,
+            "wants_upload": None,
+        }
+
     prompt = f"""You are assisting with a medical intake interview. The patient has just been shown
 a summary and asked: "Is this information correct, or would you like to make any changes?"
+
+SUMMARY SHOWN TO THE PATIENT:
+{summary_text}
 
 The patient responded: "{user_input}"
 
 Classify their intent. Choose EXACTLY ONE intent from below:
 
 - "confirm": patient says YES — the summary is correct (e.g. "yes", "correct", "looks good", "that's right", "ok", "sure", "yep")
-- "new_complaint": patient reveals a NEW specific health issue, pain, or symptom that was NOT in the summary
+- "new_complaint": patient reveals an ADDITIONAL specific health issue, pain, or symptom that was NOT in the summary
   Use when: patient says "i have neck pain", "actually my knee hurts", "i forgot to mention my back", "i have a complaint", "wait i have pain" etc.
   This means they want to ADD new medical information, not correct existing data.
+  Set addition_text to ONLY the concise clinical complaint (for example
+  "tingling in the left fingers"), never the patient's instruction words.
 - "request_change": patient wants to CORRECT or UPDATE something already stated in the summary
   CRITICAL: "no" in response to "Is this correct?" → request_change (no, it is NOT correct)
   Also: "not right", "wrong", "incorrect", "change X to Y", "actually it was X"
+  Set correction_text to null when the patient only says that something is wrong or asks to make
+  changes without identifying the information and its corrected value. Otherwise set it to the
+  patient's exact correction request.
 - "has_reports": patient mentions having diagnostic reports (MRI, X-ray, scans)
 - "no_reports": patient confirms they do NOT have reports
 - "question": patient is asking a question about the process
 
-Priority: if the patient mentions a body part or symptom (pain, neck, back, knee, shoulder, etc.) → "new_complaint" over "request_change".
+Priority: explicit replacement/correction language such as "not X, it is Y", "change X to Y",
+or "the left knee, not the right" → "request_change", even when it mentions a body part.
+Use "new_complaint" only when the information is additional rather than a replacement.
 
 Respond ONLY with compact JSON:
 {{
   "intent": "confirm" | "new_complaint" | "request_change" | "has_reports" | "no_reports" | "question",
   "correction_text": string | null,
+  "addition_text": string | null,
   "has_reports": true | false | null,
   "wants_upload": true | false | null
 }}"""
@@ -125,11 +257,12 @@ Respond ONLY with compact JSON:
         return {
             "intent": data["intent"],
             "correction_text": data.get("correction_text"),
+            "addition_text": data.get("addition_text"),
             "has_reports": data.get("has_reports"),
             "wants_upload": data.get("wants_upload"),
         }
     except Exception as e:
-        print(f"[classify_summary_response] Error: {e}")
+        print(f"[classify_summary_response] Failed: {error_type(e)}")
         return {}
 
 
@@ -146,6 +279,42 @@ def classify_reports_intent(
     """
     import re as _re
     lowered = user_input.lower()
+    report_words = ["report", "mri", "x-ray", "xray", "ct scan", "scan", "ultrasound",
+                    "blood test", "lab", "x ray", "imaging", "film", "result"]
+    _cq_str = str(context_question) if not isinstance(context_question, str) else context_question
+    asking_about_reports = any(w in _cq_str.lower() for w in report_words) if _cq_str else False
+
+    if is_report_upload_deferral(user_input, context_question):
+        return {
+            "has_reports": True,
+            "wants_upload": False,
+            "deferred_upload": True,
+        }
+
+    decline_upload_indicators = [
+        "don't want to upload", "dont want to upload", "do not want to upload",
+        "won't upload", "wont upload", "will not upload", "not upload here",
+        "don't upload here", "dont upload here", "not comfortable uploading",
+        "share directly with the doctor", "share directly with my doctor",
+        "share directly with the clinician", "show directly to the doctor",
+        "show it to the doctor", "bring it to the appointment",
+        "bring them to the appointment", "share in person",
+    ]
+    accept_upload_indicators = [
+        "want to upload", "will upload", "i'll upload", "ill upload",
+        "can upload", "upload it here", "upload them here",
+    ]
+    deterministic_upload_preference = None
+    if any(ind in lowered for ind in decline_upload_indicators):
+        deterministic_upload_preference = False
+    elif any(ind in lowered for ind in accept_upload_indicators):
+        deterministic_upload_preference = True
+    direct_share_with_clinician = bool(
+        _re.search(
+            r"\bshare\b.{0,60}\bdirectly\b.{0,40}\b(?:doctor|clinician)\b",
+            lowered,
+        )
+    )
 
     # Use specific multi-word phrases only — short fragments like "i do" match
     # substrings of "i dont" and cause false positives.
@@ -156,10 +325,32 @@ def classify_reports_intent(
         "i do have scans", "i do have my reports",
     ]
     # Whole-word check for common short confirmations to avoid "i dont" → "i do"
-    short_confirmations = ["yes i do", "yes, i do", "yes i have"]
+    short_confirmation = " ".join(_re.sub(r"[^a-z0-9\s]", " ", lowered).split())
+    confirms_reports_question = asking_about_reports and short_confirmation in {
+        "yes", "yes i do", "yes i have", "yes i have one", "yes i have reports",
+    }
     explicitly_has = (
         any(ind in lowered for ind in has_reports_indicators)
-        or any(conf in lowered for conf in short_confirmations)
+        or confirms_reports_question
+        or bool(_re.search(
+            r"\bi (?:do )?have (?:the |an? |some |my )?"
+            r"(?:x[ -]?rays?|mri|ct scans?|scans?|reports?|imaging|films?)\b",
+            lowered,
+        ))
+        or (
+            asking_about_reports
+            and (
+                direct_share_with_clinician
+                or any(
+                    phrase in lowered
+                    for phrase in (
+                        "show it to the doctor",
+                        "bring it to the appointment",
+                        "bring them to the appointment",
+                    )
+                )
+            )
+        )
     )
 
     # Fast definite-negative check: if the user clearly has no reports, skip the LLM call
@@ -174,18 +365,17 @@ def classify_reports_intent(
     explicitly_no = any(ind in lowered for ind in no_reports_indicators)
 
     if explicitly_has:
-        return {"has_reports": True, "wants_upload": None}
+        return {
+            "has_reports": True,
+            "wants_upload": deterministic_upload_preference,
+        }
     if explicitly_no and not context_question:
         # Only skip LLM when there's no question context (can't be a "yes" to a report question)
         return {"has_reports": False, "wants_upload": False}
 
     # If the user is clearly talking about symptoms/pain (no report words at all),
     # skip the LLM call — it would return null anyway.
-    report_words = ["report", "mri", "x-ray", "xray", "ct scan", "scan", "ultrasound",
-                    "blood test", "lab", "x ray", "imaging", "film", "result"]
     has_any_report_word = any(w in lowered for w in report_words)
-    _cq_str = str(context_question) if not isinstance(context_question, str) else context_question
-    asking_about_reports = any(w in _cq_str.lower() for w in report_words) if _cq_str else False
 
     if not has_any_report_word and not asking_about_reports:
         # No report-related content in input or context → definitely null, skip LLM
@@ -214,6 +404,7 @@ RULES:
 - has_reports = false ONLY if they explicitly say they do NOT have any reports/scans.
 - When in doubt → has_reports = null (never guess true from unrelated context).
 - wants_upload = true only if they clearly want to upload now.
+- wants_upload = false if they decline uploading or say they will share the report directly with their doctor/clinician.
 """
     try:
         raw = llm_complete(prompt)
@@ -227,7 +418,9 @@ RULES:
         wants_upload = data.get("wants_upload")
         if explicitly_has and has_reports is not False:
             has_reports = True
+        if deterministic_upload_preference is not None:
+            wants_upload = deterministic_upload_preference
         return {"has_reports": has_reports, "wants_upload": wants_upload}
     except Exception as e:
-        print(f"[classify_reports_intent] Error: {e}")
+        print(f"[classify_reports_intent] Failed: {error_type(e)}")
         return {}

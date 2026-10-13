@@ -5,22 +5,77 @@ then handle the result (confirm, change, reports, etc.).
 from typing import Callable
 
 from src.graph.state import InterviewState
-from src.graph.pure_functions.summary import classify_summary_response
+from src.graph.pure_functions.summary import classify_summary_response, _fallback_summary, reports_with_verified_upload
+from src.graph.nodes.generate import required_response_before_summary
 
 
 def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
     def classify_summary_intent_node(state: InterviewState) -> dict:
+        from src.graph.pure_functions.additional_complaint import (
+            normalize_additional_complaints,
+        )
+        normalized_form = normalize_additional_complaints(state["form"])
+        form_was_normalized = normalized_form != state["form"]
+        if form_was_normalized:
+            state = dict(state)
+            state["form"] = normalized_form
         user_input = state["user_input"]
 
-        # Find the last agent summary message (contains the "Is this information correct" phrase)
-        summary_text = ""
-        for entry in reversed(state["history"]):
-            if entry.get("role") == "agent" and "Is this information correct" in entry.get("message", ""):
-                summary_text = entry["message"]
-                break
+        # Historical summaries describe the record before later corrections.
+        # Classify against current structured facts, so old key points cannot
+        # steer a subsequent correction or approval back to outdated details.
+        summary_text = _fallback_summary(state["form"])
 
-        result = classify_summary_response(user_input, summary_text, llm_complete)
-        return {"summary_intent": result}
+        from src.graph.pure_functions.complaint_severity import explicit_severity_updates, complaint_targets, SCORE
+        from src.graph.pure_functions.additional_complaint import (
+            additional_complaint_removal_target,
+            additional_complaint_replacement,
+            split_update_and_addition,
+        )
+        removal_target = additional_complaint_removal_target(
+            user_input, state["form"], state.get("current_section")
+        )
+        combined = split_update_and_addition(user_input)
+        if removal_target:
+            result = {
+                "intent": "remove_additional_complaint",
+                "section": removal_target,
+            }
+        elif combined:
+            correction_text, addition_text = combined
+            updates = explicit_severity_updates(
+                state["form"], correction_text, "Pain Assessment",
+                "On a scale of 0 to 10, how severe is the pain?",
+            )
+            result = {"intent": "new_complaint", "correction_text": correction_text,
+                      "addition_text": addition_text, "severity_updates": updates}
+        elif (updates := explicit_severity_updates(
+            state["form"], user_input, "Pain Assessment"
+        )):
+            result = {"intent": "request_change", "correction_text": user_input}
+        elif replacement := additional_complaint_replacement(user_input):
+            additional_sections = [
+                name for name in state["form"]
+                if name.startswith("Additional Complaint ")
+            ]
+            if additional_sections:
+                result = {
+                    "intent": "correct_additional_complaint",
+                    "section": additional_sections[-1],
+                    "replacement": replacement,
+                }
+            else:
+                result = classify_summary_response(user_input, summary_text, llm_complete)
+        elif SCORE.search(user_input) and len(complaint_targets(state["form"])) > 1:
+            result = {"intent": "request_change", "correction_text": None}
+        else:
+            result = classify_summary_response(user_input, summary_text, llm_complete)
+        history = list(state["history"])
+        history.append({"role": "user", "message": user_input})
+        patch = {"summary_intent": result, "history": history}
+        if form_was_normalized:
+            patch["form"] = normalized_form
+        return patch
 
     return classify_summary_intent_node
 
@@ -33,30 +88,138 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
 
         patch: dict = {}
 
-        if intent == "new_complaint":
-            # Patient revealed a new specific complaint — reopen the interview,
-            # clear all "Not applicable" placeholders from complaint/pain sections,
-            # and switch to specific_complaint mode so the conductor asks follow-ups.
-            _na_values = {
-                "not applicable", "general visit — no specific complaint",
-                "not applicable — no pain reported", "not applicable — general visit",
-                "not applicable — general visit.", "none",
+        if intent == "show_summary":
+            response_text = _fallback_summary(state["form"])
+            return {
+                "response_text": response_text,
+                "history": state["history"] + [
+                    {"role": "agent", "message": response_text}
+                ],
             }
-            updated_form = {
-                section: dict(fields) if isinstance(fields, dict) else fields
-                for section, fields in state["form"].items()
+        elif intent == "remove_additional_complaint":
+            import copy
+            updated_form = copy.deepcopy(state["form"])
+            section = summary_intent.get("section")
+            removed = updated_form.pop(section, None)
+            updated_sections = [
+                name for name in state.get("form_sections", list(updated_form))
+                if name != section
+            ]
+            if removed is not None:
+                response_text = (
+                    "I've removed that additional complaint. Here is the updated information:\n\n"
+                    + _fallback_summary(updated_form)
+                )
+                return {
+                    "form": updated_form,
+                    "form_sections": updated_sections,
+                    "current_section": (
+                        updated_sections[-1] if updated_sections else "Present Complaint"
+                    ),
+                    "phase": "summary",
+                    "correction_applied": True,
+                    "response_text": response_text,
+                    "history": state["history"] + [
+                        {"role": "agent", "message": response_text}
+                    ],
+                }
+        elif intent == "new_complaint":
+            from src.graph.pure_functions.additional_complaint import (
+                capture_additional_complaint,
+                validated_additional_complaint,
+            )
+            from src.graph.pure_functions.question_plan import question_for_missing_fields
+            import copy
+            base_form = copy.deepcopy(state["form"])
+            applied_changes = []
+            for (section, field), value in summary_intent.get("severity_updates", {}).items():
+                base_form[section][field] = value
+                label = (base_form.get("Pain Assessment", {}).get("Primary Location of Pain")
+                         or base_form.get("Present Complaint", {}).get("Primary Complaint")
+                         or "existing complaint")
+                applied_changes.append(f"{label} pain to {value}")
+            correction_text = summary_intent.get("correction_text")
+            if correction_text and not applied_changes:
+                from src.graph.pure_functions.form_extraction import detect_form_correction, apply_form_correction
+                correction = detect_form_correction(
+                    correction_text, base_form, is_summary_mode=True,
+                    llm_complete=llm_complete,
+                )
+                if correction:
+                    corrected, success, _ = apply_form_correction(correction, base_form, llm_complete)
+                    if success:
+                        base_form = corrected
+                        applied_changes.append("the requested existing information")
+            complaint_candidate = (
+                summary_intent.get("addition_text") or state["user_input"]
+            )
+            complaint_label = validated_additional_complaint(complaint_candidate)
+            if complaint_label is None:
+                response_text = (
+                    "I understand that you want to add another concern, but I "
+                    "couldn't identify the symptom clearly. Please state only the "
+                    "new symptom and body area, for example: 'tingling in my left hand'."
+                )
+                return {
+                    "correction_applied": False,
+                    "response_text": response_text,
+                    "history": state["history"] + [
+                        {"role": "agent", "message": response_text}
+                    ],
+                }
+            updated_form, added_section = capture_additional_complaint(
+                base_form, complaint_label
+            )
+            added_complaint = updated_form[added_section]["Primary Complaint"]
+            missing = [(added_section, field) for field, value in updated_form[added_section].items() if not value]
+            response_text = (
+                ("I've updated " + ", ".join(applied_changes) + " and added your new concern: "
+                 if applied_changes else "I've added what you just shared alongside your earlier concern: ")
+                + added_complaint
+                + "\n\nFor this additional concern, "
+                + question_for_missing_fields(missing, {})
+            )
+            return {
+                "form": updated_form,
+                "form_sections": list(updated_form),
+                "current_section": added_section,
+                "missing_fields": [field for _, field in missing],
+                "question_field_ids": [
+                    f"{section}.{field}" for section, field in missing[:4]
+                ],
+                "phase": "interviewing",
+                "visit_context": "specific_complaint",
+                "response_text": response_text,
+                "history": state["history"] + [{"role": "agent", "message": response_text}],
             }
-            for _sec in ["Present Complaint", "Pain Assessment", "Previous Consultations"]:
-                if _sec in updated_form and isinstance(updated_form[_sec], dict):
-                    for _field in list(updated_form[_sec].keys()):
-                        if str(updated_form[_sec].get(_field, "")).strip().lower() in _na_values:
-                            updated_form[_sec][_field] = ""
-            patch["form"] = updated_form
-            patch["phase"] = "interviewing"
-            patch["visit_context"] = "specific_complaint"
-            # response_text left empty — generate_question will ask about the complaint
-
+        elif intent == "correct_additional_complaint":
+            import copy
+            updated_form = copy.deepcopy(state["form"])
+            section = summary_intent.get("section")
+            replacement = str(summary_intent.get("replacement") or "").strip()
+            if section in updated_form and replacement:
+                updated_form[section]["Primary Complaint"] = replacement
+                response_text = (
+                    f"I've corrected the additional concern to {replacement}. "
+                    "Would you like to update anything else? If everything is correct, you can confirm."
+                )
+                return {
+                    "form": updated_form,
+                    "correction_applied": True,
+                    "response_text": response_text,
+                    "history": state["history"] + [
+                        {"role": "agent", "message": response_text}
+                    ],
+                }
         elif intent == "confirm":
+            required_response = required_response_before_summary(
+                state, list(state["history"])
+            )
+            if required_response is not None:
+                # An old/resumed session may reach summary with legacy blank
+                # fields. Never terminally complete it until it goes through
+                # the same required-field gate as fresh interviews.
+                return required_response
             response_text = (
                 "Thank you for confirming. Your medical information has been recorded. "
                 "You can now close this page. Our team will review your information and get back to you soon."
@@ -66,12 +229,62 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
 
         elif intent == "has_reports":
-            if wants_upload:
+            updated_form = {section: dict(fields) if isinstance(fields, dict) else fields
+                            for section, fields in state["form"].items()}
+            diagnostics = updated_form.setdefault("History & Diagnostics", {})
+            if state.get("reports_uploaded"):
+                diagnostics["Reports"] = reports_with_verified_upload(diagnostics.get("Reports", ""))
+            elif not summary_intent.get("upload_claimed"):
+                diagnostics["Reports"] = "Patient reports having diagnostic documents; upload not yet verified"
+            patch["form"] = updated_form
+            if state.get("reports_uploaded") and summary_intent.get("additional_reports"):
+                diagnostics["Reports"] += "; patient has additional reports to share"
+            if summary_intent.get("additional_reports") and wants_upload is not False:
+                response_text = (
+                    "You can upload the additional report here. Any documents you previously "
+                    "uploaded will remain attached to this assessment."
+                )
+                patch.update(awaiting_report_upload=True, request_attachment=True,
+                             response_text=response_text,
+                             history=state["history"] + [{"role": "agent", "message": response_text}])
+            elif state.get("reports_uploaded") and wants_upload is False and not summary_intent.get("upload_claimed"):
+                response_text = "Your uploaded documents remain attached. You can share the additional reports directly with your clinician. Is the summary otherwise correct?"
+                patch.update(awaiting_report_upload=False, request_attachment=False,
+                             response_text=response_text,
+                             history=state["history"] + [{"role": "agent", "message": response_text}])
+            elif state.get("reports_uploaded"):
+                response_text = (
+                    "The documents you just uploaded are already attached to this assessment. "
+                    "I've updated your report information to reflect the upload. Is the summary otherwise correct, "
+                    "or would you like to change any information?"
+                )
+                patch["awaiting_report_upload"] = False
+                patch["request_attachment"] = False
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
+            elif summary_intent.get("upload_claimed"):
+                response_text = (
+                    "Thank you for letting me know. I cannot verify an attached file for this assessment yet. "
+                    "You can continue reviewing your summary and share the documents with your clinician. "
+                    "Is the summary correct, or would you like to change anything?"
+                )
+                patch["awaiting_report_upload"] = False
+                patch["request_attachment"] = False
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
+            elif wants_upload is False:
+                response_text = "You can share your reports directly with your clinician. Is the summary correct, or would you like to change anything?"
+                patch["awaiting_report_upload"] = False
+                patch["request_attachment"] = False
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
+            elif wants_upload:
                 response_text = (
                     "Great! Since you mentioned you have reports, would you like to upload them? "
                     "You can upload MRI, X-ray, CT scan, or blood test reports."
                 )
                 patch["awaiting_report_upload"] = True
+                patch["request_attachment"] = True
                 patch["response_text"] = response_text
                 patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
             else:
@@ -81,6 +294,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                     "You can upload MRI, X-ray, CT scan, or blood test reports."
                 )
                 patch["awaiting_report_upload"] = True
+                patch["request_attachment"] = True
                 patch["response_text"] = response_text
                 patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
 
@@ -92,14 +306,30 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             }
             if "History & Diagnostics" in updated_form and isinstance(updated_form["History & Diagnostics"], dict):
                 updated_form["History & Diagnostics"]["Reports"] = (
+                    "Diagnostic documents uploaded and attached; no additional reports available"
+                    if state.get("reports_uploaded") else
                     "No relevant diagnostic reports available for this issue"
                 )
             patch["form"] = updated_form
-            # response_text stays empty — edges will route to generate_summary to re-show
+            response_text = "I've noted your report information. Is the summary otherwise correct, or would you like to change anything?"
+            patch.update(response_text=response_text, awaiting_report_upload=False,
+                         request_attachment=False,
+                         history=state["history"] + [{"role": "agent", "message": response_text}])
 
         elif intent == "request_change":
-            # response_text stays empty — edges will route to apply_correction
-            pass
+            # A general rejection ("this is wrong", "I want changes") does not
+            # contain enough information to update a clinical record safely.
+            # Stop this turn and ask for the exact correction. A specific reply
+            # on the next turn will be detected and applied.
+            if not summary_intent.get("correction_text"):
+                response_text = (
+                    "Of course. Which information would you like to change, "
+                    "and what should the correct information be?"
+                )
+                patch["response_text"] = response_text
+                patch["history"] = state["history"] + [
+                    {"role": "agent", "message": response_text}
+                ]
 
         elif intent == "question":
             response_text = (
