@@ -37,10 +37,20 @@ MONGO_TLS_CA_FILE: str | None = os.getenv("MONGO_TLS_CA_FILE")
 # Optional secret used only to correlate pseudonymous subjects across events.
 OBSERVABILITY_HASH_KEY: str | None = os.getenv("OBSERVABILITY_HASH_KEY")
 
+# Dev MongoDB — used when requests originate from dev.customerai.stance.health
+DEV_MONGO_URI: str | None = os.getenv(
+    "DEV_MONGO_URI",
+    "mongodb+srv://healthflex-dev:FUvgMqSppKigmKHK@healthflex-dev.5kbaq08.mongodb.net/stance-dashboard?retryWrites=true&w=majority",
+)
+DEV_MONGO_DB_NAME: str = os.getenv("DEV_MONGO_DB_NAME", "stance-development")
+
+DEV_ORIGIN: str = "https://dev.customerai.stance.health"
+
 
 # ── HTTP / CORS ────────────────────────────────────────────────────────────
 _DEFAULT_CORS_ALLOWED_ORIGINS = [
     "https://customerai.stance.health",
+    "https://dev.customerai.stance.health",
     "https://customer-agent-mu.vercel.app",
     "http://localhost:3000",
     "http://localhost:8080",

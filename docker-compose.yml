@@ -1,9 +1,9 @@
 services:
-  healthflex-agent:
+  customer-agent-prod:
     build:
       context: .
       dockerfile: DataHandling/deployment/Dockerfile
-    container_name: healthflex-customer-agent
+    container_name: customer-agent-prod
     ports:
       # Local development entry point. Keep production-connected testing off
       # external interfaces on the developer machine.
@@ -35,7 +35,7 @@ services:
     restart: unless-stopped
     
     networks:
-      - healthflex-network
+      - customer-agent-network
     
     # Resource limits (adjust based on your EC2 instance)
     deploy:
@@ -48,5 +48,5 @@ services:
           memory: 2G
 
 networks:
-  healthflex-network:
+  customer-agent-network:
     driver: bridge
