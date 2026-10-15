@@ -153,56 +153,56 @@ class ReportJobTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertEqual(server_source.count("asyncio.create_task("), 1)
         self.assertIn(
-            "asyncio.create_task(_report_worker_loop())",
+            "asyncio.create_task(\n            _report_worker_loop(_report_worker_stop)\n        )",
             server_source,
         )
         self.assertNotIn("create_task(run_blocking(", server_source)
 
     def test_report_publish_is_atomic_and_latest_job_guarded(self):
-        server_source = (
-            Path(__file__).resolve().parents[1] / "server.py"
+        worker_source = (
+            Path(__file__).resolve().parents[1] / "app" / "jobs" / "worker.py"
         ).read_text(encoding="utf-8")
-        self.assertIn('"reportProcessing.jobId": job["_id"]', server_source)
+        self.assertIn('"reportProcessing.jobId": job["_id"]', worker_source)
         self.assertIn(
             '"form_data.History & Diagnostics.Reports": reports_text',
-            server_source,
+            worker_source,
         )
-        self.assertNotIn('{"$set": {"form_data": _fd', server_source)
+        self.assertNotIn('{"$set": {"form_data": _fd', worker_source)
 
     def test_job_marker_is_persisted_before_job_becomes_claimable(self):
-        server_source = (
-            Path(__file__).resolve().parents[1] / "server.py"
+        route_source = (
+            Path(__file__).resolve().parents[1] / "app" / "api" / "forms.py"
         ).read_text(encoding="utf-8")
-        route_start = server_source.index("async def upload_form_attachment")
-        marker = server_source.index('"reportProcessing": {', route_start)
-        enqueue = server_source.index("report_jobs_collection.insert_one", marker)
+        route_start = route_source.index("async def upload_form_attachment")
+        marker = route_source.index('"reportProcessing": {', route_start)
+        enqueue = route_source.index("report_jobs_collection.insert_one", marker)
         self.assertLess(marker, enqueue)
 
     def test_s3_worker_download_has_an_explicit_byte_ceiling(self):
-        server_source = (
-            Path(__file__).resolve().parents[1] / "server.py"
+        worker_source = (
+            Path(__file__).resolve().parents[1] / "app" / "jobs" / "worker.py"
         ).read_text(encoding="utf-8")
-        worker_start = server_source.index("async def _process_report_job")
-        download = server_source.index("download_bytes_from_s3,", worker_start)
-        remaining = server_source.index("remaining,", download)
-        summarize = server_source.index(
+        worker_start = worker_source.index("async def _process_report_job")
+        download = worker_source.index("download_bytes_from_s3,", worker_start)
+        remaining = worker_source.index("remaining,", download)
+        summarize = worker_source.index(
             "summary = await run_blocking(summarize_multiple_reports",
             download,
         )
         self.assertLess(remaining, summarize)
 
     def test_backlog_capacity_is_checked_before_s3_upload(self):
-        server_source = (
-            Path(__file__).resolve().parents[1] / "server.py"
+        route_source = (
+            Path(__file__).resolve().parents[1] / "app" / "api" / "forms.py"
         ).read_text(encoding="utf-8")
-        route_start = server_source.index("async def upload_form_attachment")
-        capacity = server_source.index(
+        route_start = route_source.index("async def upload_form_attachment")
+        capacity = route_source.index(
             "active_report_jobs = await run_blocking(",
             route_start,
         )
-        upload = server_source.index("upload_bytes_to_s3,", capacity)
+        upload = route_source.index("upload_bytes_to_s3,", capacity)
         self.assertLess(capacity, upload)
-        self.assertIn("REPORT_JOB_MAX_BACKLOG", server_source[capacity:upload])
+        self.assertIn("REPORT_JOB_MAX_BACKLOG", route_source[capacity:upload])
 
 
 if __name__ == "__main__":

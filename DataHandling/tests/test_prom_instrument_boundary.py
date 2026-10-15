@@ -22,7 +22,8 @@ class PromInstrumentBoundaryTests(unittest.TestCase):
         return ast.get_source_segment(self.source, function) or ""
 
     def test_immutable_filter_precedes_personalization_llm(self):
-        source = self._function_source("personalize_questions")
+        questions_path = SERVER_PATH.parent / "app" / "forms" / "questions.py"
+        source = questions_path.read_text(encoding="utf-8")
         self.assertLess(source.index("is_immutable_prom_question"), source.index("llm_complete(prompt)"))
         self.assertIn("if not editable_indexes", source)
 
@@ -33,7 +34,7 @@ class PromInstrumentBoundaryTests(unittest.TestCase):
         self.assertLess(restore, personalize)
 
     def test_persistence_has_separate_prom_snapshot_field(self):
-        source = self._function_source("save_customer_info")
+        source = (SERVER_PATH.parent / "app" / "forms" / "repository.py").read_text(encoding="utf-8")
         self.assertIn('customer_doc["promSnapshot"]', source)
         websocket_source = self._function_source("websocket_endpoint")
         self.assertIn("prom_snapshot=client_state.get(\"prom_snapshot\")", websocket_source)

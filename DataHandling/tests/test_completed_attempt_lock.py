@@ -49,15 +49,18 @@ class CompletedAttemptLockRegressionTests(unittest.TestCase):
         self.assertNotIn("resolve_form_attempt_id", flow)
 
     def test_completed_payload_is_locked_and_attachment_route_rejects_writes(self):
-        payload_start = self.source.index("def build_completed_form_payload")
-        payload_end = self.source.index("async def send_completed_form", payload_start)
-        payload = self.source[payload_start:payload_end]
+        payload = (
+            BACKEND_ROOT / "app" / "ws" / "completion.py"
+        ).read_text(encoding="utf-8")
         self.assertIn('"type": "form_completed"', payload)
         self.assertIn('"locked": True', payload)
         self.assertIn('"progress": 100.0', payload)
 
-        upload_start = self.source.index("async def upload_form_attachment")
-        upload_flow = self.source[upload_start:]
+        upload_source = (
+            BACKEND_ROOT / "app" / "api" / "forms.py"
+        ).read_text(encoding="utf-8")
+        upload_start = upload_source.index("async def upload_form_attachment")
+        upload_flow = upload_source[upload_start:]
         self.assertIn("if is_completed_form(form):", upload_flow)
         self.assertIn("status_code=409", upload_flow)
 

@@ -55,17 +55,8 @@ DEFAULT_PRICING_VERSION = "google-standard-2026-09-02"
 DEFAULT_PRICING: dict[str, PriceRate] = {
     "google_genai/gemini-2.5-flash": PriceRate(
         input_text_per_million=0.30,
-        input_audio_per_million=1.00,
         output_per_million=2.50,
         cached_text_per_million=0.03,
-        cached_audio_per_million=0.10,
-    ),
-    "google_genai/gemini-2.5-flash-lite": PriceRate(
-        input_text_per_million=0.10,
-        input_audio_per_million=0.30,
-        output_per_million=0.40,
-        cached_text_per_million=0.01,
-        cached_audio_per_million=0.03,
     ),
 }
 

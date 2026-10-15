@@ -1,7 +1,7 @@
 """
 Reasoning-based form extractor.
 
-Uses gemini-2.5-flash to reason through the full conversation and fill the
+Uses gemini model to reason through the full conversation and fill the
 medical intake form with genuine understanding — not keyword matching or
 multi-pass heuristics.
 

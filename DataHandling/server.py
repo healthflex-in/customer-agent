@@ -1,12 +1,4 @@
-from fastapi import (
-    FastAPI,
-    WebSocket,
-    HTTPException,
-    Query,
-    UploadFile,
-    File,
-    Form,
-)
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncio
@@ -14,21 +6,9 @@ import asyncio
 import time
 import os
 import json
-from datetime import datetime, timezone
-from typing import List, Optional
-import uuid
+from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
-from pymongo.collection import Collection
-from bson import ObjectId
-
-from upload.s3_client import (
-    download_bytes_from_s3,
-    generate_object_key,
-    is_s3_configured,
-    upload_bytes_to_s3,
-)
-from docscanner.service import inspect_report_upload
 
 # Import HealthAgent and related functionalities
 from src.llm.functionalities import HealthAgent
@@ -37,101 +17,84 @@ from src.llm.functionalities import HealthAgent
 # Aliased to the legacy names used throughout this file so handler code is
 # unchanged. New code should import directly from app.config.
 from app.config import (
-    MONGO_URI,
-    MONGO_DB_NAME,
-    MONGO_USERS_COLLECTION,
-    MONGO_CUSTOMER_INFO_COLLECTION,
-    MONGO_REPORT_JOBS_COLLECTION,
-    MONGO_CLINICAL_ESCALATIONS_COLLECTION,
-    MONGO_CHAT_HISTORY_COLLECTION,
-    MONGO_TLS_CA_FILE,
     CORS_ALLOWED_ORIGINS,
     AUDIO_RATE as RATE,
     AUDIO_SAMPLE_WIDTH as SAMPLE_WIDTH,
     MAX_AUDIO_SESSION_BYTES,
     MAX_AUDIO_SESSION_SECONDS,
     DEFAULT_FORM_ID,
-    ALLOWED_ATTACHMENT_TYPES,
-    MAX_ATTACHMENT_SIZE_MB,
-    MAX_ATTACHMENT_FILES,
-    MAX_ATTACHMENT_TOTAL_MB,
-    MAX_REPORT_TOTAL_PAGES,
-    REPORT_JOB_POLL_SECONDS,
-    REPORT_JOB_LEASE_SECONDS,
-    REPORT_JOB_MAX_ATTEMPTS,
-    REPORT_JOB_MAX_BACKLOG,
-    REPORT_JOB_RETRY_BASE_SECONDS,
-    REPORT_JOB_RETRY_MAX_SECONDS,
     GEMINI_REQUEST_TIMEOUT_MS,
     CHAT_HISTORY_RETENTION_DAYS,
-    UPLOAD_TRIGGER_PHRASE,
 )
-from app.db.connection import create_verified_mongo_client
+from app.db.mongo import init_mongo, mongo
+from app.db.users import validate_user_exists
 from app.ai.models import MODEL_REGISTRY
-from app.observability.ai_usage import PRICING_VERSION, gemini_usage, tracked_ai_call
+from app.observability.ai_usage import gemini_usage, tracked_ai_call
 from app.audio.limits import audio_limit_error
-from app.content_safety import (
-    contains_internal_transcription_prompt,
-    scrub_internal_transcription_prompts,
-)
+from app.content_safety import contains_internal_transcription_prompt
 from app.runtime.blocking import run_blocking
-from app.uploads.policy import validate_upload_quotas
-from app.uploads.reading import read_upload_bounded
-from app.jobs.reports import (
-    FAILED as REPORT_JOB_FAILED,
-    build_report_job,
-    claim_report_job,
-    ensure_report_job_indexes,
-    mark_report_job_completed,
-    mark_report_job_failed,
-    renew_report_job_lease,
-    render_report_summary,
-)
-from app.forms.titles import build_form_title
+from app.jobs.worker import _report_worker_loop
+from app.api.forms import register_form_routes
+from app.api.health import register_health_routes
+from app.api.users import register_user_routes
 from app.forms.progress import (
     calculate_form_progress,
     calculate_section_completion_status,
 )
 from app.forms.lifecycle import (
     COMPLETED as FORM_COMPLETED,
-    build_lifecycle_update_filter,
-    ensure_form_lifecycle_ttl_index,
     has_meaningful_form_data,
     is_completed_form,
-    resolve_form_lifecycle,
 )
-from app.forms.attempts import (
-    add_attempt_write_scope,
-    ensure_form_attempt_index,
-    resolve_form_attempt_id,
+from app.forms.prom import (
+    PROM_SCALE_MAP as _PROM_SCALE_MAP,
+    advance_tagged_turn,
+    parse_structured_prom_answers,
+    prom_field_label as _prom_field_label,
+    prom_scale_is_answered as _prom_scale_is_answered,
 )
-from app.forms.prom import advance_tagged_turn, parse_structured_prom_answers
+from app.forms.questions import batch_tagged_questions, personalize_questions
+from app.forms.repository import (
+    create_placeholder_form,
+    fetch_form_attachments,
+    fetch_form_by_id,
+    save_customer_info,
+)
+from app.interview.session import reset_health_agent_for_new_interview
+from app.ws.completion import send_completed_form
+from app.ws.handlers.control import (
+    handle_audio_start,
+    handle_end_session,
+    handle_ping,
+)
+from app.ws.thoughts import send_thought_update as _send_thought_update
 from app.forms.instruments import (
     apply_prom_answers,
     build_prom_snapshot,
-    is_immutable_prom_question,
     questions_from_prom_snapshot,
 )
 from app.clinical.escalation import (
     assess_urgent_risk,
-    ensure_escalation_indexes,
     record_escalation,
 )
 from app.clinical.scope import assess_msk_intake_scope
-from app.audit.chat_history import ensure_chat_history_indexes, record_chat_message
+from app.audit.chat_history import record_chat_message
 from src.graph.pure_functions.clarification import (
     boundary_response_with_pending_question,
     build_out_of_flow_response,
     pending_intake_question,
 )
 from app.ws.idempotency import RecentRequestWindow, RequestDecision
-from app.observability.privacy import env_flag, error_type, pseudonymous_id
-# Pure stateless helpers. Aliased to legacy names used throughout this file.
-from app.db.serializers import (
-    normalize_user_id,
-    serialize_datetime as _serialize_datetime,
-    serialize_user,
+from app.observability.privacy import error_type, pseudonymous_id
+from app.observability.logging import log as _log
+from app.observability.metrics import WS_CONNECTIONS, install_metrics
+from app.observability.tracing import (
+    langfuse_client as _langfuse,
+    langfuse_enabled as _langfuse_enabled,
 )
+from app.security.input import sanitize_patient_input
+from app.security.rate_limit import RateLimiter
+# Pure stateless helpers. Aliased to legacy names used throughout this file.
 from app.db.ownership import build_owned_form_filter
 from app.db.queries import (
     build_user_form_queries,
@@ -143,60 +106,7 @@ from app.db.queries import (
 # MongoDB DISABLED - Commented out
 # from db import MedicalInterviewDB
 
-# ── Structured logging ──────────────────────────────────────────────────────
-try:
-    import structlog
-    structlog.configure(
-        processors=[
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.add_log_level,
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.JSONRenderer(),
-        ],
-        wrapper_class=structlog.make_filtering_bound_logger(20),
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
-    )
-    _log = structlog.get_logger()
-    _HAS_STRUCTLOG = True
-except ImportError:
-    _HAS_STRUCTLOG = False
-    class _FallbackLog:
-        def info(self, event, **kw): print(f"[INFO] {event}", kw or "")
-        def warning(self, event, **kw): print(f"[WARN] {event}", kw or "")
-        def error(self, event, **kw): print(f"[ERROR] {event}", kw or "")
-    _log = _FallbackLog()
-
-# ── Prometheus metrics ───────────────────────────────────────────────────────
-try:
-    from prometheus_client import Gauge, make_asgi_app as _make_metrics_app
-    from starlette_prometheus import PrometheusMiddleware
-    WS_CONNECTIONS = Gauge('ws_active_connections', 'Active WebSocket sessions')
-    _HAS_PROMETHEUS = True
-except ImportError:
-    _HAS_PROMETHEUS = False
-    class _Noop:
-        def inc(self, *a, **k): pass
-        def dec(self, *a, **k): pass
-        def observe(self, *a, **k): pass
-        def labels(self, *a, **k): return self
-    WS_CONNECTIONS = _Noop()
-
-# ── FastAPI-native rate limiter (no external library needed) ─────────────────
-from collections import defaultdict
-class _RateLimiter:
-    """Token-bucket rate limiter using FastAPI dependency injection."""
-    def __init__(self, max_per_minute: int = 30):
-        self._counts: dict = defaultdict(list)
-        self._max = max_per_minute
-    def check(self, key: str) -> bool:
-        now = time.monotonic()
-        calls = [t for t in self._counts[key] if now - t < 60]
-        calls.append(now)
-        self._counts[key] = calls
-        return len(calls) <= self._max
-
-_rate_limiter = _RateLimiter(max_per_minute=30)
+_rate_limiter = RateLimiter(max_per_minute=30)
 _request_window = RecentRequestWindow(capacity=4096)
 
 # ── Active connections tracker for graceful shutdown ─────────────────────────
@@ -204,23 +114,6 @@ _active_ws_connections: set = set()
 _shutting_down = False
 _report_worker_task: asyncio.Task | None = None
 _report_worker_stop: asyncio.Event | None = None
-
-# ── Input sanitization ───────────────────────────────────────────────────────
-import re as _re
-def sanitize_patient_input(text: str) -> str:
-    """Strip control chars, limit length, neutralize prompt injection."""
-    if not text:
-        return text
-    text = text[:2000]
-    text = _re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', text)
-    _injection = [
-        r'ignore\s+(all\s+)?(previous|prior)?\s*instructions?',
-        r'you are now',  r'forget everything',  r'system prompt',  r'jailbreak',
-        r'act as',  r'pretend (you are|to be)',
-    ]
-    for pat in _injection:
-        text = _re.sub(pat, '[filtered]', text, flags=_re.IGNORECASE)
-    return text.strip()
 
 # ── FastAPI app with lifespan for graceful startup/shutdown ──────────────────
 from contextlib import asynccontextmanager
@@ -231,8 +124,10 @@ async def lifespan(app_instance):
     _log.info("server_startup", service="healthflex-agent")
     _shutting_down = False
     _report_worker_stop = asyncio.Event()
-    if report_jobs_collection is not None:
-        _report_worker_task = asyncio.create_task(_report_worker_loop())
+    if mongo.report_jobs_collection is not None:
+        _report_worker_task = asyncio.create_task(
+            _report_worker_loop(_report_worker_stop)
+        )
     yield
     # ── Graceful shutdown ───────────────────────────────────────────────────
     _shutting_down = True
@@ -264,113 +159,10 @@ async def lifespan(app_instance):
 
 app = FastAPI(lifespan=lifespan, title="Healthflex Customer Agent", version="2.0.0")
 
-if _HAS_PROMETHEUS:
-    app.add_middleware(PrometheusMiddleware)
-    metrics_app = _make_metrics_app()
-    app.mount("/metrics", metrics_app)
+install_metrics(app)
 
 # ── Agent thought stream: human-readable labels for each graph node ──────────
-NODE_THOUGHTS: dict[str, dict[str, str]] = {
-    "handle_first_turn": {
-        "stage": "Starting Interview",
-        "detail": "Initiating the consultation and reviewing your case...",
-    },
-    "extract_form_data": {
-        "stage": "Extracting Information",
-        "detail": "Reading your responses and organizing patient data...",
-    },
-    "validate_section": {
-        "stage": "Validating Completeness",
-        "detail": "Checking which sections have sufficient information...",
-    },
-    "advance_section": {
-        "stage": "Advancing Assessment",
-        "detail": "Moving to the next area of clinical assessment...",
-    },
-    "detect_correction": {
-        "stage": "Detecting Corrections",
-        "detail": "Checking if you're updating or correcting previous information...",
-    },
-    "apply_correction": {
-        "stage": "Applying Corrections",
-        "detail": "Updating your records with the corrected information...",
-    },
-    "generate_question": {
-        "stage": "Formulating Question",
-        "detail": "Preparing the next targeted clinical question...",
-    },
-    "generate_summary": {
-        "stage": "Generating Summary",
-        "detail": "Compiling a comprehensive summary of all your responses...",
-    },
-    "classify_summary_intent": {
-        "stage": "Reviewing Feedback",
-        "detail": "Understanding your response to the summary...",
-    },
-    "handle_summary_response": {
-        "stage": "Processing Summary Response",
-        "detail": "Handling your confirmation or requested changes...",
-    },
-    "handle_upload_response": {
-        "stage": "Processing Upload",
-        "detail": "Handling your document upload or file response...",
-    },
-}
 
-
-async def _send_thought_update(
-    websocket: WebSocket,
-    completed_nodes: list[str],
-    active_node: str | None = None,
-) -> None:
-    """Send a thought_update message to the frontend with the current thought list."""
-    thoughts: list[dict[str, str]] = []
-    for node in completed_nodes:
-        info = NODE_THOUGHTS[node]
-        thoughts.append({
-            "stage": info["stage"],
-            "detail": info["detail"],
-            "status": "done",
-        })
-    if active_node:
-        info = NODE_THOUGHTS[active_node]
-        thoughts.append({
-            "stage": info["stage"],
-            "detail": info["detail"],
-            "status": "active",
-        })
-    try:
-        await websocket.send_text(json.dumps({
-            "type": "thought_update",
-            "thoughts": thoughts,
-        }))
-    except Exception:
-        pass  # WebSocket closed — safe to ignore
-
-
-# ── Langfuse LLM observability ───────────────────────────────────────────────
-_langfuse_credentials_present = bool(
-    os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")
-)
-_langfuse_content_approved = env_flag("LANGFUSE_CAPTURE_CONTENT", default=False)
-_langfuse_enabled = _langfuse_credentials_present and _langfuse_content_approved
-if _langfuse_enabled:
-    try:
-        from langfuse import get_client as _lf_get_client
-        from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
-        _langfuse = _lf_get_client()
-        LlamaIndexInstrumentor().instrument()
-        print("[langfuse] Content tracing explicitly enabled")
-    except Exception as _lf_err:
-        print(f"[langfuse] Initialization failed: {error_type(_lf_err)}")
-        _langfuse_enabled = False
-else:
-    if _langfuse_credentials_present:
-        print("[langfuse] Content tracing disabled by privacy default")
-    else:
-        print("[langfuse] Skipping — credentials not configured")
-    _langfuse = None
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Add CORS middleware to allow frontend connections
 app.add_middleware(
@@ -420,9 +212,9 @@ try:
     from src.graph.graph import create_checkpointer as _create_checkpointer
     _checkpointer = _create_checkpointer()
 
-    # Initialize reasoning-grade LLM (gemini-2.5-flash) for form extraction.
-    # Kept separate from the main LLM (flash-lite) so only extraction pays
-    # for the more capable model.
+    # Initialize reasoning-grade Gemini model for form extraction.
+    # Kept separate from the main conversation model so only extraction pays
+    # for the more capable reasoning configuration.
     _reasoning_llm_complete = None
     try:
         from src.llm.utils import init_reasoning_llm
@@ -440,9 +232,8 @@ try:
                 pass
         if _api_key:
             # Use google.genai SDK directly so we can set thinking_budget=0.
-            # gemini-2.5-flash has thinking ON by default (dynamic budget) which
-            # adds several seconds of latency for every extraction call.
-            # thinking_budget=0 disables it, giving flash-2.0 speed with 2.5 quality.
+            # The configured reasoning model may enable thinking by default;
+            # disable it here to keep extraction latency bounded.
             try:
                 from google import genai as _genai_r
                 from google.genai import types as _genai_r_types
@@ -507,265 +298,13 @@ except Exception as _graph_err:
     print(f"[graph] LangGraph initialization failed with {error_type(_graph_err)}; using fallback")
     _interview_graph = None
 
-# MongoDB connection handles (populated by init_mongo()).
-mongo_client = None
-users_collection: Optional[Collection] = None
-customer_info_collection: Optional[Collection] = None
-tagged_questions_collection: Optional[Collection] = None
-report_jobs_collection: Optional[Collection] = None
-clinical_escalations_collection: Optional[Collection] = None
-chat_history_collection: Optional[Collection] = None
 
-
-# normalize_user_id moved to app.db.serializers (imported above).
-
-
-def init_mongo():
-    """Initialize MongoDB client for user directory lookups and customer info."""
-    global mongo_client, users_collection, customer_info_collection, tagged_questions_collection, report_jobs_collection, clinical_escalations_collection, chat_history_collection
-
-    if not MONGO_URI:
-        print("MONGO_URI not set. User suggestions and customer info endpoints will be disabled.")
-        return
-
-    try:
-        mongo_client = create_verified_mongo_client(
-            MONGO_URI,
-            ca_file=MONGO_TLS_CA_FILE,
-        )
-        mongo_client.admin.command("ping")
-        db = mongo_client[MONGO_DB_NAME]
-        users_collection = db[MONGO_USERS_COLLECTION]
-        customer_info_collection = db[MONGO_CUSTOMER_INFO_COLLECTION]
-        tagged_questions_collection = db["tagged-questions"]
-        report_jobs_collection = db[MONGO_REPORT_JOBS_COLLECTION]
-        clinical_escalations_collection = db[MONGO_CLINICAL_ESCALATIONS_COLLECTION]
-        chat_history_collection = db[MONGO_CHAT_HISTORY_COLLECTION]
-
-        # A formId identifies a questionnaire; attemptId identifies one intake.
-        # This migration preserves legacy records while allowing repeat intakes.
-        ensure_form_attempt_index(customer_info_collection)
-
-        # Drafts alone receive expiresAt. Answered/completed records omit it,
-        # and the partial filter provides defense if stale data is present.
-        ensure_form_lifecycle_ttl_index(customer_info_collection)
-        ensure_report_job_indexes(report_jobs_collection)
-        ensure_escalation_indexes(clinical_escalations_collection)
-        try:
-            ensure_chat_history_indexes(chat_history_collection)
-        except Exception as chat_index_error:
-            # Transcript persistence is diagnostic only. A bad/missing audit
-            # index must not make the patient intake database unavailable.
-            _log.error(
-                "chat_history_index_initialization_failed",
-                error_type=error_type(chat_index_error),
-            )
-
-        print(
-            "Connected to MongoDB collections: "
-            f"{MONGO_DB_NAME}.{MONGO_USERS_COLLECTION}, "
-            f"{MONGO_DB_NAME}.{MONGO_CUSTOMER_INFO_COLLECTION}, "
-            f"{MONGO_DB_NAME}.{MONGO_CHAT_HISTORY_COLLECTION}"
-        )
-    except Exception as e:
-        mongo_client = None
-        users_collection = None
-        customer_info_collection = None
-        tagged_questions_collection = None
-        report_jobs_collection = None
-        clinical_escalations_collection = None
-        chat_history_collection = None
-        print(f"MongoDB connection failed: {error_type(e)}")
-
-
-async def _process_report_job(job: dict, worker_id: str) -> None:
-    """Process one leased report job and atomically publish only the latest result."""
-
-    from docscanner.service import summarize_multiple_reports
-
-    try:
-        max_total_bytes = MAX_ATTACHMENT_TOTAL_MB * 1024 * 1024
-        file_data_list = []
-        downloaded_bytes = 0
-        for item in job.get("objects", []):
-            remaining = max_total_bytes - downloaded_bytes
-            if remaining <= 0:
-                raise ValueError("Report job exceeds the aggregate download limit")
-            content = await run_blocking(
-                download_bytes_from_s3,
-                item["key"],
-                remaining,
-            )
-            downloaded_bytes += len(content)
-            file_data_list.append((content, item["filename"]))
-        if not file_data_list:
-            raise ValueError("Report job contains no objects")
-
-        summary = await run_blocking(summarize_multiple_reports, file_data_list)
-        if not summary or summary.get("error"):
-            raise RuntimeError("Report summarizer returned no usable result")
-        lease_is_current = await run_blocking(
-            renew_report_job_lease,
-            report_jobs_collection,
-            job["_id"],
-            worker_id=worker_id,
-            lease_seconds=REPORT_JOB_LEASE_SECONDS,
-        )
-        if not lease_is_current:
-            _log.info("report_job_lease_lost", job_id=job["_id"])
-            return
-        reports_text = render_report_summary(summary, len(file_data_list))
-        now = datetime.now(timezone.utc)
-        result = await run_blocking(
-            customer_info_collection.update_one,
-            {
-                "formId": job["formId"],
-                "userId": job["userId"],
-                "reportProcessing.jobId": job["_id"],
-            },
-            {
-                "$set": {
-                    "form_data.History & Diagnostics.Reports": reports_text,
-                    "reportProcessing.status": "completed",
-                    "reportProcessing.completedAt": now,
-                    "updatedAt": now,
-                }
-            },
-        )
-        if result.matched_count == 0:
-            _log.info("report_job_result_superseded", job_id=job["_id"])
-        await run_blocking(
-            mark_report_job_completed,
-            report_jobs_collection,
-            job["_id"],
-            worker_id=worker_id,
-        )
-        _log.info("report_job_completed", job_id=job["_id"])
-    except Exception as exc:
-        status = await run_blocking(
-            mark_report_job_failed,
-            report_jobs_collection,
-            job,
-            worker_id=worker_id,
-            error_name=error_type(exc),
-            max_attempts=REPORT_JOB_MAX_ATTEMPTS,
-            retry_base_seconds=REPORT_JOB_RETRY_BASE_SECONDS,
-            retry_max_seconds=REPORT_JOB_RETRY_MAX_SECONDS,
-        )
-        _log.warning(
-            "report_job_attempt_failed",
-            job_id=job.get("_id"),
-            status=status,
-            error_type=error_type(exc),
-        )
-        if status == REPORT_JOB_FAILED and customer_info_collection is not None:
-            await run_blocking(
-                customer_info_collection.update_one,
-                {
-                    "formId": job["formId"],
-                    "userId": job["userId"],
-                    "reportProcessing.jobId": job["_id"],
-                },
-                {
-                    "$set": {
-                        "reportProcessing.status": "failed",
-                        "reportProcessing.failedAt": datetime.now(timezone.utc),
-                    }
-                },
-            )
-
-
-async def _report_worker_loop() -> None:
-    """Claim durable jobs one at a time; leases recover work after a crash."""
-
-    worker_id = f"{os.getpid()}-{uuid.uuid4().hex}"
-    while _report_worker_stop is not None and not _report_worker_stop.is_set():
-        try:
-            job = await run_blocking(
-                claim_report_job,
-                report_jobs_collection,
-                worker_id=worker_id,
-                lease_seconds=REPORT_JOB_LEASE_SECONDS,
-                max_attempts=REPORT_JOB_MAX_ATTEMPTS,
-            )
-            if job:
-                await _process_report_job(job, worker_id)
-                continue
-        except Exception as exc:
-            _log.warning("report_worker_poll_failed", error_type=error_type(exc))
-        try:
-            await asyncio.wait_for(
-                _report_worker_stop.wait(),
-                timeout=REPORT_JOB_POLL_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            pass
 
 
 # _serialize_datetime and serialize_user moved to app.db.serializers (imported above).
 
 
-_PROM_SCALE_MAP = {
-    "prom_ohs":    "Oxford Hip Score (OHS)",
-    "prom_oss":    "Oxford Shoulder Score (OSS)",
-    "prom_phq9":   "PHQ-9 (Depression)",
-    "prom_gad7":   "GAD-7 (Anxiety)",
-    "prom_nps":    "Numeric Pain Scale (NPS)",
-    "prom_rmdq":   "RMDQ (Back Disability)",
-    "prom_koos":   "KOOS (Knee)",
-    "prom_dash":   "DASH (Arm/Shoulder/Hand)",
-    "prom_odi":    "Oswestry Disability Index (ODI)",
-    "prom_whoqol": "WHOQOL (Quality of Life)",
-}
 
-
-def _prom_field_label(suffix: str) -> str:
-    return suffix.replace("_", " ").title()
-
-
-def _build_prom_template_from_ids(question_ids: list) -> dict:
-    """Group question IDs by PROM scale to build a structured form template."""
-    template: dict = {}
-    for qid in question_ids:
-        scale_name = "Other Assessments"
-        suffix = qid
-        for prefix, name in _PROM_SCALE_MAP.items():
-            if qid.startswith(prefix + "_"):
-                scale_name = name
-                suffix = qid[len(prefix) + 1:]
-                break
-        if scale_name not in template:
-            template[scale_name] = {}
-        template[scale_name][_prom_field_label(suffix)] = ""
-    return template
-
-
-def _prom_scale_is_answered(val) -> bool:
-    """Return True only when a PROM scale value has at least one real answer.
-    Empty dicts (skeleton placeholders) and empty strings both return False."""
-    if isinstance(val, dict):
-        return any(str(v).strip() for v in val.values() if v)
-    return bool(val and str(val).strip())
-
-
-def _collapse_prom_form(form: dict) -> dict:
-    """
-    Collapse nested PROM form {scale: {question: answer, ...}} into
-    {scale: "Question: answer; Question: answer"} — one line per scale.
-    Empty fields are omitted. Non-dict sections passed through unchanged.
-    """
-    collapsed = {}
-    for section, data in form.items():
-        if isinstance(data, dict):
-            parts = [
-                f"{field}: {value}"
-                for field, value in data.items()
-                if value and str(value).strip()
-            ]
-            collapsed[section] = "; ".join(parts)
-        else:
-            collapsed[section] = data
-    return collapsed
 
 
 def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
@@ -773,7 +312,7 @@ def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
     Return (resolved_texts, prom_form_template, source_document_id) for the
     exact (user_id, form_id). Returns ([], {}, None) if nothing is found.
     """
-    if tagged_questions_collection is None:
+    if mongo.tagged_questions_collection is None:
         return empty_tagged_questions_result()
     try:
         queries = build_user_form_queries(user_id, form_id)
@@ -781,15 +320,15 @@ def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
         doc = None
         _from_customer_info = False
         for q in queries:
-            doc = tagged_questions_collection.find_one(q)
+            doc = mongo.tagged_questions_collection.find_one(q)
             if doc:
                 break
 
-        # Fallback: check customer_info_collection for template docs that embed the
+        # Fallback: check mongo.customer_info_collection for template docs that embed the
         # questions array directly (new template format from the clinic admin system)
-        if not doc and customer_info_collection is not None:
+        if not doc and mongo.customer_info_collection is not None:
             for q in queries:
-                doc = customer_info_collection.find_one(q)
+                doc = mongo.customer_info_collection.find_one(q)
                 if doc and doc.get("questions"):
                     _from_customer_info = True
                     print("[tagged-questions] Found embedded questions in customer-info")
@@ -855,7 +394,7 @@ def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
         id_to_doc: dict = {}
         if question_ids:
             try:
-                qb = tagged_questions_collection.database["question-bank"]
+                qb = mongo.tagged_questions_collection.database["question-bank"]
                 bank_docs = qb.find(
                     {"id": {"$in": question_ids}},
                     {
@@ -946,682 +485,7 @@ def fetch_tagged_questions(user_id: str, form_id: str) -> tuple:
     return empty_tagged_questions_result()
 
 
-_SCALE_RESPONSE_OPTIONS: dict = {
-    "Oxford Hip Score": "(options: none / very mild / mild / moderate / severe)",
-    "OHS": "(options: none / very mild / mild / moderate / severe)",
-    "Oxford Shoulder Score": "(options: none / very mild / mild / moderate / severe)",
-    "OSS": "(options: none / very mild / mild / moderate / severe)",
-    "PHQ": "(options: not at all / several days / more than half the days / nearly every day)",
-    "GAD": "(options: not at all / several days / more than half the days / nearly every day)",
-    "NPS": "(0 = no pain, 10 = worst possible pain)",
-    "RMDQ": "(please answer yes or no)",
-    "Roland": "(please answer yes or no)",
-}
 
-_SCALE_INTROS: dict = {
-    "Oxford Hip Score": "Now let me ask about your hip over the past 4 weeks.",
-    "OHS": "Now let me ask about your hip over the past 4 weeks.",
-    "Oxford Shoulder Score": "Now let me ask about your shoulder over the past 4 weeks.",
-    "OSS": "Now let me ask about your shoulder over the past 4 weeks.",
-    "PHQ": "I'd like to ask a few questions about your mood and mental well-being.",
-    "GAD": "Let me ask a few questions about how you've been feeling emotionally.",
-    "NPS": "Quick pain check —",
-    "RMDQ": "Now let me ask about how your back pain has affected your daily activities.",
-    "Roland": "Now let me ask about how your back pain has affected your daily activities.",
-}
-
-
-def batch_tagged_questions(questions: list, llm_complete, form_template: dict = None) -> list:
-    """
-    Combine ALL PROM questions into a single multi_answer turn so the patient
-    sees the entire assessment at once.
-
-    Questions are ordered by PROM scale (using question_id prefix matching) and
-    the resulting turn includes a `question_scales` list so the frontend can
-    render section headers (e.g. "Oxford Hip Score", "PHQ-9").
-    """
-    if not questions:
-        return []
-
-    # --- Group by scale via question_id prefix ---
-    if form_template:
-        scale_order = list(form_template.keys())
-    else:
-        scale_order = []
-
-    buckets: dict = {}
-    for q in questions:
-        q_dict = q if isinstance(q, dict) else {"text": q, "type": "text", "options": None, "question_id": None}
-        qid = q_dict.get("question_id") or ""
-        assigned = "Other Assessments"
-        for pfx, name in _PROM_SCALE_MAP.items():
-            if qid.startswith(pfx + "_"):
-                assigned = name
-                break
-        buckets.setdefault(assigned, []).append(q_dict)
-
-    # Preserve scale ordering from form_template
-    seen: set = set()
-    scale_groups: list = []
-    for sname in scale_order:
-        if sname in buckets and sname not in seen:
-            scale_groups.append((sname, buckets[sname]))
-            seen.add(sname)
-    for sname, qs in buckets.items():
-        if sname not in seen:
-            scale_groups.append((sname, qs))
-
-    # Flatten all questions into a single ordered list with scale labels
-    all_ids, all_texts, all_opts, all_types, all_scales = [], [], [], [], []
-    for scale_name, qs in scale_groups:
-        for c in qs:
-            all_ids.append(c.get("question_id"))
-            all_texts.append(c.get("text", ""))
-            all_opts.append(c.get("options"))
-            all_types.append(c.get("type", "text"))
-            all_scales.append(scale_name)
-
-    combined_text = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(all_texts))
-    print(f"[tagged-questions] {len(questions)} questions → 1 combined turn")
-    return [{
-        "text": combined_text,
-        "type": "multi_answer",
-        "options": None,
-        "question_id": None,
-        "question_ids": all_ids,
-        "questions": all_texts,
-        "question_options": all_opts,
-        "question_types": all_types,
-        "question_scales": all_scales,
-    }]
-
-
-def personalize_questions(raw_questions: list, patient_context: dict, llm_complete) -> list:
-    """
-    Rewrite only non-PROM custom questions for this patient's situation.
-
-    Uses FRM-01 intake data (onset, body part, severity, duration) to replace
-    generic template phrasing ("past 4 weeks", "your joint") with patient-accurate
-    language ("past 3 days", "your right knee").  If a question touches something
-    already well-documented in the patient's history, it is reframed as a follow-up
-    ("You mentioned X last time — has that changed?").
-
-    Falls back to raw templates on any error so the interview is never blocked.
-    """
-    if not raw_questions:
-        return raw_questions
-
-    import json as _json
-
-    # Build a compact clinical summary from FRM-01 (key facts only, skip empty / N/A values)
-    _na_markers = {"not applicable", "n/a", "na", "none", "general visit"}
-    facts = []
-    for section, fields in patient_context.items():
-        if isinstance(fields, dict):
-            for field, value in fields.items():
-                v = str(value).strip()
-                if v and not any(v.lower().startswith(m) for m in _na_markers):
-                    facts.append(f"{field}: {v}")
-        elif isinstance(fields, str) and fields.strip():
-            facts.append(f"{section}: {fields.strip()}")
-
-    if not facts:
-        print("[personalize-questions] No usable patient facts; using raw templates")
-        return raw_questions
-
-    # Published/clinical PROM wording and time windows are part of the instrument
-    # definition. They are never sent to an LLM for rewriting. A stored snapshot
-    # is also frozen so a resume cannot silently adopt later question-bank edits.
-    editable_indexes = [
-        index
-        for index, question in enumerate(raw_questions)
-        if not is_immutable_prom_question(question)
-        and not (isinstance(question, dict) and question.get("definition_frozen"))
-    ]
-    if not editable_indexes:
-        print("[personalize-questions] Clinical definitions are immutable; skipping personalization")
-        return raw_questions
-
-    raw_texts = [
-        raw_questions[index]["text"]
-        if isinstance(raw_questions[index], dict)
-        else raw_questions[index]
-        for index in editable_indexes
-    ]
-
-    patient_summary = "\n".join(facts[:30])  # Cap to keep prompt concise
-    questions_json = _json.dumps(raw_texts)
-
-    prompt = (
-        "You are a clinical assistant personalizing assessment questions for a specific patient.\n\n"
-        "PATIENT INTAKE HISTORY (FRM-01):\n"
-        f"{patient_summary}\n\n"
-        f"CUSTOM QUESTION TEMPLATES ({len(raw_texts)} questions):\n"
-        f"{questions_json}\n\n"
-        "RULES:\n"
-        "1. Replace 'past 4 weeks' (or any generic time window) with the patient's actual "
-        "duration if documented (e.g. 'past 5 days', 'past 2 months'). If duration is unknown, "
-        "remove the time reference entirely.\n"
-        "2. Replace generic body-part language ('your joint', 'the affected area') with the "
-        "patient's specific condition (e.g. 'your right hip', 'your lower back').\n"
-        "3. If a question asks about something already well-captured in the intake history, "
-        "reframe it as a follow-up: 'You mentioned [X] — has that changed recently?'\n"
-        "4. Do NOT change the clinical meaning or intent of any question.\n"
-        "5. Keep exactly the same number of questions in the same order.\n"
-        "6. Keep each question concise — one sentence where possible.\n\n"
-        f"Return ONLY a valid JSON array of exactly {len(raw_texts)} strings. No other text."
-    )
-
-    try:
-        raw = llm_complete(prompt).strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        personalized_texts = _json.loads(raw.strip())
-        if isinstance(personalized_texts, list) and len(personalized_texts) == len(editable_indexes):
-            print(f"[personalize-questions] Personalized {len(personalized_texts)} questions using patient history")
-            result = list(raw_questions)
-            for output_index, source_index in enumerate(editable_indexes):
-                question = raw_questions[source_index]
-                result[source_index] = (
-                    {**question, "text": personalized_texts[output_index]}
-                    if isinstance(question, dict)
-                    else personalized_texts[output_index]
-                )
-            return result
-        print(f"[personalize-questions] Length mismatch ({len(personalized_texts)} vs {len(editable_indexes)}), using raw")
-    except Exception as e:
-        print(f"[personalize-questions] Failed with {error_type(e)}; using raw templates")
-
-    return raw_questions
-
-
-# Fixed questionnaire ID; attemptId distinguishes repeat intakes per user.
-# DEFAULT_FORM_ID moved to app.config (imported above).
-
-def resolve_assessment_appointment_id(user_id: str):
-    """The booked assessment this intake belongs to.
-
-    Priority: the appointmentId propagated onto the patient's tagged-questions doc
-    (resolved at tag time in clinical-mcp) → else resolve the next BOOKED appointment
-    directly from the appointments collection. Returns an ObjectId or None.
-    """
-    from bson import ObjectId
-    from datetime import datetime, timezone
-
-    # 1) Propagated from tag time (clinical-mcp).
-    try:
-        if tagged_questions_collection is not None:
-            td = tagged_questions_collection.find_one(
-                {"$or": [{"userId": str(user_id)}, {"userId": normalize_user_id(user_id)}]},
-                {"appointmentId": 1},
-            )
-            if td and td.get("appointmentId"):
-                try:
-                    return ObjectId(str(td["appointmentId"]))
-                except Exception:
-                    return td["appointmentId"]
-    except Exception as e:
-        print(f"[appointment-tag] Tagged-question lookup failed: {error_type(e)}")
-
-    # 2) Fallback: resolve the next booked appointment ourselves.
-    try:
-        if mongo_client is None:
-            return None
-        appts = mongo_client[MONGO_DB_NAME]["appointments"]
-        pid_variants = []
-        try:
-            pid_variants.append(ObjectId(str(user_id)))
-        except Exception:
-            pass
-        pid_variants.append(str(user_id))
-        now = datetime.now(timezone.utc)
-        for pid in pid_variants:
-            doc = appts.find_one(
-                {"patient": pid, "status": "BOOKED", "appointmentStartTime": {"$gte": now}},
-                sort=[("appointmentStartTime", 1)], projection={"_id": 1},
-            )
-            if doc:
-                return doc["_id"]
-        for pid in pid_variants:
-            doc = appts.find_one(
-                {"patient": pid, "status": "BOOKED"},
-                sort=[("appointmentStartTime", -1)], projection={"_id": 1},
-            )
-            if doc:
-                return doc["_id"]
-    except Exception as e:
-        print(f"[appointment-tag] Appointment lookup failed: {error_type(e)}")
-    return None
-
-
-def save_customer_info(
-    user_id: str,
-    form_data: dict,
-    current_section: str,
-    form_id: str = None,
-    attachments: Optional[List[dict]] = None,
-    chat_history: Optional[list] = None,
-    preferred_doc_id: Optional[str] = None,
-    lifecycle_status: Optional[str] = None,
-    attempt_id: Optional[str] = None,
-    prom_snapshot: Optional[dict] = None,
-):
-    """
-    Save or update customer interview information in MongoDB.
-    Forms are unique by ``(userId, formId, attemptId)`` for new records.
-    Legacy records without ``attemptId`` remain updateable for compatibility.
-    
-    Args:
-        user_id: The user ID from the selected user (required for uniqueness)
-        form_data: The form data dictionary
-        current_section: Current section of the interview
-        form_id: Optional form ID. If None, uses DEFAULT_FORM_ID.
-        lifecycle_status: Explicit lifecycle transition, currently ``completed``
-            for terminal interview/PROM events. Ordinary saves infer draft or
-            in-progress from the form data.
-        attempt_id: Intake-instance identity. When omitted, the legacy
-            ``(userId, formId)`` record is selected.
-    
-    Returns:
-        The form_id of the saved form (always DEFAULT_FORM_ID)
-    """
-    global customer_info_collection
-    
-    if customer_info_collection is None:
-        # Try to reconnect once
-        init_mongo()
-    
-    if customer_info_collection is None:
-        print("Warning: customer-info collection not available. Skipping MongoDB save.")
-        return None
-    
-    if not user_id:
-        print("Error: user_id is required for saving form data")
-        return None
-    
-    try:
-        from datetime import datetime, timezone
-        import copy
-        
-        # Normalize user_id to ObjectId where possible
-        normalized_user_id = normalize_user_id(user_id)
-
-        # Use fixed form ID (same for all users)
-        if not form_id:
-            form_id = DEFAULT_FORM_ID
-            print("[save_customer_info] Using default form type")
-        else:
-            # If form_id is provided, use it (but typically should be DEFAULT_FORM_ID)
-            print("[save_customer_info] Using requested form type")
-        
-        # CRITICAL: Deep copy form_data to prevent shared references
-        # This ensures each form has its own independent copy of the data
-        form_data_copy, removed_prompt_values = scrub_internal_transcription_prompts(
-            copy.deepcopy(form_data)
-        )
-        if removed_prompt_values:
-            _log.warning(
-                "internal_prompt_content_removed_before_persistence",
-                removed_values=removed_prompt_values,
-                subject=pseudonymous_id(user_id),
-            )
-        
-        # Deterministic title generation avoids an external model request on
-        # every save while preserving the existing empty-form lifecycle marker.
-        form_title = build_form_title(form_data_copy, empty_title="New Form")
-        
-        # Prepare the document matching the medical_interview_history.json structure
-        save_time = datetime.now(timezone.utc)
-        customer_doc = {
-            "userId": normalized_user_id,
-            "formId": form_id,
-            "title": form_title,
-            "timestamp": save_time.isoformat(),
-            "form_data": form_data_copy,  # Use the deep copy
-            "current_section": current_section,
-            "updatedAt": save_time,
-        }
-        if attempt_id is not None:
-            normalized_attempt_id = str(attempt_id).strip()
-            if not normalized_attempt_id:
-                raise ValueError("attempt_id cannot be empty")
-            customer_doc["attemptId"] = normalized_attempt_id
-        if prom_snapshot is not None:
-            customer_doc["promSnapshot"] = copy.deepcopy(prom_snapshot)
-
-        # Tag this intake to the patient's booked assessment so the recommender's
-        # customer icon can fetch the right assessment's data. Only set when
-        # resolved, so we never clobber an existing tag with null.
-        _appt_id = resolve_assessment_appointment_id(user_id)
-        if _appt_id is not None:
-            customer_doc["appointmentId"] = _appt_id
-
-        # Find existing doc — prefer preferred_doc_id (template doc _id) when provided,
-        # then try both ObjectId and plain-string userId so we don't create a second
-        # document when external systems stored userId as a string.
-        from bson import ObjectId as _ObjId2
-        existing = None
-        if preferred_doc_id:
-            try:
-                existing = customer_info_collection.find_one({"_id": _ObjId2(preferred_doc_id)})
-            except Exception:
-                pass
-        if not existing:
-            _uid_variants = [normalized_user_id]
-            try:
-                _uid_variants.append(str(user_id))
-            except Exception:
-                pass
-            for _uid in _uid_variants:
-                _existing_query = add_attempt_write_scope(
-                    {"formId": form_id, "userId": _uid},
-                    attempt_id,
-                )
-                existing = customer_info_collection.find_one(_existing_query)
-                if existing:
-                    break
-
-        lifecycle = resolve_form_lifecycle(
-            form_data_copy,
-            requested_status=lifecycle_status,
-            existing_status=existing.get("status") if existing else None,
-            existing_completed_at=existing.get("completedAt") if existing else None,
-            now=save_time,
-        )
-        customer_doc["status"] = lifecycle.status
-        if lifecycle.expires_at is not None:
-            customer_doc["expiresAt"] = lifecycle.expires_at
-        if lifecycle.completed_at is not None:
-            customer_doc["completedAt"] = lifecycle.completed_at
-
-        attachments_to_store = (
-            attachments if attachments is not None else
-            (existing.get("attachments", []) if existing else [])
-        )
-        from app.uploads.attachments import attachment_urls
-        customer_doc["attachments"] = attachment_urls(attachments_to_store)
-
-        if existing:
-            # Update the doc we found (regardless of how userId was stored)
-            update = {"$set": customer_doc}
-            if lifecycle.expires_at is None:
-                update["$unset"] = {"expiresAt": ""}
-            update_filter = build_lifecycle_update_filter(
-                existing["_id"],
-                requested_status=lifecycle_status,
-            )
-            customer_info_collection.update_one(update_filter, update)
-        else:
-            customer_doc["createdAt"] = save_time
-            customer_info_collection.insert_one(customer_doc)
-        print("[save_customer_info] Customer form persisted")
-        
-        return form_id
-            
-    except Exception as e:
-        print(f"[save_customer_info] Persistence failed: {error_type(e)}")
-        return None
-
-
-def fetch_user_forms(user_id: str) -> list:
-    """
-    Retrieve all forms for a specific user from MongoDB.
-    
-    Args:
-        user_id: The user ID to retrieve forms for
-        
-    Returns:
-        List of form documents with formId, title, timestamp, etc.
-    """
-    global customer_info_collection
-    
-    if customer_info_collection is None:
-        init_mongo()
-    
-    if customer_info_collection is None:
-        print("Warning: customer-info collection not available.")
-        return []
-    
-    try:
-        queries = build_user_form_queries(user_id, DEFAULT_FORM_ID)
-        identity_query = queries[0] if len(queries) == 1 else {"$or": queries}
-        forms = list(
-            customer_info_collection.find(
-                identity_query,
-                {"_id": 0}
-            ).sort("createdAt", -1)
-        )
-        
-        formatted_forms = []
-        for form in forms:
-            form, removed_prompt_values = scrub_internal_transcription_prompts(form)
-            if removed_prompt_values:
-                _log.warning(
-                    "internal_prompt_content_removed_during_form_list_read",
-                    removed_values=removed_prompt_values,
-                    subject=pseudonymous_id(user_id),
-                )
-            formatted_forms.append({
-                "formId": form.get("formId", ""),
-                "attemptId": form.get("attemptId"),
-                "title": form.get("title", "Untitled Form"),
-                "timestamp": _serialize_datetime(form.get("timestamp")),
-                "createdAt": _serialize_datetime(form.get("createdAt")),
-                "updatedAt": _serialize_datetime(form.get("updatedAt")),
-                "current_section": form.get("current_section", ""),
-                "progress": calculate_form_progress(form.get("form_data", {}))
-            })
-        
-        return formatted_forms
-    except Exception as e:
-        print(f"[fetch_user_forms] Retrieval failed: {error_type(e)}")
-        return []
-
-
-def fetch_latest_form_for_user(user_id: str) -> dict:
-    """
-    Retrieve the latest default-form attempt for a specific user.
-    """
-    global customer_info_collection
-
-    if customer_info_collection is None:
-        init_mongo()
-
-    if customer_info_collection is None:
-        print("Warning: customer-info collection not available when fetching latest form.")
-        return None
-
-    try:
-        queries = build_user_form_queries(user_id, DEFAULT_FORM_ID)
-        identity_query = queries[0] if len(queries) == 1 else {"$or": queries}
-        form = customer_info_collection.find_one(
-            identity_query,
-            {"_id": 0},
-            sort=[("updatedAt", -1), ("createdAt", -1)],
-        )
-        if form:
-            form, removed_prompt_values = scrub_internal_transcription_prompts(form)
-            if removed_prompt_values:
-                _log.warning(
-                    "internal_prompt_content_removed_during_latest_form_read",
-                    removed_values=removed_prompt_values,
-                    subject=pseudonymous_id(user_id),
-                )
-            form["timestamp"] = _serialize_datetime(form.get("timestamp"))
-            form["createdAt"] = _serialize_datetime(form.get("createdAt"))
-            form["updatedAt"] = _serialize_datetime(form.get("updatedAt"))
-        return form
-    except Exception as e:
-        print(f"[fetch_latest_form] Retrieval failed: {error_type(e)}")
-        return None
-
-
-def fetch_form_by_id(
-    form_id: str,
-    user_id: str = None,
-    attempt_id: Optional[str] = None,
-) -> dict:
-    """
-    Retrieve an exact attempt, or the latest matching legacy-compatible form.
-    
-    Args:
-        form_id: The form ID to retrieve
-        user_id: The user ID (required for uniqueness)
-        attempt_id: Optional intake-instance ID. Older clients may omit it and
-            receive the latest matching attempt.
-        
-    Returns:
-        Form document or None if not found
-    """
-    global customer_info_collection
-    
-    if customer_info_collection is None:
-        init_mongo()
-    
-    if customer_info_collection is None:
-        print("Warning: customer-info collection not available.")
-        return None
-    
-    if not user_id:
-        print("Warning: user_id is required to fetch form by form_id")
-        return None
-    
-    try:
-        # Try ObjectId first, then plain string — external systems may store userId
-        # as a string while our backend normalises it to ObjectId.
-        from bson import ObjectId as _ObjId
-        _uid_variants = [user_id]
-        try:
-            _uid_variants.insert(0, _ObjId(user_id))
-        except Exception:
-            pass
-        _queries = []
-        for _uid in _uid_variants:
-            _query = {"formId": form_id, "userId": _uid}
-            if attempt_id is not None:
-                _normalized_attempt = str(attempt_id).strip()
-                if not _normalized_attempt:
-                    raise ValueError("attempt_id cannot be empty")
-                _query["attemptId"] = _normalized_attempt
-            _queries.append(_query)
-        _identity_query = _queries[0] if len(_queries) == 1 else {"$or": _queries}
-        form = customer_info_collection.find_one(
-            _identity_query,
-            sort=[("updatedAt", -1), ("createdAt", -1)],
-        )
-        if form:
-            form, removed_prompt_values = scrub_internal_transcription_prompts(form)
-            if removed_prompt_values:
-                _log.warning(
-                    "internal_prompt_content_removed_during_form_read",
-                    removed_values=removed_prompt_values,
-                    subject=pseudonymous_id(user_id),
-                )
-            form["_id"] = str(form.get("_id", ""))
-            form["timestamp"] = _serialize_datetime(form.get("timestamp"))
-            form["createdAt"] = _serialize_datetime(form.get("createdAt"))
-            form["updatedAt"] = _serialize_datetime(form.get("updatedAt"))
-        return form
-    except Exception as e:
-        print(f"[fetch_form] Retrieval failed: {error_type(e)}")
-        return None
-
-
-def fetch_form_attachments(
-    form_id: str,
-    user_id: str = None,
-    attempt_id: Optional[str] = None,
-) -> List[dict]:
-    """
-    Retrieve attachments for a form.
-    The user and optional attempt identity scope the requested form.
-    """
-    global customer_info_collection
-
-    if customer_info_collection is None:
-        init_mongo()
-
-    if customer_info_collection is None:
-        return []
-
-    if not user_id:
-        print("Warning: user_id is required to fetch form attachments")
-        return []
-
-    try:
-        queries = build_user_form_queries(
-            user_id,
-            form_id,
-            attempt_id=attempt_id,
-        )
-        identity_query = queries[0] if len(queries) == 1 else {"$or": queries}
-        doc = customer_info_collection.find_one(
-            identity_query,
-            {"_id": 0, "attachments": 1},
-            sort=[("updatedAt", -1), ("createdAt", -1)],
-        )
-        # Patient UI uses metadata records; MongoDB/dashboard stores URL strings.
-        # Preserve the existing REST/WS shape while accepting both DB formats.
-        from urllib.parse import urlparse, unquote
-        return [
-            item if isinstance(item, dict) else {
-                "url": item, "type": "report", "label": "Medical Report",
-                "fileName": unquote(urlparse(item).path.rsplit("/", 1)[-1]),
-            }
-            for item in (doc.get("attachments", []) if doc else [])
-            if isinstance(item, (str, dict))
-        ]
-    except Exception as e:
-        print(f"[fetch_attachments] Retrieval failed: {error_type(e)}")
-        return []
-
-
-def create_placeholder_form(
-    user_id: str,
-    client_state: dict,
-    preferred_attempt_id: Optional[str] = None,
-) -> Optional[str]:
-    """Resolve or durably reserve the first intake attempt for a patient.
-
-    A newly allocated identity is persisted as an empty ``draft`` immediately.
-    Draft TTL cleanup prevents abandoned reservations from accumulating, while
-    persistence guarantees that a browser refresh can safely resume the same
-    attempt. Repeat intakes are still never allocated here; they must be
-    assigned by the consultant workflow.
-    """
-    # Check if a form already exists — if so, reuse its exact attempt.
-    existing = None if preferred_attempt_id else fetch_latest_form_for_user(user_id)
-    if existing:
-        existing_id = existing.get("formId", DEFAULT_FORM_ID)
-        client_state["form_id"] = existing_id
-        client_state["attempt_id"] = resolve_form_attempt_id(existing)
-        print("[create_placeholder_form] Reusing existing form")
-        return existing_id
-
-    # No existing form: allocate (or recover) the first attempt and persist an
-    # expiring draft so the identity remains valid across reloads.
-    client_state["form_id"] = DEFAULT_FORM_ID
-    client_state["attempt_id"] = (
-        str(preferred_attempt_id).strip()
-        if preferred_attempt_id
-        else resolve_form_attempt_id(existing)
-    )
-    if not client_state["attempt_id"]:
-        raise ValueError("Attempt ID cannot be empty")
-
-    saved_form_id = save_customer_info(
-        user_id=user_id,
-        form_data={},
-        current_section="Present Complaint",
-        form_id=DEFAULT_FORM_ID,
-        attempt_id=client_state["attempt_id"],
-    )
-    if not saved_form_id:
-        raise RuntimeError("Unable to reserve the new assessment attempt")
-    print("[create_placeholder_form] Persisted expiring draft attempt")
-    return DEFAULT_FORM_ID
 
 
 
@@ -1744,79 +608,6 @@ async def build_interview_state_async(
     )
 
 
-def user_has_reports(user_response: str) -> bool:
-    """
-    Check if the user's response indicates they have reports.
-    
-    Args:
-        user_response: The user's text response
-        
-    Returns:
-        True if user indicates they have reports, False otherwise
-    """
-    if not user_response:
-        return False
-    
-    normalized = user_response.lower().strip()
-    
-    # Special handling: phrases like "i do / i do not" combined with "report"
-    if "report" in normalized or "reports" in normalized:
-        if ("i do not" in normalized) or ("i don't" in normalized) or ("i dont" in normalized):
-            print("[user_has_reports] Detected 'i do not' with reports → treating as NO reports")
-            return False
-        if "i do" in normalized and not ("i do not" in normalized or "i don't" in normalized or "i dont" in normalized):
-            print("[user_has_reports] Detected 'i do' with reports → treating as HAS reports")
-            return True
-    
-    # Positive indicators that user has reports
-    positive_indicators = [
-        "yes", "yeah", "yep", "i have", "i do have", "i've got", "i got",
-        "i have reports", "i have mri", "i have x-ray", "i have x ray",
-        "i have ct scan", "i have blood reports", "i have scans",
-        "yes i have", "yes i do", "yes i do have", "i do have reports",
-        "i have some", "i have them", "yes i have them", "i got reports",
-        "i have the reports", "i have my reports", "i brought", "i brought reports"
-    ]
-    
-    # Negative indicators that user doesn't have reports
-    negative_indicators = [
-        "no", "nope",
-        "don't have", "do not have", "don't have any",
-        "dont have", "dont have any",
-        "no i don't", "no i do not",
-        "no i dont", "no i dont have",
-        "i don't have", "i do not have",
-        "i dont have", "i dont have any",
-        "no reports", "no i don't have", "no i dont have reports",
-        "none", "nothing", "no i haven't",
-        "i haven't", "i have not",
-        "no scans", "no mri", "no x-ray"
-    ]
-    
-    # Check for negative first (more definitive)
-    for neg in negative_indicators:
-        if neg in normalized:
-            print(f"[user_has_reports] User indicated NO reports: '{neg}' found in response")
-            return False
-    
-    # Check for positive indicators
-    for pos in positive_indicators:
-        if pos in normalized:
-            print(f"[user_has_reports] User indicated they HAVE reports: '{pos}' found in response")
-            return True
-    
-    # If no clear indicator, check if they mention having specific report types
-    report_types = ["mri", "x-ray", "x ray", "ct scan", "blood report", "scan", "reports"]
-    has_report_types = any(rt in normalized for rt in report_types)
-    
-    if has_report_types:
-        # If they mention report types without negative words, assume they have them
-        print(f"[user_has_reports] User mentioned report types, assuming they have reports")
-        return True
-    
-    return False
-
-
 def message_requires_attachment(
     current_section: Optional[str], 
     message_text: Optional[str] = None, 
@@ -1901,7 +692,7 @@ def _record_chat_audit(
     """Persist one short-lived transcript message without exposing it to logs."""
 
     return record_chat_message(
-        chat_history_collection,
+        mongo.chat_history_collection,
         user_id=client_state.get("user_id"),
         session_id=client_state.get("session_id"),
         form_id=client_state.get("form_id"),
@@ -1995,95 +786,8 @@ async def send_text_message(
     )
 
 
-COMPLETED_FORM_MESSAGE = (
-    "This assessment has already been completed and is now read-only. "
-    "If another assessment is needed, your clinician will send you a new assessment link."
-)
 
 
-def build_completed_form_payload(client_state: dict, form: dict) -> dict:
-    """Build the deterministic, zero-AI response for a terminal attempt."""
-
-    form_id = form.get("formId") or client_state.get("form_id")
-    attempt_id = form.get("attemptId") or client_state.get("attempt_id")
-    return {
-        "type": "form_completed",
-        "text": COMPLETED_FORM_MESSAGE,
-        "session_id": client_state["session_id"],
-        "formId": form_id,
-        "attemptId": attempt_id,
-        "status": FORM_COMPLETED,
-        "completedAt": _serialize_datetime(form.get("completedAt")),
-        "interview_state": {
-            "section": "Completed",
-            "progress": 100.0,
-            "missing_fields": [],
-            "attachments": [],
-            "formId": form_id,
-            "attemptId": attempt_id,
-            "sectionProgress": [],
-            "promSteps": None,
-            "status": FORM_COMPLETED,
-            "locked": True,
-        },
-    }
-
-
-async def send_completed_form(websocket: WebSocket, client_state: dict, form: dict) -> None:
-    """Lock a completed attempt in-session and notify the patient without AI."""
-
-    client_state["form_id"] = form.get("formId") or client_state.get("form_id")
-    client_state["attempt_id"] = form.get("attemptId") or client_state.get("attempt_id")
-    client_state["attempt_locked"] = True
-    client_state["locked_form"] = {
-        "formId": client_state.get("form_id"),
-        "attemptId": client_state.get("attempt_id"),
-        "status": FORM_COMPLETED,
-        "completedAt": form.get("completedAt"),
-    }
-    client_state["is_recording"] = False
-    client_state["received_audio_buffer"].clear()
-    client_state["recording_start_time"] = None
-    await websocket.send_text(json.dumps(build_completed_form_payload(client_state, form)))
-    await run_blocking(
-        _record_chat_audit,
-        client_state,
-        role="agent",
-        content=COMPLETED_FORM_MESSAGE,
-        message_type="form_completed",
-        phase=FORM_COMPLETED,
-        section="Completed",
-    )
-
-
-def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, agent=None):
-    """
-    Reset the per-connection HealthAgent for a new interview.
-    `agent` is the per-connection HealthAgent instance (no longer global).
-    """
-    if agent is None:
-        return  # safety guard
-
-    previous_user_id = client_state.get("user_id")
-    if previous_user_id and previous_user_id != new_user_id:
-        print("[reset_health_agent] Subject changed; resetting agent state")
-    elif previous_user_id == new_user_id:
-        print("[reset_health_agent] Existing subject started a new interview")
-    else:
-        print("[reset_health_agent] New interview subject; resetting agent state")
-
-    agent.init_form()
-    agent.talk_mode = "START"
-    agent.history = []
-    agent.history.append({"role": "agent", "message": agent.welcome_prompt})
-
-    client_state["user_id"] = new_user_id
-    client_state["form_id"] = None
-    client_state["attempt_id"] = None
-    client_state["prom_snapshot"] = None
-    client_state["prom_source_doc_id"] = None
-
-    print(f"[reset_health_agent] HealthAgent reset complete. Form is now empty: {len(agent.form)} sections")
 
 
 # Initialize database
@@ -2094,22 +798,9 @@ def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, a
 init_mongo()
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for Docker and monitoring."""
-    return {
-        "status": "ok",
-        "service": "healthflex-customer-agent",
-        "components": {
-            "mongodb": "ok" if customer_info_collection is not None else "degraded",
-            "graph": "ok" if _interview_graph is not None else "degraded",
-            "stt": "gemini-primary-google-cloud-speech-fallback",
-        },
-        "ai_telemetry": {
-            "metrics_endpoint": "/metrics" if _HAS_PROMETHEUS else None,
-            "pricing_version": PRICING_VERSION,
-        },
-    }
+register_health_routes(app, lambda: _interview_graph is not None)
+register_user_routes(app)
+register_form_routes(app)
 
 
 # def modify_system_prompt():
@@ -2224,12 +915,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     data = json.loads(message["text"])
                     msg_type = data.get("type", "")
 
-                    # Browser WebSockets cannot emit protocol-level ping frames.
-                    # This lightweight application heartbeat keeps idle patient
-                    # sessions alive through proxies/load balancers with a
-                    # one-minute idle timeout. It never changes interview state.
                     if msg_type == "ping":
-                        await websocket.send_text(json.dumps({"type": "pong"}))
+                        await handle_ping(websocket)
                         continue
 
                     # A completed attempt remains read-only even if an outdated
@@ -2285,7 +972,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         if not await run_blocking(validate_user_exists, provided_user_id):
                             # Get database info for error message
                             db_name, collection_name = collection_namespace(
-                                users_collection, "users"
+                                mongo.users_collection, "users"
                             )
                             error_msg = f"User {provided_user_id} does not exist in {db_name}.{collection_name}. Please use a valid user ID from your user management system."
                             print(f"[start_interview] ERROR: {error_msg}")
@@ -2768,7 +1455,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 client_state["graph_referral_asked"] = referral_complete
 
                                 # Derive the ordered form_sections list
-                                from src.prompts import get_medical_form_template as _get_tmpl
                                 client_state["graph_form_sections"] = list(form_data.keys())
 
                                 print(f"[start_interview] Loaded form at section index {_resume_idx}")
@@ -3032,14 +1718,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     print("[load_form] Removing empty placeholder before loading requested form")
                                     # Delete the empty form to prevent orphaned forms in the database
                                     try:
-                                        if customer_info_collection is not None:
+                                        if mongo.customer_info_collection is not None:
                                             delete_filter = build_owned_form_filter(
                                                 existing_form,
                                                 user_id_for_check,
                                                 existing_form_id,
                                             )
                                             result = await run_blocking(
-                                                customer_info_collection.delete_one,
+                                                mongo.customer_info_collection.delete_one,
                                                 delete_filter,
                                             )
                                             if result.deleted_count > 0:
@@ -3294,45 +1980,20 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # Continue from where they left off
 
                     elif msg_type == "end_session":
-                        provided_user_id = data.get("userId")
-                        if provided_user_id:
-                            client_state["user_id"] = provided_user_id
-
-                        try:
-                            import copy
-                            health_agent.save_progress()
-                            form_id = client_state.get("form_id")
-                            await run_blocking(
-                                save_customer_info,
-                                user_id=client_state["user_id"],
-                                form_data=copy.deepcopy(health_agent.form),  # Deep copy to prevent sharing
-                                current_section=health_agent.current_section,
-                                form_id=form_id,
-                                attempt_id=client_state.get("attempt_id"),
-                            )
-                            await send_text_message(
-                                websocket,
-                                client_state,
-                                "Interview summary saved.",
-                                await build_interview_state_async(
-                                    client_state,
-                                    progress_override=calculate_form_progress(
-                                        health_agent.form
-                                    ),
-                                ),
-                                user_response=None
-                            )
-                        except Exception as e:
-                            print(f"[end_session] Save failed: {error_type(e)}")
+                        await handle_end_session(
+                            websocket,
+                            data,
+                            client_state,
+                            health_agent,
+                            save_customer_info=save_customer_info,
+                            send_text_message=send_text_message,
+                            build_interview_state_async=build_interview_state_async,
+                            calculate_form_progress=calculate_form_progress,
+                            run_blocking=run_blocking,
+                        )
 
                     elif msg_type == "audio_start":
-                        # Client is starting to send audio
-                        client_state["is_recording"] = True
-                        client_state["received_audio_buffer"] = bytearray()
-                        # Use a monotonic server clock; client timestamps can be
-                        # absent, use different units, or be manipulated.
-                        client_state["recording_start_time"] = time.monotonic()
-                        print("Client started sending audio")
+                        handle_audio_start(client_state)
 
                     elif msg_type == "text_input":
                         # Client is sending text input (manual or auto-sent transcription)
@@ -3414,11 +2075,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             structured_answers=_structured_prom_answers,
                         )
                         if _escalation is not None:
-                            if clinical_escalations_collection is not None:
+                            if mongo.clinical_escalations_collection is not None:
                                 try:
                                     await run_blocking(
                                         record_escalation,
-                                        clinical_escalations_collection,
+                                        mongo.clinical_escalations_collection,
                                         _escalation,
                                         patient_id=client_state.get("user_id") or "",
                                         form_id=client_state.get("form_id"),
@@ -3863,15 +2524,6 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                         _reask_combined = _reask_preamble + "\n\n" + "\n".join(
                                             f"{_ri2 + 1}. {_q2}" for _ri2, _q2 in enumerate(_reask_qs)
                                         )
-                                        _reask_turn = {
-                                            "text": _reask_combined,
-                                            "type": "multi_answer",
-                                            "question_ids": _reask_ids,
-                                            "questions": _reask_qs,
-                                            "question_options": _reask_opts,
-                                            "question_types": _reask_types,
-                                            "question_scales": _reask_scales,
-                                        }
                                         _reask_meta = {
                                             "type": "multi_answer",
                                             "options": None,
@@ -4467,511 +3119,6 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
         # Close database connection
         # MongoDB DISABLED - Commented out
         # db.close()
-
-
-def validate_user_exists(user_id: str) -> bool:
-    """
-    Validate that a user exists in the MongoDB users collection.
-    
-    Args:
-        user_id: The user ID to validate (as string or ObjectId)
-        
-    Returns:
-        True if user exists, False otherwise
-    """
-    try:
-        from bson import ObjectId
-        
-        # Ensure MongoDB connection
-        if users_collection is None:
-            print(f"[validate_user_exists] MongoDB not connected")
-            return False
-        
-        # Get database and collection names for logging
-        db_name = users_collection.database.name
-        collection_name = users_collection.name
-        
-        # Convert user_id to ObjectId if it's a valid ObjectId string
-        try:
-            user_object_id = ObjectId(user_id) if isinstance(user_id, str) else user_id
-        except Exception:
-            print("[validate_user_exists] Invalid subject identifier format")
-            return False
-        
-        # Check if user exists
-        user = users_collection.find_one({"_id": user_object_id})
-        exists = user is not None
-        
-        if exists:
-            print(f"[validate_user_exists] Subject exists in {db_name}.{collection_name}")
-        else:
-            print(f"[validate_user_exists] Subject not found in {db_name}.{collection_name}")
-        
-        return exists
-        
-    except Exception as e:
-        print(f"[validate_user_exists] Validation failed: {error_type(e)}")
-        return False
-
-
-def ensure_users_collection() -> Collection:
-    """Get an initialized users collection or raise."""
-    global users_collection
-
-    if users_collection is None:
-        # Attempt to reconnect once to avoid stale connections
-        init_mongo()
-
-    if users_collection is None:
-        raise RuntimeError("User directory is not configured on the server.")
-
-    return users_collection
-
-
-def _fetch_users_sync(collection: Collection, mongo_query: dict, limit: int) -> list[dict]:
-    """Execute and consume the synchronous PyMongo cursor off the event loop."""
-
-    cursor = collection.find(mongo_query).sort("updatedAt", -1).limit(limit)
-    users = []
-    for doc in cursor:
-        serialized = serialize_user(doc)
-        if serialized and serialized["id"]:
-            users.append(serialized)
-    return users
-
-
-@app.get("/api/users")
-async def get_users(
-    search: str = Query(default="", description="Optional search term"),
-    limit: int = Query(default=50, ge=1, le=500),
-):
-    """Return up-to-date list of users for the selector."""
-    try:
-        collection = await run_blocking(ensure_users_collection)
-
-        mongo_query = {}
-        if search:
-            regex = {"$regex": search, "$options": "i"}
-            mongo_query = {
-                "$or": [
-                    {"firstName": regex},
-                    {"lastName": regex},
-                    {"name": regex},
-                    {"email": regex},
-                ]
-            }
-
-        users = await run_blocking(_fetch_users_sync, collection, mongo_query, limit)
-
-        return {"users": users}
-    except HTTPException:
-        raise
-    except RuntimeError as err:
-        raise HTTPException(
-            status_code=500,
-            detail=str(err),
-        ) from err
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to fetch users: {str(e)}"
-        )
-
-
-@app.get("/api/users/{user_id}/consent")
-async def get_consent_status(
-    user_id: str,
-):
-    """
-    Check whether a user has accepted the consent policy.
-    Checks two sources:
-    1. users.profileData.consentAccepted (set by our API or legacy)
-    2. consentrecords collection (written by consent.stance.health via recordConsent GraphQL mutation)
-    """
-    try:
-        from app.config import MONGO_DB_NAME
-        users_col = await run_blocking(ensure_users_collection)
-        user_oid = ObjectId(user_id)
-
-        # Source 1: users.profileData.consentAccepted
-        user = await run_blocking(
-            users_col.find_one,
-            {"_id": user_oid},
-            {"profileData.consentAccepted": 1, "profileData.consentAcceptedAt": 1}
-        )
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-
-        profile = user.get("profileData", {})
-        if profile.get("consentAccepted"):
-            return {
-                "consentAccepted": True,
-                "source": "profileData",
-                "consentAcceptedAt": str(profile.get("consentAcceptedAt", "")),
-            }
-
-        # Source 2: consentrecords collection (created by consent.stance.health)
-        try:
-            db = users_col.database
-            consent_col = db["consentrecords"]
-            record = await run_blocking(
-                consent_col.find_one,
-                {"userId": user_oid, "isActive": True},
-                {"acceptedAt": 1}
-            )
-            if record:
-                return {
-                    "consentAccepted": True,
-                    "source": "consentrecords",
-                    "consentAcceptedAt": str(record.get("acceptedAt", "")),
-                }
-        except Exception as ce:
-            print(f"[consent] consentrecords check failed (non-fatal): {ce}")
-
-        return {"consentAccepted": False}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to check consent: {str(e)}")
-
-
-@app.post("/api/users/{user_id}/consent")
-async def accept_consent(
-    user_id: str,
-):
-    """Record that a user has accepted the consent policy."""
-    try:
-        from datetime import datetime, timezone
-        collection = await run_blocking(ensure_users_collection)
-        user_oid = ObjectId(user_id)
-        result = await run_blocking(
-            collection.update_one,
-            {"_id": user_oid},
-            {"$set": {
-                "profileData.consentAccepted": True,
-                "profileData.consentAcceptedAt": datetime.now(timezone.utc),
-                "profileData.consentPolicyVersion": "1.1.0",
-            }}
-        )
-        if result.matched_count == 0:
-            raise HTTPException(status_code=404, detail="User not found")
-        return {"success": True, "consentAccepted": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to record consent: {str(e)}")
-
-
-@app.get("/api/users/{user_id}/forms")
-async def get_user_forms_endpoint(
-    user_id: str,
-):
-    """Return all forms for a specific user."""
-    try:
-        forms = await run_blocking(fetch_user_forms, user_id)
-        return {"forms": forms}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to fetch user forms: {str(e)}"
-        )
-
-
-@app.get("/api/forms/{form_id}")
-async def get_form_endpoint(
-    form_id: str,
-    userId: str = Query(..., description="User ID (required)"),
-    attemptId: Optional[str] = Query(None, description="Form attempt ID"),
-):
-    """Return a specific form by form_id and userId."""
-    try:
-        form = await run_blocking(fetch_form_by_id, form_id, userId, attemptId)
-        if form is None:
-            raise HTTPException(status_code=404, detail="Form not found")
-        return {"form": form}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to fetch form: {str(e)}"
-        )
-
-
-@app.get("/api/forms/{form_id}/progress")
-async def get_form_progress_endpoint(
-    form_id: str,
-    userId: str = Query(..., description="User ID (required)"),
-    attemptId: Optional[str] = Query(None, description="Form attempt ID"),
-):
-    """
-    Return section completion status for a form.
-    Sections are ordered with completed sections first, incomplete sections at the bottom.
-    """
-    try:
-        form = await run_blocking(fetch_form_by_id, form_id, userId, attemptId)
-        if form is None:
-            raise HTTPException(status_code=404, detail="Form not found")
-        
-        form_data = form.get("form_data", {})
-        progress_data = calculate_section_completion_status(form_data)
-        
-        return progress_data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to calculate form progress: {str(e)}"
-        )
-
-
-@app.post("/api/forms/{form_id}/attachments")
-async def upload_form_attachment(
-    form_id: str,
-    files: List[UploadFile] = File(...),
-    userId: str = Form(...),
-    attemptId: Optional[str] = Form(None),
-):
-    """Upload multiple scans/reports to S3, generate combined summary, and auto-fill Reports section."""
-    if not is_s3_configured():
-        raise HTTPException(
-            status_code=500,
-            detail="S3 is not configured on the server.",
-        )
-
-    form = await run_blocking(fetch_form_by_id, form_id, userId, attemptId)
-    if not form:
-        raise HTTPException(status_code=404, detail="Form not found.")
-
-    # Enforce that each form remains bound to a single user.
-    # Compare as strings to handle ObjectId vs string mismatches.
-    if str(form.get("userId", "")) != str(userId):
-        raise HTTPException(
-            status_code=403,
-            detail="Form does not belong to this user.",
-        )
-
-    if is_completed_form(form):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This assessment has already been completed and is read-only. "
-                "A clinician must assign a new assessment before additional files can be uploaded."
-            ),
-        )
-
-    if not files:
-        raise HTTPException(status_code=400, detail="No files provided.")
-    if len(files) > MAX_ATTACHMENT_FILES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"A maximum of {MAX_ATTACHMENT_FILES} files is allowed per request.",
-        )
-
-    max_bytes = MAX_ATTACHMENT_SIZE_MB * 1024 * 1024
-    max_total_bytes = MAX_ATTACHMENT_TOTAL_MB * 1024 * 1024
-    validated_files = []
-    total_pages = 0
-
-    # Read and validate the complete request before creating any S3 objects.
-    # This prevents a late invalid/oversized file from leaving partial uploads.
-    for file_index, file in enumerate(files, start=1):
-        filename = file.filename or "upload.bin"
-        current_total = sum(len(item[0]) for item in validated_files)
-        remaining_total = max_total_bytes - current_total
-        try:
-            if remaining_total <= 0:
-                raise ValueError("Combined files exceed the request size limit")
-            read_limit = min(max_bytes, remaining_total)
-            try:
-                file_bytes = await read_upload_bounded(file, max_bytes=read_limit)
-            except ValueError as exc:
-                if remaining_total < max_bytes:
-                    raise ValueError(
-                        "Combined files exceed the request size limit"
-                    ) from exc
-                raise ValueError("File exceeds the per-file size limit") from exc
-            validate_upload_quotas(
-                [len(file_bytes)],
-                max_files=1,
-                max_file_bytes=max_bytes,
-                max_total_bytes=max_bytes,
-            )
-            running_total = current_total + len(file_bytes)
-            if running_total > max_total_bytes:
-                raise ValueError("Combined files exceed the request size limit")
-            inspection = await run_blocking(
-                inspect_report_upload,
-                file_bytes,
-                filename,
-                file.content_type,
-            )
-            total_pages += inspection.page_count
-            if total_pages > MAX_REPORT_TOTAL_PAGES:
-                raise ValueError(
-                    f"Combined reports exceed the {MAX_REPORT_TOTAL_PAGES}-page limit"
-                )
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File {file_index} was rejected: {exc}",
-            ) from exc
-        except Exception as exc:
-            print(f"[upload_attachment] Content inspection failed: {error_type(exc)}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"File {file_index} is corrupt or cannot be decoded.",
-            ) from exc
-
-        validated_files.append(
-            (file_bytes, filename, inspection.identity.content_type)
-        )
-
-    try:
-        validate_upload_quotas(
-            (len(item[0]) for item in validated_files),
-            max_files=MAX_ATTACHMENT_FILES,
-            max_file_bytes=max_bytes,
-            max_total_bytes=max_total_bytes,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if report_jobs_collection is None:
-        await run_blocking(init_mongo)
-    if report_jobs_collection is None:
-        raise HTTPException(status_code=500, detail="Report queue is unavailable.")
-    active_report_jobs = await run_blocking(
-        report_jobs_collection.count_documents,
-        {"status": {"$in": ["queued", "retry", "processing"]}},
-        limit=REPORT_JOB_MAX_BACKLOG,
-    )
-    if active_report_jobs >= REPORT_JOB_MAX_BACKLOG:
-        raise HTTPException(
-            status_code=503,
-            detail="Report processing is at capacity. Please retry later.",
-        )
-
-    report_objects = []
-    attachment_records = []
-
-    # Upload only after the entire batch has passed preflight validation.
-    for file_bytes, filename, content_type in validated_files:
-        key = generate_object_key(userId, form_id, filename)
-        
-        try:
-            s3_url = await run_blocking(
-                upload_bytes_to_s3,
-                file_bytes,
-                key,
-                content_type,
-            )
-            print(f"[upload_attachment] Uploaded object ({len(file_bytes)} bytes)")
-        except RuntimeError as exc:
-            print(f"[upload_attachment] S3 upload failed: {error_type(exc)}")
-            continue
-
-        report_objects.append({"key": key, "filename": filename})
-        
-        attachment_records.append({
-            "id": str(uuid.uuid4()),
-            "type": "report",
-            "label": "Medical Report",
-            "fileName": filename,
-            "url": s3_url,
-            "uploadedAt": datetime.now(timezone.utc).isoformat(),
-            "contentType": content_type,
-        })
-
-    if not report_objects:
-        raise HTTPException(status_code=400, detail="No valid files were uploaded.")
-
-    # ── Step 1: Save attachment records to MongoDB immediately ────────────────
-    if customer_info_collection is None or report_jobs_collection is None:
-        await run_blocking(init_mongo)
-    if customer_info_collection is None or report_jobs_collection is None:
-        raise HTTPException(status_code=500, detail="Database unavailable.")
-
-    owned_form_filter = build_owned_form_filter(form, userId, form_id)
-    job_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc)
-    form_data = form.get("form_data", {})
-    hist_diag = form_data.get("History & Diagnostics", {})
-    processing_text = (
-        f"Uploaded {len(attachment_records)} document(s). "
-        "Report summary processing is in progress."
-    )
-    update_fields = {
-        "reportProcessing": {
-            "jobId": job_id,
-            "status": "queued",
-            "queuedAt": now,
-        },
-        "updatedAt": now,
-    }
-    from src.graph.pure_functions.summary import reports_with_verified_upload
-    report_value = reports_with_verified_upload(hist_diag.get("Reports", ""))
-    if not str(hist_diag.get("Reports", "")).strip():
-        report_value += "; " + processing_text
-    update_fields["form_data.History & Diagnostics.Reports"] = report_value
-    form_data.setdefault("History & Diagnostics", {})["Reports"] = report_value
-
-    from app.uploads.attachments import append_attachment_urls_expression
-    await run_blocking(
-        customer_info_collection.update_one,
-        owned_form_filter,
-        [{"$set": {
-            **{key: {"$literal": value} for key, value in update_fields.items()},
-            "attachments": append_attachment_urls_expression(attachment_records),
-        }}],
-    )
-    print(f"[upload_attachment] Saved {len(attachment_records)} attachment(s) to MongoDB")
-
-    try:
-        job = build_report_job(
-            job_id=job_id,
-            user_id=owned_form_filter["userId"],
-            form_id=form_id,
-            objects=report_objects,
-            now=now,
-        )
-        await run_blocking(
-            report_jobs_collection.insert_one,
-            job,
-        )
-    except Exception as exc:
-        await run_blocking(
-            customer_info_collection.update_one,
-            {
-                "formId": form_id,
-                "userId": owned_form_filter["userId"],
-                "reportProcessing.jobId": job_id,
-            },
-            {
-                "$set": {
-                    "reportProcessing.status": "enqueue_failed",
-                    "reportProcessing.failedAt": datetime.now(timezone.utc),
-                }
-            },
-        )
-        _log.error("report_job_enqueue_failed", error_type=error_type(exc))
-        raise HTTPException(
-            status_code=503,
-            detail="Reports were uploaded, but summary processing could not be queued.",
-        ) from exc
-
-    updated_progress = calculate_form_progress(form_data)
-    section_progress = calculate_section_completion_status(form_data)
-
-    return {
-        "attachments": attachment_records,
-        "reports_filled": True,
-        "ocr_status": "processing",
-        "ocr_job_id": job_id,
-        "form_data": form_data,
-        "progress": updated_progress,
-        "sectionProgress": section_progress,
-    }
 
 
 if __name__ == "__main__":

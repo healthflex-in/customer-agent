@@ -117,12 +117,12 @@ class UploadPolicyTests(unittest.TestCase):
         )
 
     def test_server_inspects_complete_content_before_s3_upload(self):
-        server_source = (
-            Path(__file__).resolve().parents[1] / "server.py"
+        route_source = (
+            Path(__file__).resolve().parents[1] / "app" / "api" / "forms.py"
         ).read_text(encoding="utf-8")
 
-        inspection = server_source.index("inspect_report_upload,")
-        upload = server_source.index("upload_bytes_to_s3,", inspection)
+        inspection = route_source.index("inspect_report_upload,")
+        upload = route_source.index("upload_bytes_to_s3,", inspection)
         self.assertLess(inspection, upload)
 
 

@@ -29,10 +29,9 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
         self.assertNotIn("agent state contains data at {section}.{field}", flow)
 
     def test_first_attempt_is_persisted_before_opening_messages(self):
-        source = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
+        source = (BACKEND_ROOT / "app" / "forms" / "repository.py").read_text(encoding="utf-8")
         helper_start = source.index("def create_placeholder_form(")
-        helper_end = source.index("def build_interview_state(", helper_start)
-        helper = source[helper_start:helper_end]
+        helper = source[helper_start:]
 
         self.assertIn("saved_form_id = save_customer_info(", helper)
         self.assertIn("form_data={}", helper)

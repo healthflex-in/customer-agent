@@ -69,22 +69,30 @@ class AIUsageTests(unittest.TestCase):
             AIUsage(measured=True, input_text_tokens=70, output_tokens=11),
         )
 
-    def test_verified_gemini_rates_are_model_and_modality_specific(self):
-        usage = AIUsage(
+    def test_configured_gemini_rates_are_model_specific(self):
+        text_usage = AIUsage(
             input_text_tokens=1_000_000,
-            input_audio_tokens=1_000_000,
             output_tokens=1_000_000,
         )
 
         self.assertAlmostEqual(
-            ai_usage.estimate_cost_usd("google_genai", "gemini-2.5-flash", usage),
-            3.80,
+            ai_usage.estimate_cost_usd("google_genai", "gemini-2.5-flash", text_usage),
+            2.80,
         )
         self.assertAlmostEqual(
             ai_usage.estimate_cost_usd(
-                "google_genai", "gemini-2.5-flash-lite", usage
+                "google_genai", "gemini-3.5-flash-lite", text_usage
             ),
-            0.80,
+            2.80,
+        )
+
+    def test_audio_cost_is_not_guessed_without_a_configured_rate(self):
+        self.assertIsNone(
+            ai_usage.estimate_cost_usd(
+                "google_genai",
+                "gemini-3.5-flash-lite",
+                AIUsage(input_audio_tokens=1_000_000),
+            )
         )
 
     def test_unknown_provider_rate_is_never_guessed(self):
@@ -181,7 +189,7 @@ class AIUsageTests(unittest.TestCase):
         with patch.object(ai_usage, "record_ai_call") as record:
             returned = tracked_ai_call(
                 provider="google_genai",
-                model="gemini-2.5-flash",
+                model="gemini-3.5-flash-lite",
                 operation="test",
                 call=lambda: response,
                 usage_extractor=gemini_usage,
