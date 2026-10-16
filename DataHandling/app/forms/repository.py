@@ -81,6 +81,21 @@ def resolve_assessment_appointment_id(user_id: str):
     return None
 
 
+def save_for_graph(user_id, form, section, form_id, chat_history=None,
+                    preferred_doc_id=None, lifecycle_status=None,
+                    attempt_id=None):
+    # NOTE: preferred_doc_id must be passed in by the caller — this function
+    # runs at module scope (and inside background threads) where the per-
+    # connection `client_state` is NOT in scope. Referencing it here raised
+    # NameError on every call, silently dropping the FRM-01 intake save.
+    return save_customer_info(user_id=user_id, form_data=form,
+                              current_section=section, form_id=form_id,
+                              chat_history=chat_history,
+                              preferred_doc_id=preferred_doc_id,
+                              lifecycle_status=lifecycle_status,
+                              attempt_id=attempt_id)
+
+
 def save_customer_info(
     user_id: str,
     form_data: dict,

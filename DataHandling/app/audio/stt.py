@@ -20,6 +20,7 @@ import sys
 import logging
 
 from app.ai.models import MODEL_REGISTRY
+from app.ai.thinking import bounded_thinking
 from app.content_safety import contains_internal_transcription_prompt
 from app.observability.ai_usage import AIUsage, gemini_usage, tracked_ai_call
 from app.observability.privacy import error_type
@@ -118,6 +119,7 @@ def _transcribe_with_gemini(raw_audio_bytes: bytes) -> str:
 
     mime_type = _detect_mime_type(raw_audio_bytes)
     client = _genai.Client(api_key=api_key)
+    thinking = bounded_thinking(MODEL_REGISTRY.audio)
 
     _t0 = _time.perf_counter()
     response = tracked_ai_call(
@@ -130,7 +132,7 @@ def _transcribe_with_gemini(raw_audio_bytes: bytes) -> str:
             config=_types.GenerateContentConfig(
                 system_instruction=_GEMINI_STT_PROMPT,
                 temperature=0,
-                thinking_config=_types.ThinkingConfig(thinking_budget=0),
+                thinking_config=_types.ThinkingConfig(**thinking.as_kwargs()),
             ),
         ),
         usage_extractor=gemini_usage,

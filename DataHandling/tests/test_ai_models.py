@@ -102,12 +102,13 @@ class GeminiModelRegistryTests(unittest.TestCase):
 
     def test_reasoning_provider_has_a_bounded_request_timeout(self):
         project_root = Path(__file__).resolve().parents[1]
-        server_source = (project_root / "server.py").read_text(encoding="utf-8")
+        gemini_source = (project_root / "app" / "ai" / "gemini.py").read_text(encoding="utf-8")
         config_source = (project_root / "app" / "config.py").read_text(encoding="utf-8")
 
         self.assertIn("GEMINI_REQUEST_TIMEOUT_MS", config_source)
-        self.assertIn("http_options=_genai_r_types.HttpOptions(", server_source)
-        self.assertIn("timeout=GEMINI_REQUEST_TIMEOUT_MS", server_source)
+        self.assertIn("http_options=types.HttpOptions(", gemini_source)
+        self.assertIn("timeout=timeout_ms", gemini_source)
+        self.assertIn("timeout_ms: int = GEMINI_REQUEST_TIMEOUT_MS", gemini_source)
 
 
 if __name__ == "__main__":

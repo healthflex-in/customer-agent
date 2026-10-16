@@ -1,4 +1,51 @@
-"""Per-connection interview session reset."""
+"""Per-connection interview session state."""
+
+import time
+
+
+def new_client_state() -> dict:
+    """Return the empty state for one newly accepted socket."""
+
+    client_state = {
+        "session_id": f"session_{int(time.time())}",
+        # user_id will be provided by the frontend (real app user ID)
+        # via the "start_interview" message. We intentionally avoid
+        # generating placeholder IDs like "user_<timestamp>" so that
+        # all MongoDB documents are tied to real users from your system.
+        "user_id": None,
+        "interview_id": None,
+        "form_id": None,
+        "attempt_id": None,
+        # Terminal attempts are read-only. This server-side flag blocks text,
+        # audio, end-session saves, and patient-created replacement attempts.
+        "attempt_locked": False,
+        "locked_form": None,
+        "prom_snapshot": None,
+        "prom_source_doc_id": None,
+        "first_interaction": True,
+        "is_recording": False,
+        "received_audio_buffer": bytearray(),
+        "recording_start_time": None,
+        # Orchestrator session tracking
+        "current_question_id": None,
+        # LangGraph state (graph_* keys are managed by server_adapter helpers)
+        "graph_form": None,
+        "graph_question_round": None,
+        "graph_current_section": None,
+        "graph_phase": None,
+        "graph_history": None,
+        "graph_form_sections": None,
+        "graph_asked_previous_consultations": False,
+        "graph_reports_uploaded": False,
+        "graph_awaiting_report_upload": False,
+        "graph_attempts_on_current_section": 0,
+    }
+    # Create a new interview record
+    # MongoDB DISABLED - Using placeholder values instead
+    # interview_id = db.create_interview(user_id, client_state["session_id"])
+    interview_id = f"interview_{int(time.time())}"  # Placeholder interview ID
+    client_state["interview_id"] = interview_id
+    return client_state
 
 
 def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, agent=None):

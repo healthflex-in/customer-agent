@@ -73,7 +73,14 @@ class TranscriptionContentSafetyTests(unittest.TestCase):
             stt.transcribe_audio_bytes(b"audio")
 
     def test_server_has_delivery_submission_persistence_and_read_guards(self):
-        source = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                BACKEND_ROOT / "server.py",
+                BACKEND_ROOT / "app" / "ws" / "handlers" / "text.py",
+                BACKEND_ROOT / "app" / "ws" / "handlers" / "audio.py",
+            )
+        )
         repository = (BACKEND_ROOT / "app" / "forms" / "repository.py").read_text(encoding="utf-8")
 
         self.assertGreaterEqual(source.count("contains_internal_transcription_prompt"), 3)

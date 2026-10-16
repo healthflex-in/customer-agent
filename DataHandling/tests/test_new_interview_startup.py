@@ -12,9 +12,11 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
         self.assertFalse(has_meaningful_form_data({}))
 
     def test_new_frm01_sends_only_single_opening_prompt(self):
-        source = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
+        source = (
+            BACKEND_ROOT / "app" / "ws" / "handlers" / "interview.py"
+        ).read_text(encoding="utf-8")
         start = source.index("# NEW INTERVIEW MODE: Verify reset and create new form")
-        end = source.index('elif msg_type == "start_new_form"', start)
+        end = source.index("async def handle_start_new_form", start)
         flow = source[start:end]
 
         safe_check = flow.index("form_has_data = has_meaningful_form_data(form_data)")
@@ -39,17 +41,21 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
         self.assertIn('raise RuntimeError("Unable to reserve', helper)
 
     def test_unknown_attempt_recovery_is_limited_to_first_form(self):
-        source = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
+        source = (
+            BACKEND_ROOT / "app" / "ws" / "handlers" / "interview.py"
+        ).read_text(encoding="utf-8")
         start = source.index("if provided_attempt_id and not existing_form:")
         end = source.index("# Check if user already has a form", start)
         recovery = source[start:end]
 
         self.assertIn("_any_existing_attempt", recovery)
         self.assertIn('"code": "ATTEMPT_NOT_FOUND"', recovery)
-        self.assertIn("continue", recovery)
+        self.assertIn("return", recovery)
 
     def test_empty_reserved_draft_uses_single_opening_prompt(self):
-        source = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
+        source = (
+            BACKEND_ROOT / "app" / "ws" / "handlers" / "interview.py"
+        ).read_text(encoding="utf-8")
         start = source.index("# Resume must be deterministic.")
         end = source.index("await send_text_message(", start)
         selection = source[start:end]
@@ -59,18 +65,20 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
         self.assertIn("resume_message = INITIAL_INTAKE_PROMPT", selection)
 
         resume_start = source.index("client_state[\"graph_history\"]", start)
-        next_question = source.index("continue\n                            else:", resume_start)
+        next_question = source.index("return\n        else:", resume_start)
         empty_draft_guard = source[resume_start:next_question]
         self.assertIn(
             'if not _saved_patient_content and not client_state.get("tagged_turns"):',
             empty_draft_guard,
         )
-        self.assertIn("continue", empty_draft_guard)
+        self.assertIn("return", empty_draft_guard)
 
     def test_resuming_never_uses_legacy_ai_summary(self):
-        source = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
+        source = (
+            BACKEND_ROOT / "app" / "ws" / "handlers" / "interview.py"
+        ).read_text(encoding="utf-8")
         start = source.index("# Resume must be deterministic.")
-        end = source.index("else:\n                                print(\"[start_interview] Requested form not found", start)
+        end = source.index('print("[start_interview] Requested form not found', start)
         resume_flow = source[start:end]
 
         self.assertNotIn("health_agent.generate_summary", resume_flow)
