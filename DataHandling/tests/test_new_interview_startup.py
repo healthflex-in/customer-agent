@@ -2,6 +2,8 @@ from pathlib import Path
 import unittest
 
 from app.forms.lifecycle import has_meaningful_form_data
+from src.forms.loader import load_form
+from src.graph.pure_functions.resume import build_resume_plan
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -57,13 +59,6 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
             BACKEND_ROOT / "app" / "ws" / "handlers" / "interview.py"
         ).read_text(encoding="utf-8")
         start = source.index("# Resume must be deterministic.")
-        end = source.index("await send_text_message(", start)
-        selection = source[start:end]
-
-        self.assertIn("elif not _saved_patient_content:", selection)
-        self.assertLess(selection.index("elif not _saved_patient_content:"), selection.index("elif not _required_missing:"))
-        self.assertIn("resume_message = INITIAL_INTAKE_PROMPT", selection)
-
         resume_start = source.index("client_state[\"graph_history\"]", start)
         next_question = source.index("return\n        else:", resume_start)
         empty_draft_guard = source[resume_start:next_question]
@@ -83,7 +78,7 @@ class NewInterviewStartupRegressionTests(unittest.TestCase):
 
         self.assertNotIn("health_agent.generate_summary", resume_flow)
         self.assertNotIn("health_agent.talk_to_user", resume_flow)
-        self.assertIn("contextual_resume_question", resume_flow)
+        self.assertIn("_resume_plan.message", resume_flow)
 
     def test_short_clinical_first_reply_is_not_treated_as_confirmation(self):
         source = (

@@ -101,6 +101,39 @@ _INTAKE_ANSWER_SIGNALS = re.compile(
     re.I,
 )
 
+_ACTIONABLE_INTAKE_FACT = re.compile(
+    r"(?:"
+    # Explicit symptom/location statements and corrections.
+    r"\b(?:i|my)\s+(?:also\s+)?(?:have|has|had|feel|felt|experience|experienced|"
+    r"don'?t have|do not have)\b.{0,45}\b(?:pain|ache|injur|numb|tingl|stiff|swollen)|"
+    r"\b(?:pain|severity|rating|score)\b.{0,18}\b(?:is|was|to|from)\s*\d{1,2}\b|"
+    r"\b\d{1,2}\s*(?:/\s*10|out of 10)\b|"
+    # Onset, triggers and relief supplied as facts rather than requests.
+    r"\b(?:it|this|the pain|my pain)\s+(?:started|began|gets|got|becomes|became|"
+    r"feels|felt|improves|improved|worsens|worsened)\b|"
+    r"\b(?:walking|sitting|standing|moving|bending|exercise|rest|massage|ice|heat)"
+    r"\b.{0,35}\b(?:makes|made|causes|caused|helps|helped|relieves|relieved)\b|"
+    # History and lifestyle facts that must remain collectable in a mixed turn.
+    r"\bi\s+(?:work|exercise|smoke|drink|saw|visited|consulted|had surgery|"
+    r"have an?\s+(?:mri|x-?ray|ct scan|report))\b|"
+    r"\bi\s+(?:do not|don'?t|never)\s+(?:smoke|drink|exercise)\b|"
+    r"\bmy\s+(?:job|occupation|goal|expectation)\s+(?:is|was)\b"
+    r")",
+    re.I,
+)
+
+
+def has_actionable_intake_fact(user_input: str | None) -> bool:
+    """Return True when an advice question also contains a concrete patient fact.
+
+    This is intentionally conservative: generic symptom words inside a question
+    are not enough. A match requires an assertion, numeric severity, or another
+    explicit intake answer so pure medical-advice questions remain blocked.
+    """
+
+    text = " ".join(str(user_input or "").split())
+    return bool(text and _ACTIONABLE_INTAKE_FACT.search(text))
+
 
 def _looks_like_detailed_intake_answer(text: str) -> bool:
     """Recognize pasted Q&A and detailed clinical replies before boundary checks."""
@@ -133,6 +166,12 @@ def build_out_of_flow_response(
     if build_intake_clarification(text, last_agent_question) is not None:
         return None
 
+    # A short upload deferral answers the active reports question. Let report
+    # intent handling record it and continue instead of returning a refusal.
+    from src.graph.pure_functions.summary import is_report_upload_deferral
+    if is_report_upload_deferral(text, last_agent_question):
+        return None
+
     # Corrections, upload/navigation questions, and pasted clinical Q&A belong
     # to the intake even when their wording starts with "can" or "what".
     if _IN_FLOW_OPERATIONAL.search(text):
@@ -147,7 +186,8 @@ def build_out_of_flow_response(
     # They are statements, not questions, even though the first word is also a
     # question word (for example: "When I walk, the pain gets worse").
     if re.match(r"^(?:when|while)\s+(?:i|my|the)\b", lowered) and re.search(
-        r"\b(?:pain|hurt|ache|worse|better|relief|reliev|massage|walk|move|bend)\b",
+        r"\b(?:pain|hurt|ache|worse|better|relief|reliev|massage|walk|move|bend|"
+        r"stand|feel|fine|normal|okay|ok)\b",
         lowered,
     ):
         return None

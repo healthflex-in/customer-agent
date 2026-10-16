@@ -11,6 +11,32 @@ from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
 
 
+_REPORT_UPLOAD_DEFERRAL = re.compile(
+    r"^(?:i\s+)?(?:will|shall|can)\s+(?:share|upload|attach|send)"
+    r"(?:\s+(?:it|them|the\s+reports?))?\s+later\b|"
+    r"^(?:i['’]?ll\s+)?(?:share|upload|attach|send)"
+    r"(?:\s+(?:it|them|the\s+reports?))?\s+later\b|"
+    r"^(?:not\s+now|later)\b",
+    re.I,
+)
+
+
+def is_report_upload_deferral(
+    user_input: str | None, context_question: str | None
+) -> bool:
+    """Recognize a short deferral only in explicit report/upload context."""
+
+    question = " ".join(str(context_question or "").lower().split())
+    if not re.search(
+        r"\b(?:reports?|documents?|x[ -]?rays?|mri|ct scans?|blood reports?|"
+        r"scans?|upload|attach)\b",
+        question,
+    ):
+        return False
+    answer = " ".join(str(user_input or "").strip().split())
+    return bool(_REPORT_UPLOAD_DEFERRAL.search(answer))
+
+
 def reports_with_verified_upload(value: str) -> str:
     """Keep extracted report findings, replacing obsolete absence claims."""
     text = str(value or "").strip()
@@ -257,6 +283,13 @@ def classify_reports_intent(
                     "blood test", "lab", "x ray", "imaging", "film", "result"]
     _cq_str = str(context_question) if not isinstance(context_question, str) else context_question
     asking_about_reports = any(w in _cq_str.lower() for w in report_words) if _cq_str else False
+
+    if is_report_upload_deferral(user_input, context_question):
+        return {
+            "has_reports": True,
+            "wants_upload": False,
+            "deferred_upload": True,
+        }
 
     decline_upload_indicators = [
         "don't want to upload", "dont want to upload", "do not want to upload",

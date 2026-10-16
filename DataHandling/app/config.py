@@ -37,10 +37,20 @@ MONGO_TLS_CA_FILE: str | None = os.getenv("MONGO_TLS_CA_FILE")
 # Optional secret used only to correlate pseudonymous subjects across events.
 OBSERVABILITY_HASH_KEY: str | None = os.getenv("OBSERVABILITY_HASH_KEY")
 
+# Dev MongoDB — used when requests originate from dev.customerai.stance.health
+DEV_MONGO_URI: str | None = os.getenv(
+    "DEV_MONGO_URI",
+    "mongodb+srv://healthflex-dev:FUvgMqSppKigmKHK@healthflex-dev.5kbaq08.mongodb.net/stance-dashboard?retryWrites=true&w=majority",
+)
+DEV_MONGO_DB_NAME: str = os.getenv("DEV_MONGO_DB_NAME", "stance-development")
+
+DEV_ORIGIN: str = "https://dev.customerai.stance.health"
+
 
 # ── HTTP / CORS ────────────────────────────────────────────────────────────
 _DEFAULT_CORS_ALLOWED_ORIGINS = [
     "https://customerai.stance.health",
+    "https://dev.customerai.stance.health",
     "https://customer-agent-mu.vercel.app",
     "http://localhost:3000",
     "http://localhost:8080",
@@ -78,6 +88,33 @@ def _positive_int_env(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
+
+
+def _boolean_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+# Disabled by default. QA may retain original audio + paired STT output inside
+# the Docker container to investigate transcription problems.
+DEBUG_AUDIO_CAPTURE: bool = _boolean_env("DEBUG_AUDIO_CAPTURE", False)
+DEBUG_AUDIO_DIR: str = os.getenv(
+    "DEBUG_AUDIO_DIR", "/tmp/customer-agent-audio-debug"
+)
+DEBUG_AUDIO_RETENTION_HOURS: int = _positive_int_env(
+    "DEBUG_AUDIO_RETENTION_HOURS", 24
+)
+DEBUG_AUDIO_MAX_TOTAL_MB: int = _positive_int_env(
+    "DEBUG_AUDIO_MAX_TOTAL_MB", 250
+)
+DEBUG_AUDIO_MAX_TOTAL_BYTES: int = DEBUG_AUDIO_MAX_TOTAL_MB * 1024 * 1024
 
 
 CHAT_HISTORY_RETENTION_DAYS: int = _positive_int_env(
