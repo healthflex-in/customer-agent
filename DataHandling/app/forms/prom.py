@@ -9,6 +9,31 @@ PROM_COMPLETION_MESSAGE = (
     "Thank you for completing the assessment! Your responses have been recorded."
 )
 
+PROM_SCALE_MAP = {
+    "prom_ohs":    "Oxford Hip Score (OHS)",
+    "prom_oss":    "Oxford Shoulder Score (OSS)",
+    "prom_phq9":   "PHQ-9 (Depression)",
+    "prom_gad7":   "GAD-7 (Anxiety)",
+    "prom_nps":    "Numeric Pain Scale (NPS)",
+    "prom_rmdq":   "RMDQ (Back Disability)",
+    "prom_koos":   "KOOS (Knee)",
+    "prom_dash":   "DASH (Arm/Shoulder/Hand)",
+    "prom_odi":    "Oswestry Disability Index (ODI)",
+    "prom_whoqol": "WHOQOL (Quality of Life)",
+}
+
+
+def prom_field_label(suffix: str) -> str:
+    return suffix.replace("_", " ").title()
+
+
+def prom_scale_is_answered(val) -> bool:
+    """Return True only when a PROM scale value has at least one real answer.
+    Empty dicts (skeleton placeholders) and empty strings both return False."""
+    if isinstance(val, dict):
+        return any(str(v).strip() for v in val.values() if v)
+    return bool(val and str(val).strip())
+
 
 def parse_structured_prom_answers(
     text: str,

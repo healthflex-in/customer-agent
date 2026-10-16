@@ -21,6 +21,7 @@ if load_dotenv is not None:
 SUPPORTED_GEMINI_MODELS = frozenset({
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
+    "gemini-3.5-flash-lite", #testing only will have to check behaviour and cost
 })
 
 RETIRED_GEMINI_MODELS = frozenset({
@@ -70,19 +71,19 @@ def build_model_registry(environment: Mapping[str, str]) -> GeminiModelRegistry:
     """Build and validate model configuration without contacting a provider."""
 
     general = _normalize_model_name(
-        environment.get("GEMINI_GENERAL_MODEL", "gemini-2.5-flash-lite"),
+        environment.get("GEMINI_GENERAL_MODEL", "gemini-3.5-flash-lite"),
         "GEMINI_GENERAL_MODEL",
     )
     reasoning = _normalize_model_name(
-        environment.get("GEMINI_REASONING_MODEL", "gemini-2.5-flash"),
+        environment.get("GEMINI_REASONING_MODEL", "gemini-3.5-flash-lite"),
         "GEMINI_REASONING_MODEL",
     )
     audio = _normalize_model_name(
-        environment.get("GEMINI_AUDIO_MODEL", reasoning),
+        environment.get("GEMINI_AUDIO_MODEL", "gemini-3.5-flash-lite"),
         "GEMINI_AUDIO_MODEL",
     )
     search = _normalize_model_name(
-        environment.get("GEMINI_SEARCH_MODEL", reasoning),
+        environment.get("GEMINI_SEARCH_MODEL", "gemini-3.5-flash-lite"),
         "GEMINI_SEARCH_MODEL",
     )
 

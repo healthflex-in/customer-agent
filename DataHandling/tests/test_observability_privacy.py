@@ -52,6 +52,7 @@ class ObservabilityPrivacyTests(unittest.TestCase):
         paths = [
             project_root / "server.py",
             project_root / "app" / "mcp_client.py",
+            *sorted((project_root / "app" / "ws" / "handlers").glob("*.py")),
             *sorted((project_root / "src").rglob("*.py")),
         ]
         forbidden = (
