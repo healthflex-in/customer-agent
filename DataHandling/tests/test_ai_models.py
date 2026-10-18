@@ -14,7 +14,7 @@ class GeminiModelRegistryTests(unittest.TestCase):
         registry = build_model_registry({})
 
         self.assertEqual(registry.general, "gemini-3.5-flash-lite")
-        self.assertEqual(registry.reasoning, "gemini-3.5-flash-lite")
+        self.assertEqual(registry.reasoning, "gemini-2.5-flash")
         self.assertEqual(registry.audio, "gemini-3.5-flash-lite")
         self.assertEqual(registry.search, "gemini-3.5-flash-lite")
         self.assertEqual(

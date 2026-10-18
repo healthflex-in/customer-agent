@@ -49,14 +49,35 @@ class PriceRate:
     request: float | None = None
 
 
-# Google standard paid-tier prices verified against the official pricing page
-# on this date. Deployment can replace/extend these entries via AI_PRICING_JSON.
-DEFAULT_PRICING_VERSION = "google-standard-2026-09-02"
+# Google Gemini API standard paid tier, USD per 1,000,000 tokens.
+# Source: https://ai.google.dev/gemini-api/docs/pricing
+# Checked 2026-10-18. Batch, Flex, and Priority tiers are not included.
+# Deployment can replace/extend these entries via AI_PRICING_JSON.
+DEFAULT_PRICING_VERSION = "google-standard-2026-10-18"
 DEFAULT_PRICING: dict[str, PriceRate] = {
+    # Text $0.30, audio $1.00, output $2.50, cached text $0.03, cached audio $0.10.
     "google_genai/gemini-2.5-flash": PriceRate(
         input_text_per_million=0.30,
+        input_audio_per_million=1.00,
         output_per_million=2.50,
         cached_text_per_million=0.03,
+        cached_audio_per_million=0.10,
+    ),
+    # Text $0.10, audio $0.30, output $0.40, cached text $0.01, cached audio $0.03.
+    "google_genai/gemini-2.5-flash-lite": PriceRate(
+        input_text_per_million=0.10,
+        input_audio_per_million=0.30,
+        output_per_million=0.40,
+        cached_text_per_million=0.01,
+        cached_audio_per_million=0.03,
+    ),
+    # Text and audio share one input rate, $0.30. Output $2.50. Cache $0.03.
+    "google_genai/gemini-3.5-flash-lite": PriceRate(
+        input_text_per_million=0.30,
+        input_audio_per_million=0.30,
+        output_per_million=2.50,
+        cached_text_per_million=0.03,
+        cached_audio_per_million=0.03,
     ),
 }
 

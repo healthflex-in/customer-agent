@@ -81,6 +81,12 @@ class AIUsageTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             ai_usage.estimate_cost_usd(
+                "google_genai", "gemini-2.5-flash-lite", text_usage
+            ),
+            0.50,
+        )
+        self.assertAlmostEqual(
+            ai_usage.estimate_cost_usd(
                 "google_genai", "gemini-3.5-flash-lite", text_usage
             ),
             2.80,
@@ -90,9 +96,33 @@ class AIUsageTests(unittest.TestCase):
         self.assertIsNone(
             ai_usage.estimate_cost_usd(
                 "google_genai",
-                "gemini-3.5-flash-lite",
+                "gemini-unpriced",
                 AIUsage(input_audio_tokens=1_000_000),
             )
+        )
+        self.assertAlmostEqual(
+            ai_usage.estimate_cost_usd(
+                "google_genai",
+                "gemini-2.5-flash",
+                AIUsage(input_audio_tokens=1_000_000),
+            ),
+            1.00,
+        )
+        self.assertAlmostEqual(
+            ai_usage.estimate_cost_usd(
+                "google_genai",
+                "gemini-2.5-flash-lite",
+                AIUsage(input_audio_tokens=1_000_000),
+            ),
+            0.30,
+        )
+        self.assertAlmostEqual(
+            ai_usage.estimate_cost_usd(
+                "google_genai",
+                "gemini-3.5-flash-lite",
+                AIUsage(input_audio_tokens=1_000_000),
+            ),
+            0.30,
         )
 
     def test_unknown_provider_rate_is_never_guessed(self):

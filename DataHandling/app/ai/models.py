@@ -15,13 +15,13 @@ if load_dotenv is not None:
     load_dotenv()
 
 
-# Production-approved stable IDs, verified against Google's model lifecycle on
-# 2026-09-02. Adding a new model is an intentional reviewed change because model
-# migrations can alter clinical extraction behaviour and cost.
+# Production-approved stable IDs. Adding a new model is an intentional reviewed
+# change because model migrations can alter clinical extraction behaviour.
+# Standard paid-tier rates for these IDs live in app.observability.ai_usage.
 SUPPORTED_GEMINI_MODELS = frozenset({
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
-    "gemini-3.5-flash-lite", #testing only will have to check behaviour and cost
+    "gemini-3.5-flash-lite",  # behaviour still under review; rates are in the pricing catalog
 })
 
 RETIRED_GEMINI_MODELS = frozenset({
@@ -75,7 +75,7 @@ def build_model_registry(environment: Mapping[str, str]) -> GeminiModelRegistry:
         "GEMINI_GENERAL_MODEL",
     )
     reasoning = _normalize_model_name(
-        environment.get("GEMINI_REASONING_MODEL", "gemini-3.5-flash-lite"),
+        environment.get("GEMINI_REASONING_MODEL", "gemini-2.5-flash"),
         "GEMINI_REASONING_MODEL",
     )
     audio = _normalize_model_name(
@@ -89,7 +89,7 @@ def build_model_registry(environment: Mapping[str, str]) -> GeminiModelRegistry:
 
     raw_fallbacks = environment.get("GEMINI_FALLBACK_MODELS")
     fallback_values = (
-        [reasoning]
+        [general]
         if raw_fallbacks is None
         else [item for item in raw_fallbacks.split(",") if item.strip()]
     )

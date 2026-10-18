@@ -11,6 +11,7 @@ import re
 
 
 _REFERRAL_QUESTION_PATTERNS = (
+    r"\bwhere did you hear about us\b",
     r"\bhow did you (?:come to know|hear|find|learn) about\b",
     r"\bhow (?:did|have) you (?:hear|heard|find|found) (?:about|us)\b",
     r"\bhow (?:did|have) you (?:come across|discover)\b",
@@ -47,6 +48,40 @@ _REFERRAL_CHANNELS = (
     ("podcast", "Podcast"),
     ("blog", "Blog/article"),
 )
+
+
+def referral_answer(question: str | None, user_input: str | None) -> str | None:
+    """Return the clause that answers where the patient heard about us.
+
+    In a batch, the activity-and-habits question takes two comma-separated
+    clauses. The source clause is the one after those, and it is not taken
+    from an activity or habit answer.
+    """
+
+    text = " ".join(str(user_input or "").strip().split())
+    if not text or not is_referral_question(question):
+        return None
+    bullets = [
+        line.strip()[2:].strip()
+        for line in str(question or "").splitlines()
+        if line.strip().startswith("- ")
+    ]
+    if not bullets:
+        return text
+    clauses = [part.strip() for part in re.split(r"\s*[,;]\s*", text) if part.strip()]
+    index = 0
+    for bullet in bullets:
+        normalized = " ".join(bullet.lower().split())
+        if is_referral_question(bullet):
+            if index >= len(clauses):
+                return None
+            return clauses[index]
+        index += (
+            2
+            if "activity or exercise" in normalized and "smoke or drink" in normalized
+            else 1
+        )
+    return None
 
 
 def is_referral_question(text: str | None) -> bool:

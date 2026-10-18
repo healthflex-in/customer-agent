@@ -287,8 +287,7 @@ class IntakeClarificationTests(unittest.TestCase):
         self.assertTrue(result["direct_response_handled"])
         self.assertIn("what procedure", result["response_text"])
         lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
-        self.assertIn("Activity/exercise:", lifestyle)
-        self.assertIn("work out once a week", lifestyle.lower())
+        self.assertEqual(lifestyle, "")
         self.assertEqual(result["history"][-1]["role"], "agent")
         self.assertEqual(result["history"][-1]["message"], result["response_text"])
 

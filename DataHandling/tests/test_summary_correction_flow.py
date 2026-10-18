@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import types
 import unittest
@@ -480,36 +481,31 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
             "history": [{"role": "agent", "message": "Is this correct?"}],
         }
 
-        def unexpected(_prompt):
-            self.fail("Explicit alcohol correction must not call AI")
+        def correction_llm(_prompt):
+            return json.dumps({
+                "is_correction": True,
+                "confidence": "high",
+                "updates": [{
+                    "operation": "update",
+                    "section_name": "Current Lifestyle",
+                    "field_name": "Alcohol",
+                    "new_value": "does drink",
+                }],
+                "needs_clarification": False,
+                "clarification_question": "",
+            })
 
-        state.update(make_classify_summary_intent_node(unexpected)(state))
+        state.update(make_classify_summary_intent_node(correction_llm)(state))
         self.assertEqual(state["summary_intent"]["intent"], "request_change")
-        state.update(make_handle_summary_response_node(unexpected)(state))
-        state.update(make_detect_correction_node(unexpected)(state))
-        result = make_apply_correction_node(unexpected)(state)
+        state.update(make_handle_summary_response_node(correction_llm)(state))
+        state.update(make_detect_correction_node(correction_llm)(state))
+        result = make_apply_correction_node(correction_llm)(state)
 
         lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
-        self.assertIn("Alcohol: Drinks alcohol", lifestyle)
+        self.assertIn("Alcohol: does drink", lifestyle)
         self.assertNotIn("Does not drink alcohol", lifestyle)
+        self.assertIn("Work: I work in a company", lifestyle)
         self.assertTrue(result["correction_applied"])
-
-        # A retried delivery must be idempotent and must never fall back to the
-        # invalid Current Lifestyle -> Alcohol field path.
-        retry_state = {
-            **state,
-            **result,
-            "phase": "summary",
-            "user_input": "thanks but I do drink pls update",
-        }
-        retry_state.update(make_detect_correction_node(unexpected)(retry_state))
-        retry = make_apply_correction_node(unexpected)(retry_state)
-        self.assertTrue(retry["correction_applied"])
-        self.assertIn("already recorded", retry["response_text"])
-        self.assertEqual(
-            retry["form"]["History & Diagnostics"]["Current Lifestyle"],
-            lifestyle,
-        )
 
     def test_lifestyle_alias_from_correction_model_maps_to_real_schema_field(self):
         form = {

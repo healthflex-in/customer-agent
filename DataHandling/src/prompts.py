@@ -153,7 +153,7 @@ Example output format:
 
 # ──────────────────────────────────────────────────────────────
 # REASONING EXTRACTOR — replaces FORMAT_PROMPT multi-pass stack
-# Uses gemini-3.5-flash-lite to reason through the full conversation
+# Uses gemini-2.5-flash to reason through the full conversation
 # and fill the form with genuine understanding, not keyword matching
 # ──────────────────────────────────────────────────────────────
 REASONING_EXTRACTOR_PROMPT = """You are an intelligent medical intake analyst for Stance Health, India's first technology-enabled MSK health platform.

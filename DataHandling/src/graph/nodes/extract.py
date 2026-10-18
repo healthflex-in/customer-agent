@@ -598,26 +598,26 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         previous_lifestyle = form.get("History & Diagnostics", {}).get(
             "Current Lifestyle", ""
         )
-        # Lifestyle is persisted only through the deterministic, question-aware
-        # merger.  This prevents a reasoning-model cross-field guess (for
-        # example a pain trigger written as exercise) from replacing trusted
-        # lifestyle data.  The merger also handles bare occupation answers such
-        # as "accountant", so valid answers are not lost or asked twice.
+        # A lifestyle field is written only when this turn's question asked it.
+        # The reasoning result may add the other habit. It does not replace
+        # the reply, and an unrelated answer leaves the model's lifestyle text.
+        model_lifestyle = ""
+        model_diagnostics = updated_form.get("History & Diagnostics")
+        if isinstance(model_diagnostics, dict):
+            model_lifestyle = model_diagnostics.get("Current Lifestyle") or ""
         updated_lifestyle = merge_lifestyle_answer(
             previous_lifestyle,
             user_input,
             last_agent_q,
+            model_lifestyle=model_lifestyle,
         )
-        if updated_lifestyle or updated_form.get("History & Diagnostics", {}).get(
-            "Current Lifestyle"
-        ):
-            updated_form = dict(updated_form)
-            updated_form["History & Diagnostics"] = dict(
-                updated_form.get("History & Diagnostics", {})
-            )
-            updated_form["History & Diagnostics"]["Current Lifestyle"] = (
-                updated_lifestyle
-            )
+        updated_form = dict(updated_form)
+        updated_form["History & Diagnostics"] = dict(
+            updated_form.get("History & Diagnostics", {})
+        )
+        updated_form["History & Diagnostics"]["Current Lifestyle"] = (
+            updated_lifestyle
+        )
 
         # A patient may have a report but explicitly choose to show it directly
         # to the clinician. Persist both facts deterministically so the Reports
@@ -787,7 +787,8 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
             state.get("referral_asked", False) and not _stored_referral
         )
         if _referral_turn:
-            _ref_input = user_input.strip()
+            from src.graph.pure_functions.referral import referral_answer
+            _ref_input = referral_answer(last_agent_q, user_input) or ""
             _is_null = _ref_input.lower() in {"no", "nope", "nah", "none", "n/a", "na", ""}
 
             # Farewell/closing signals — don't store goodbyes as referral source
