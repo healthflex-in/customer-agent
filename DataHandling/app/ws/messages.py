@@ -90,6 +90,8 @@ async def send_text_message(
     user_response: Optional[str] = None,
     force_request_attachment: bool = False,
     question_meta: Optional[dict] = None,
+    audit_message_type: str = "text_message",
+    audit_event_key: Optional[str] = None,
 ):
     """
     Send a text message to the client.
@@ -101,6 +103,8 @@ async def send_text_message(
         interview_state: Optional interview state
         user_response: Optional user's previous response (to check if they have reports)
         force_request_attachment: If True, always show the upload button regardless of heuristics
+        audit_message_type: Chat-history type for this agent message (e.g. "resume_state")
+        audit_event_key: Stable key so a repeated event is stored only once
     """
     if interview_state and interview_state.get("status") == FORM_COMPLETED:
         # Completion during an active session uses a final text_message. Lock
@@ -147,7 +151,8 @@ async def send_text_message(
         client_state,
         role="agent",
         content=text,
-        message_type="text_message",
+        message_type=audit_message_type,
+        event_key=audit_event_key,
         question_id=(question_meta or {}).get("questionId"),
         phase=resolved_interview_state.get("status"),
         section=resolved_interview_state.get("section"),

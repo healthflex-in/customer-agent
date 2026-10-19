@@ -7,13 +7,19 @@ is a separate command.
 
 import json
 import time
+import uuid
 
 from fastapi import WebSocket
 
 from app.audio.limits import audio_limit_error
+from app.audit.chat_history import build_pending_voice_input
 from app.config import (
     AUDIO_RATE as RATE,
     AUDIO_SAMPLE_WIDTH as SAMPLE_WIDTH,
+    DEBUG_AUDIO_CAPTURE,
+    DEBUG_AUDIO_DIR,
+    DEBUG_AUDIO_MAX_TOTAL_BYTES,
+    DEBUG_AUDIO_RETENTION_HOURS,
     MAX_AUDIO_SESSION_BYTES,
     MAX_AUDIO_SESSION_SECONDS,
 )
@@ -61,10 +67,69 @@ async def handle_audio_end(
     print(
         f"Received complete audio: {len(audio_bytes)} bytes, duration: {audio_duration:.2f}s"
     )
+
+    # Optional QA-only capture of the original browser audio.
+    # The default remains memory-only. Files live only in the
+    # container filesystem and are age/size pruned. Capture
+    # before the minimum-length check so failed short clips
+    # are available when diagnosing recorder/transcription
+    # problems.
+    debug_audio_capture = None
+    if DEBUG_AUDIO_CAPTURE and audio_bytes:
+        try:
+            from app.audio.debug_capture import save_debug_audio
+
+            debug_audio_capture = await run_blocking(
+                save_debug_audio,
+                audio_bytes,
+                enabled=True,
+                directory=DEBUG_AUDIO_DIR,
+                retention_hours=DEBUG_AUDIO_RETENTION_HOURS,
+                max_total_bytes=DEBUG_AUDIO_MAX_TOTAL_BYTES,
+                metadata={
+                    "userId": client_state.get("user_id"),
+                    "sessionId": client_state.get("session_id"),
+                    "attemptId": client_state.get("attempt_id"),
+                    "interviewId": client_state.get("interview_id"),
+                    "formId": client_state.get("form_id"),
+                    "declaredDurationSeconds": audio_duration,
+                    "measuredDurationSeconds": elapsed_seconds,
+                },
+            )
+            if debug_audio_capture is not None:
+                print(
+                    "[audio-debug] Saved capture "
+                    f"{debug_audio_capture.capture_id}"
+                )
+        except Exception as debug_error:
+            print(
+                "[audio-debug] Capture failed: "
+                f"{error_type(debug_error)}"
+            )
+
+    async def update_audio_debug_status(**updates):
+        """Keep optional debug writes from affecting STT delivery."""
+        if debug_audio_capture is None:
+            return
+        try:
+            from app.audio.debug_capture import update_debug_capture
+
+            await run_blocking(
+                update_debug_capture,
+                debug_audio_capture,
+                **updates,
+            )
+        except Exception as debug_error:
+            print(
+                "[audio-debug] Status update failed: "
+                f"{error_type(debug_error)}"
+            )
+
     # Skip processing if not enough audio data received
     if (
         len(audio_bytes) < RATE * SAMPLE_WIDTH * 0.5
     ):  # At least 0.5 seconds
+        await update_audio_debug_status(status="rejected_too_short")
         print(
             f"Audio too short ({len(audio_bytes)} bytes), skipping"
         )
@@ -88,9 +153,15 @@ async def handle_audio_end(
         transcription = await run_blocking(
             transcribe_audio_bytes, audio_bytes
         )
+        raw_transcription = transcription
         t_stt_ms = (time.perf_counter() - t_stt_start) * 1000
         print(f"[audio] STT latency={t_stt_ms:.0f}ms transcript_chars={len(transcription)}")
+        await update_audio_debug_status(
+            status="transcribed",
+            raw_transcript=raw_transcription,
+        )
         if contains_internal_transcription_prompt(transcription):
+            await update_audio_debug_status(status="rejected_internal_prompt")
             _log.warning(
                 "internal_prompt_content_rejected_before_transcription_delivery",
                 subject=pseudonymous_id(client_state.get("user_id")),
@@ -101,6 +172,7 @@ async def handle_audio_end(
             }))
             return
         if is_hallucination(transcription):
+            await update_audio_debug_status(status="rejected_hallucination")
             print("[audio] Hallucination detected — discarding transcription")
             await websocket.send_text(json.dumps({
                 "type": "error",
@@ -108,16 +180,45 @@ async def handle_audio_end(
             }))
             return
         transcription = clean_transcript(transcription)
-        # Send transcription immediately to frontend for real-time display
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "type": "transcription",
-                    "text": transcription,
-                    "timestamp": timestamp,
-                }
-            )
+        await update_audio_debug_status(
+            status="delivered",
+            cleaned_transcript=transcription,
         )
+
+        # The server remembers which transcription it delivered so the
+        # patient's next submitted answer can be audited as voice input
+        # without trusting file metadata sent by the client.
+        transcription_id = f"TRN-{uuid.uuid4()}"
+        audio_capture_id = (
+            debug_audio_capture.capture_id
+            if debug_audio_capture is not None
+            else None
+        )
+        audio_filename = (
+            debug_audio_capture.audio_path.name
+            if debug_audio_capture is not None
+            else None
+        )
+        client_state["pending_voice_input"] = build_pending_voice_input(
+            transcript=transcription,
+            transcription_id=transcription_id,
+            audio_capture_id=audio_capture_id,
+            audio_filename=audio_filename,
+        )
+
+        # Send transcription immediately to frontend for real-time display
+        transcription_payload = {
+            "type": "transcription",
+            "text": transcription,
+            "timestamp": timestamp,
+            "inputSource": "voice_transcription",
+            "transcriptionId": transcription_id,
+        }
+        if audio_capture_id:
+            transcription_payload["audioCaptureId"] = audio_capture_id
+        if audio_filename:
+            transcription_payload["audioFilename"] = audio_filename
+        await websocket.send_text(json.dumps(transcription_payload))
         # (transcript .txt write removed — never read back)
         # Log user's speech in the database
         # MongoDB DISABLED - Commented out
@@ -137,6 +238,10 @@ async def handle_audio_end(
         # The text_input handler (line 751) will process it and send the response
         print(f"Transcription sent to frontend. Waiting for user to click send...")
     except Exception as e:
+        await update_audio_debug_status(
+            status="transcription_error",
+            error_code=error_type(e),
+        )
         print(f"[audio] Processing failed: {error_type(e)}")
         await websocket.send_text(
             json.dumps(

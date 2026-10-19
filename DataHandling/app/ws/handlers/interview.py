@@ -8,6 +8,7 @@ import json
 
 from fastapi import WebSocket
 
+from app.audit.chat_history import resume_event_key
 from app.clinical.scope import assess_msk_intake_scope
 from app.config import DEFAULT_FORM_ID
 from app.db.mongo import mongo
@@ -510,47 +511,16 @@ async def handle_start_interview(
                 form_data.get("Present Complaint", {}).get("Primary Complaint", "")
             ) if provided_form_id == DEFAULT_FORM_ID else None
 
-            # Validate sections using the stateless LangGraph helper
-            # (takes form as a parameter — no global state risk).
-            from src.graph.pure_functions.form_validation import validate_section as _vs
-            pc_complete   = not bool(_vs(form_data, "Present Complaint"))
-            prev_complete = not bool(_vs(form_data, "Previous Consultations"))
-            pain_complete = not bool(_vs(form_data, "Pain Assessment"))
-            hist_complete = not bool(_vs(form_data, "History & Diagnostics"))
-            goals_complete = not bool(_vs(form_data, "Treatment Goals"))
-            referral_complete = not bool(_vs(form_data, "Referral"))
+            from src.graph.pure_functions.resume import build_resume_plan
+            _resume_plan = build_resume_plan(form_data, current_section)
+            _required_missing = list(_resume_plan.missing)
+            _resume_section = _resume_plan.current_section
+            _resume_idx = _resume_plan.question_round
 
-            def first_incomplete():
-                if not pc_complete:
-                    return "Present Complaint"
-                if not prev_complete:
-                    return "Previous Consultations"
-                if not pain_complete:
-                    return "Pain Assessment"
-                if not hist_complete:
-                    return "History & Diagnostics"
-                if not goals_complete:
-                    return "Treatment Goals"
-                if not referral_complete:
-                    return "Referral"
-                return current_section
-
-            # Derive idx and current_section locally from form_data
-            if (not pc_complete) or (not prev_complete):
-                _resume_idx = 0
-            elif (not pain_complete) or (not hist_complete):
-                _resume_idx = 1
-            elif (not goals_complete) or (not referral_complete):
-                _resume_idx = 2
-            else:
-                _resume_idx = 3
-
-            _resume_section = first_incomplete()
-
-            # Always resume into interviewing phase so the graph never
-            # re-runs the welcome/first-turn logic on reconnect.
-            if client_state.get("graph_phase") is not None:
-                client_state["graph_phase"] = "interviewing"
+            # A fresh socket starts with graph_phase=None. Restore it
+            # unconditionally; the old conditional sent the first reply
+            # after reconnect through welcome/first-turn handling.
+            client_state["graph_phase"] = _resume_plan.phase
 
             # CRITICAL: Sync the full graph state from MongoDB so the first
             # user turn after a redeploy doesn't overwrite saved data with
@@ -562,9 +532,11 @@ async def handle_start_interview(
 
             # Derive the correct question_round from section completion so the
             # graph asks questions at the right depth (not restarting from round 0).
-            _idx = _resume_idx
-            client_state["graph_question_round"] = _idx if _idx < 3 else 2
-            client_state["graph_referral_asked"] = referral_complete
+            client_state["graph_question_round"] = _resume_idx
+            client_state["graph_referral_asked"] = not any(
+                section == "Referral" and field == "Source"
+                for section, field in _required_missing
+            )
 
             # Derive the ordered form_sections list
             client_state["graph_form_sections"] = list(form_data.keys())
@@ -576,36 +548,34 @@ async def handle_start_interview(
             # it can invent facts and duplicate a summary on
             # every reconnect. Use the same required-field
             # plan as a live LangGraph turn.
-            _required_missing = [
-                (section, field)
-                for section in client_state["graph_form_sections"]
-                for field in _vs(form_data, section)
-            ]
             if _saved_scope is not None:
                 resume_message = _saved_scope.patient_message
                 client_state["scope_notice_sent"] = True
-            elif not _saved_patient_content:
-                resume_message = INITIAL_INTAKE_PROMPT
-            elif not _required_missing:
-                resume_message = (
-                    "All required answers for this assessment are already saved. "
-                    "Please ask your clinician to review the assessment."
-                )
+                client_state["graph_phase"] = "interviewing"
             else:
-                from src.graph.pure_functions.question_plan import contextual_resume_question
-                from src.forms.loader import load_form as _load_resume_form
-                resume_message = contextual_resume_question(
-                    form_data,
-                    _required_missing,
-                    _load_resume_form("FRM-01").field_labels,
-                )
+                resume_message = _resume_plan.message
+
+            _resume_missing_ids = [
+                f"{section}.{field}"
+                for section, field in _required_missing
+            ]
+            _resume_event_key = resume_event_key(
+                user_id=provided_user_id,
+                form_id=provided_form_id,
+                attempt_id=client_state.get("attempt_id"),
+                phase=client_state["graph_phase"],
+                missing_field_ids=_resume_missing_ids,
+                form=form_data,
+            )
 
             await send_text_message(
                 websocket,
                 client_state,
                 resume_message,
                 await build_interview_state_async(client_state),
-                user_response=None
+                user_response=None,
+                audit_message_type="resume_state",
+                audit_event_key=_resume_event_key,
             )
             client_state["startup_sent"] = True
 

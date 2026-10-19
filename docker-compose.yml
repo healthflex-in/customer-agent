@@ -18,6 +18,8 @@ services:
       - CHROMA_DB_PATH=/app/db/vector/chroma_db_collective
       - LANGFUSE_CAPTURE_CONTENT=${LANGFUSE_CAPTURE_CONTENT:-false}
       - OBSERVABILITY_HASH_KEY=${OBSERVABILITY_HASH_KEY:-}
+      # Patient voice recordings (kept 48h, see DEBUG_AUDIO_* in .env)
+      - DEBUG_AUDIO_DIR=/app/audio_debug
     
     volumes:
       # Persist audio files, transcripts, and cache
@@ -25,6 +27,7 @@ services:
       - ./DataHandling/transcripts:/app/transcripts
       - ./DataHandling/output:/app/output
       - ./DataHandling/received_audio:/app/received_audio
+      - ./DataHandling/audio_debug:/app/audio_debug
       
       # Persist vector database
       - ./DataHandling/db:/app/db
