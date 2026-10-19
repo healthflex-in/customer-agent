@@ -141,7 +141,9 @@ class GraphTopologyContractTests(unittest.TestCase):
         self.assertNotIn("tagged_cleanup_done", fresh)
         self.assertNotIn("is_correction_turn", fresh)
         server = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
+        thoughts = (BACKEND_ROOT / "app" / "ws" / "thoughts.py").read_text(encoding="utf-8")
         self.assertNotIn('"classify_intent": {', server)
+        self.assertNotIn('"classify_intent": {', thoughts)
 
 
 if __name__ == "__main__":

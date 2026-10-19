@@ -260,3 +260,43 @@ def record_chat_message(
         # Never print the exception payload because it may contain patient text.
         print(f"[chat-history] Audit write failed: {error_type(exc)}")
         return False
+
+
+def record_client_chat(
+    client_state: dict,
+    *,
+    role: str,
+    content: str,
+    message_type: str = "text_message",
+    request_id: object = None,
+    question_id: object = None,
+    error_code: object = None,
+    phase: object = None,
+    section: object = None,
+) -> bool:
+    """Persist one short-lived transcript message without exposing it to logs."""
+
+    from app.config import CHAT_HISTORY_RETENTION_DAYS
+    from app.db.mongo import mongo
+
+    return record_chat_message(
+        mongo.chat_history_collection,
+        user_id=client_state.get("user_id"),
+        session_id=client_state.get("session_id"),
+        form_id=client_state.get("form_id"),
+        attempt_id=client_state.get("attempt_id"),
+        interview_id=client_state.get("interview_id"),
+        role=role,
+        content=content,
+        message_type=message_type,
+        phase=phase if phase is not None else client_state.get("graph_phase"),
+        section=(
+            section
+            if section is not None
+            else client_state.get("graph_current_section")
+        ),
+        request_id=request_id,
+        question_id=question_id,
+        error_code=error_code,
+        retention_days=CHAT_HISTORY_RETENTION_DAYS,
+    )

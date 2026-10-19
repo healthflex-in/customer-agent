@@ -38,7 +38,7 @@ class ClinicalScopeTests(unittest.TestCase):
 
     def test_scope_boundary_precedes_all_ai_intake_routes(self):
         backend_root = Path(__file__).resolve().parents[1]
-        source = (backend_root / "server.py").read_text(encoding="utf-8")
+        source = (backend_root / "app" / "ws" / "handlers" / "text.py").read_text(encoding="utf-8")
         urgent_gate = source.index("_escalation = assess_urgent_risk(")
         scope_gate = source.index("_scope_decision = assess_msk_intake_scope(text_input)")
         boundary_gate = source.index("_boundary_response = (")
@@ -52,7 +52,7 @@ class ClinicalScopeTests(unittest.TestCase):
         self.assertLess(scope_gate, graph_path)
 
     def test_scope_clarification_is_a_chat_message_without_socket_close(self):
-        source = (Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8")
+        source = (Path(__file__).resolve().parents[1] / "app" / "ws" / "handlers" / "text.py").read_text(encoding="utf-8")
         start = source.index("_scope_decision = assess_msk_intake_scope(text_input)")
         end = source.index("# ── Off-topic question shortcut", start)
         flow = source[start:end]
@@ -62,9 +62,9 @@ class ClinicalScopeTests(unittest.TestCase):
         self.assertIn('client_state["scope_notice_sent"] = True', flow)
 
     def test_global_boundary_preserves_form_flow_and_disables_ai_off_topic_answers(self):
-        source = (Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8")
+        source = (Path(__file__).resolve().parents[1] / "app" / "ws" / "handlers" / "text.py").read_text(encoding="utf-8")
         start = source.index("_boundary_response = (")
-        end = source.index("if _session_processing:", start)
+        end = source.index('if _session_processing["active"]:', start)
         flow = source[start:end]
 
         self.assertIn("build_out_of_flow_response(", flow)

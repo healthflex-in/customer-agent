@@ -25,7 +25,7 @@ REQUIRED_FIELD_QUESTIONS = {
         "Do you have any other health conditions, past surgeries, or fractures?"
     ),
     "Current Lifestyle": (
-        "What is your work and usual activity or exercise routine? Do you smoke or drink alcohol?"
+        "What is your usual activity or exercise routine? Do you smoke or drink alcohol?"
     ),
     "Reports": "Do you have any related X-rays, MRI, CT scans, or blood reports?",
     "Short-Term Goals (within 3 months)": (
@@ -38,6 +38,8 @@ REQUIRED_FIELD_QUESTIONS = {
         "What are your specific expectations from treatment?"
     ),
 }
+
+REFERRAL_SOURCE_QUESTION = "Where did you hear about us?"
 
 LIFESTYLE_COMPONENT_QUESTIONS = {
     "Current Lifestyle — Work": "What is your work or usual occupation?",
@@ -54,13 +56,17 @@ def question_for_missing_fields(
 ) -> str:
     """Return an explicit question for each missing field in one small batch."""
 
-    prompts = [
-        REQUIRED_FIELD_QUESTIONS.get(
-            field,
-            LIFESTYLE_COMPONENT_QUESTIONS.get(field, field_labels.get(field, field)),
+    prompts = []
+    for _, field in missing[:max_fields]:
+        if field == "Source":
+            prompts.append(REFERRAL_SOURCE_QUESTION)
+            continue
+        prompts.append(
+            REQUIRED_FIELD_QUESTIONS.get(
+                field,
+                LIFESTYLE_COMPONENT_QUESTIONS.get(field, field_labels.get(field, field)),
+            )
         )
-        for _, field in missing[:max_fields]
-    ]
     if len(prompts) == 1:
         return prompts[0]
     return "Could you also tell me:\n" + "\n".join(f"- {prompt}" for prompt in prompts)

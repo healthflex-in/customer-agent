@@ -24,6 +24,21 @@ class RequiredIntakeCoverageTests(unittest.TestCase):
         self.assertNotIn("Did it start", response)
         self.assertNotIn("Is this information correct", response)
 
+    def test_resume_asks_activity_without_work_and_asks_where_they_heard_about_us(self):
+        from src.graph.pure_functions.question_plan import contextual_resume_question
+        form = {"Present Complaint": {"Primary Complaint": "Back pain"}}
+        missing = [
+            ("History & Diagnostics", "Current Lifestyle"),
+            ("Referral", "Source"),
+        ]
+        response = contextual_resume_question(form, missing, {})
+        self.assertIn("What is your usual activity or exercise routine?", response)
+        self.assertIn("Do you smoke or drink alcohol?", response)
+        self.assertNotIn("work", response.lower())
+        self.assertIn("Where did you hear about us?", response)
+        self.assertNotIn("\n- Source", response)
+        self.assertNotIn("\nSource", response)
+
     def setUp(self):
         self.definition = load_form("FRM-01")
 

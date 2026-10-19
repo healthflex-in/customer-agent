@@ -85,16 +85,13 @@ class ReportDeclineFlowTests(unittest.TestCase):
             {"has_reports": True, "wants_upload": None},
         )
 
-    def test_smoking_alcohol_and_walking_are_registered_without_llm(self):
+    def test_unasked_lifestyle_words_are_not_assigned_by_phrase(self):
         value = merge_lifestyle_answer(
             "",
             "Actually I smoke only, I don't drink alcohol. I only walk and "
             "I don't have any other exercise routine.",
         )
-        self.assertIn("Smokes", value)
-        self.assertIn("Does not drink alcohol", value)
-        self.assertIn("Walks for exercise", value)
-        self.assertIn("No other regular exercise routine", value)
+        self.assertEqual(value, "")
 
     def test_shared_habit_negation_and_common_typo_fill_both_fields(self):
         from src.graph.pure_functions.lifestyle import missing_lifestyle_components
@@ -108,8 +105,8 @@ class ReportDeclineFlowTests(unittest.TestCase):
                 value = merge_lifestyle_answer(
                     "", answer, "Do you smoke or drink alcohol?"
                 )
-                self.assertIn("Smoking: Does not smoke", value)
-                self.assertIn("Alcohol: Does not drink alcohol", value)
+                self.assertIn(f"Smoking: {answer}", value)
+                self.assertIn(f"Alcohol: {answer}", value)
                 self.assertNotIn(
                     "Current Lifestyle — Smoking",
                     missing_lifestyle_components(value),
@@ -127,14 +124,226 @@ class ReportDeclineFlowTests(unittest.TestCase):
             smoking, "No.", "Do you drink alcohol?"
         )
 
-        self.assertIn("Smoking: Does not smoke", alcohol)
-        self.assertIn("Alcohol: Does not drink alcohol", alcohol)
+        self.assertIn("Smoking: Never.", alcohol)
+        self.assertIn("Alcohol: No.", alcohol)
+
+    def test_short_reply_closes_only_the_asked_habit(self):
+        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+
+        for reply in ("no", "nah", "nope"):
+            with self.subTest(reply=reply):
+                value = merge_lifestyle_answer("", reply, "Do you drink alcohol?")
+                self.assertIn(f"Alcohol: {reply}", value)
+                self.assertNotIn("Smoking:", value)
+                self.assertNotIn(
+                    "Current Lifestyle — Alcohol",
+                    missing_lifestyle_components(value),
+                )
+
+        both = merge_lifestyle_answer(
+            "",
+            "I do not drink or smoke",
+            "Do you drink alcohol?",
+            model_lifestyle="Smoking: does not smoke",
+        )
+        self.assertIn("Alcohol: I do not drink or smoke", both)
+        self.assertIn("Smoking: does not smoke", both)
+
+    def test_batched_reply_stores_only_the_habit_denial(self):
+        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+        from src.graph.pure_functions.question_plan import REQUIRED_FIELD_QUESTIONS
+
+        value = merge_lifestyle_answer(
+            "",
+            "resting, i do zumba, no i dont, no report, relief from pain",
+            REQUIRED_FIELD_QUESTIONS["Current Lifestyle"],
+        )
+        self.assertEqual(value, "")
+        self.assertIn(
+            "Current Lifestyle — Smoking",
+            missing_lifestyle_components(value),
+        )
+
+    def test_activity_clause_follows_the_asked_question(self):
+        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+
+        value = merge_lifestyle_answer(
+            "",
+            "resting, manager, pilates, nope",
+            "Could you also tell me:\n"
+            "- What makes it feel better or gives relief?\n"
+            "- What is your work or usual occupation?\n"
+            "- What is your usual activity or exercise routine?\n"
+            "- Do you have any related X-rays, MRI, CT scans, or blood reports?",
+        )
+        self.assertIn("Activity/exercise: pilates", value)
+        self.assertIn("Work: manager", value)
+        self.assertNotIn("resting", value.lower())
+        self.assertNotIn("nope", value.lower())
+        self.assertNotIn(
+            "Current Lifestyle — Activity or Exercise",
+            missing_lifestyle_components(value),
+        )
+
+        alone = merge_lifestyle_answer(
+            "",
+            "pilates",
+            "What is your usual activity or exercise routine?",
+        )
+        self.assertIn("Activity/exercise: pilates", alone)
+
+    def test_combined_question_two_clause_reply_closes_activity_and_habits(self):
+        from src.forms.loader import load_form
+        from src.graph.pure_functions.form_validation import validate_section
+        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+        from src.graph.pure_functions.question_plan import (
+            LIFESTYLE_COMPONENT_QUESTIONS,
+            REQUIRED_FIELD_QUESTIONS,
+            question_for_missing_fields,
+        )
+
+        combined = REQUIRED_FIELD_QUESTIONS["Current Lifestyle"]
+        cases = (
+            ("Calisthenics , no", "Calisthenics", "no"),
+            ("Calisthenics, no i dont", "Calisthenics", "no i dont"),
+            ("pilates, no", "pilates", "no"),
+        )
+        definition = load_form("FRM-01")
+        for reply, activity, habit in cases:
+            with self.subTest(reply=reply):
+                value = merge_lifestyle_answer("", reply, combined)
+                self.assertIn(f"Activity/exercise: {activity}", value)
+                self.assertIn(f"Smoking: {habit}", value)
+                self.assertIn(f"Alcohol: {habit}", value)
+                self.assertNotIn("Work:", value)
+                self.assertEqual(
+                    missing_lifestyle_components(value),
+                    ["Current Lifestyle — Work"],
+                )
+
+                form = definition.empty_form()
+                form["History & Diagnostics"]["Systemic Illness and Surgical History"] = "None"
+                form["History & Diagnostics"]["Reports"] = "None"
+                form["History & Diagnostics"]["Current Lifestyle"] = value
+                missing = validate_section(form, "History & Diagnostics")
+                self.assertEqual(missing, ["Current Lifestyle — Work"])
+                question = question_for_missing_fields(
+                    [("History & Diagnostics", field) for field in missing],
+                    definition.field_labels,
+                )
+                self.assertEqual(
+                    question,
+                    LIFESTYLE_COMPONENT_QUESTIONS["Current Lifestyle — Work"],
+                )
+                self.assertNotEqual(question, combined)
+
+                with_work = merge_lifestyle_answer(value, "manager", question)
+                self.assertEqual(missing_lifestyle_components(with_work), [])
+
+    def test_combined_question_single_clause_reply_closes_its_part(self):
+        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+        from src.graph.pure_functions.question_plan import REQUIRED_FIELD_QUESTIONS
+
+        combined = REQUIRED_FIELD_QUESTIONS["Current Lifestyle"]
+        denial = merge_lifestyle_answer("", "no i dont", combined)
+        self.assertIn("Smoking: no i dont", denial)
+        self.assertIn("Alcohol: no i dont", denial)
+        self.assertEqual(
+            missing_lifestyle_components(denial),
+            ["Current Lifestyle — Work", "Current Lifestyle — Activity or Exercise"],
+        )
+
+        activity = merge_lifestyle_answer("", "pilates", combined)
+        self.assertEqual(activity, "Activity/exercise: pilates")
+
+        three = merge_lifestyle_answer("", "manager, pilates, no", combined)
+        self.assertIn("Work: manager", three)
+        self.assertIn("Activity/exercise: pilates", three)
+        self.assertIn("Smoking: no", three)
+        self.assertIn("Alcohol: no", three)
+
+    def test_drink_answer_leaves_smoking_to_be_asked(self):
+        from src.graph.pure_functions.lifestyle import missing_lifestyle_components
+        from src.graph.pure_functions.question_plan import (
+            LIFESTYLE_COMPONENT_QUESTIONS,
+            REQUIRED_FIELD_QUESTIONS,
+            question_for_missing_fields,
+        )
+
+        combined = REQUIRED_FIELD_QUESTIONS["Current Lifestyle"]
+        value = merge_lifestyle_answer(
+            "Work: artist",
+            "cardio, yes i drink",
+            combined,
+        )
+        self.assertIn("Activity/exercise: cardio", value)
+        self.assertIn("Alcohol: yes i drink", value)
+        self.assertIn("Work: artist", value)
+        self.assertNotIn("Smoking:", value)
+        self.assertEqual(
+            missing_lifestyle_components(value),
+            ["Current Lifestyle — Smoking"],
+        )
+        question = question_for_missing_fields(
+            [("History & Diagnostics", "Current Lifestyle — Smoking")],
+            {},
+        )
+        self.assertEqual(
+            question,
+            LIFESTYLE_COMPONENT_QUESTIONS["Current Lifestyle — Smoking"],
+        )
+
+        spaced = merge_lifestyle_answer("", "cardio no i dont drink", combined)
+        self.assertIn("Activity/exercise: cardio", spaced)
+        self.assertIn("Alcohol: no i dont drink", spaced)
+        self.assertNotIn("Smoking:", spaced)
+        self.assertIn(
+            "Current Lifestyle — Smoking",
+            missing_lifestyle_components(spaced),
+        )
+
+        comma_drink = merge_lifestyle_answer("", "cardio, i dont drink", combined)
+        self.assertIn("Activity/exercise: cardio", comma_drink)
+        self.assertIn("Alcohol: i dont drink", comma_drink)
+        self.assertNotIn("Smoking:", comma_drink)
+
+        lined = merge_lifestyle_answer(
+            "",
+            "cardio\nno i dont drink or smoke",
+            combined,
+        )
+        self.assertIn("Activity/exercise: cardio", lined)
+        self.assertIn("Smoking: no i dont drink or smoke", lined)
+        self.assertIn("Alcohol: no i dont drink or smoke", lined)
+        self.assertNotIn(
+            "Current Lifestyle — Smoking",
+            missing_lifestyle_components(lined),
+        )
+        self.assertNotIn(
+            "Current Lifestyle — Alcohol",
+            missing_lifestyle_components(lined),
+        )
+
+        named = merge_lifestyle_answer(
+            "", "yes i drink", "Do you smoke or drink alcohol?"
+        )
+        self.assertEqual(named, "Alcohol: yes i drink")
+        self.assertEqual(
+            missing_lifestyle_components(named),
+            [
+                "Current Lifestyle — Work",
+                "Current Lifestyle — Activity or Exercise",
+                "Current Lifestyle — Smoking",
+            ],
+        )
 
     def test_combined_occupation_and_exercise_do_not_contaminate_each_other(self):
         value = merge_lifestyle_answer(
             "",
-            "I work as a firmware engineer and go to the gym four times a week.",
-            "What is your work and usual activity or exercise routine?",
+            "I work as a firmware engineer, go to the gym four times a week",
+            "Could you also tell me:\n"
+            "- What is your work or usual occupation?\n"
+            "- What is your usual activity or exercise routine?",
         )
 
         self.assertIn("Work: I work as a firmware engineer", value)
@@ -147,12 +356,14 @@ class ReportDeclineFlowTests(unittest.TestCase):
 
         with_habits = merge_lifestyle_answer(
             "",
-            "I am a doctor and dnt smoke or drink.",
-            "What is your occupation? Do you smoke or drink alcohol?",
+            "I am a doctor, dnt smoke or drink.",
+            "Could you also tell me:\n"
+            "- What is your work or usual occupation?\n"
+            "- Do you smoke or drink alcohol?",
         )
         self.assertIn("Work: I am a doctor", with_habits)
-        self.assertIn("Smoking: Does not smoke", with_habits)
-        self.assertIn("Alcohol: Does not drink alcohol", with_habits)
+        self.assertIn("Smoking: dnt smoke or drink.", with_habits)
+        self.assertIn("Alcohol: dnt smoke or drink.", with_habits)
         self.assertNotIn("smoke", with_habits.split(";", 1)[0].lower())
 
     def test_report_and_direct_clinician_share_are_deterministic(self):
@@ -298,9 +509,7 @@ class ReportDeclineFlowTests(unittest.TestCase):
             result["form"]["History & Diagnostics"]["Reports"],
         )
         lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
-        self.assertIn("smokes", lifestyle.lower())
-        self.assertIn("does not drink alcohol", lifestyle.lower())
-        self.assertIn("walks for exercise", lifestyle.lower())
+        self.assertEqual(lifestyle, "")
         self.assertIsNone(result["pending_question"])
 
     def test_compact_lifestyle_answer_fills_every_subtopic(self):
@@ -308,16 +517,24 @@ class ReportDeclineFlowTests(unittest.TestCase):
             format_lifestyle_value,
             missing_lifestyle_components,
         )
+        from src.graph.pure_functions.question_plan import REQUIRED_FIELD_QUESTIONS
 
         value = merge_lifestyle_answer(
-            "", "4 times a week, work in company, yes smoke, yes drink"
+            "",
+            "4 times a week, work in company, yes smoke, yes drink",
+            REQUIRED_FIELD_QUESTIONS["Current Lifestyle"],
         )
 
-        self.assertEqual(missing_lifestyle_components(value), [])
-        self.assertIn("Work:", value)
-        self.assertIn("Activity/exercise:", value)
-        self.assertIn("Smoking: Smokes", value)
-        self.assertIn("Alcohol: Drinks alcohol", value)
+        self.assertEqual(value, "")
+        self.assertEqual(
+            missing_lifestyle_components(""),
+            [
+                "Current Lifestyle — Work",
+                "Current Lifestyle — Activity or Exercise",
+                "Current Lifestyle — Smoking",
+                "Current Lifestyle — Alcohol",
+            ],
+        )
         self.assertEqual(
             format_lifestyle_value({
                 "Work": "Works in a company",
@@ -345,28 +562,30 @@ class ReportDeclineFlowTests(unittest.TestCase):
             "can you please update I drink also and pain rating is 10",
         )
 
-        self.assertIn("Alcohol: Drinks alcohol", value)
-        self.assertNotIn("Alcohol: Does not drink alcohol", value)
+        self.assertEqual(value, existing)
         self.assertEqual(value.count("Alcohol:"), 1)
 
     def test_compound_work_and_alcohol_answer_is_split_into_correct_fields(self):
-        for answer in (
-            "I work in a company , no drink",
-            "I work in a company and I don't drink",
-            "I work in a company no drink",
-        ):
-            with self.subTest(answer=answer):
-                value = merge_lifestyle_answer(
-                    "",
-                    answer,
-                    "What is your occupation, and do you drink alcohol?",
-                )
+        value = merge_lifestyle_answer(
+            "",
+            "I work in a company, no",
+            "Could you also tell me:\n"
+            "- What is your work or usual occupation?\n"
+            "- Do you drink alcohol?",
+        )
 
-                self.assertIn("Work: I work in a company", value)
-                self.assertIn("Alcohol: Does not drink alcohol", value)
-                self.assertNotIn("drink", value.split(";", 1)[0].lower())
-                self.assertEqual(value.count("Work:"), 1)
-                self.assertEqual(value.count("Alcohol:"), 1)
+        self.assertIn("Work: I work in a company", value)
+        self.assertIn("Alcohol: no", value)
+        self.assertNotIn("company", value.split("Alcohol:", 1)[-1].lower())
+        self.assertEqual(value.count("Work:"), 1)
+        self.assertEqual(value.count("Alcohol:"), 1)
+
+        unmatched = merge_lifestyle_answer(
+            "",
+            "I work in a company no drink",
+            "What is your occupation, and do you drink alcohol?",
+        )
+        self.assertEqual(unmatched, "")
 
     def test_bare_job_title_answers_occupation_question(self):
         value = merge_lifestyle_answer(
@@ -391,15 +610,17 @@ class ReportDeclineFlowTests(unittest.TestCase):
     def test_unpunctuated_exercise_and_smoking_are_separate_components(self):
         value = merge_lifestyle_answer(
             "",
-            "I exercise three days in a week I smoke",
-            "What is your exercise routine, and do you smoke?",
+            "I exercise three days in a week, I smoke",
+            "Could you also tell me:\n"
+            "- What is your usual activity or exercise routine?\n"
+            "- Do you smoke or use tobacco?",
         )
 
         self.assertIn(
             "Activity/exercise: I exercise three days in a week",
             value,
         )
-        self.assertIn("Smoking: Smokes", value)
+        self.assertIn("Smoking: I smoke", value)
         activity = next(
             part for part in value.split(";")
             if part.strip().startswith("Activity/exercise:")
@@ -420,11 +641,13 @@ class ReportDeclineFlowTests(unittest.TestCase):
         }
         value = format_lifestyle_value(polluted)
 
-        self.assertNotIn("noter contions", value)
-        self.assertIn("Activity/exercise: I exercise three days in a week", value)
-        self.assertNotIn("week I smoke", value)
-        self.assertIn("Smoking: Smokes", value)
+        self.assertIn("Work: noter contions", value)
         self.assertIn(
+            "Activity/exercise: I exercise three days in a week I smoke",
+            value,
+        )
+        self.assertIn("Smoking: Smokes", value)
+        self.assertNotIn(
             "Current Lifestyle — Work",
             missing_lifestyle_components(value),
         )
@@ -438,10 +661,7 @@ class ReportDeclineFlowTests(unittest.TestCase):
 
         value = merge_lifestyle_answer(polluted, "I do not drink alcohol")
 
-        self.assertNotIn("Work:", value)
-        self.assertNotIn("week I smoke", value)
-        self.assertIn("Smoking: Smokes", value)
-        self.assertIn("Alcohol: Does not drink alcohol", value)
+        self.assertEqual(value, polluted)
 
     def test_reasoning_model_cannot_store_health_denial_as_occupation(self):
         import copy
@@ -611,8 +831,8 @@ class ReportDeclineFlowTests(unittest.TestCase):
             result["form"]["Pain Assessment"]["Severity (1-10)"], "10/10"
         )
         lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
-        self.assertIn("Alcohol: Drinks alcohol", lifestyle)
-        self.assertNotIn("Alcohol: Does not drink alcohol", lifestyle)
+        self.assertIn("Alcohol: Does not drink alcohol", lifestyle)
+        self.assertNotIn("Alcohol: Drinks alcohol", lifestyle)
 
 
 if __name__ == "__main__":

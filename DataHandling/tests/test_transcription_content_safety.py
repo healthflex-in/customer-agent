@@ -73,13 +73,21 @@ class TranscriptionContentSafetyTests(unittest.TestCase):
             stt.transcribe_audio_bytes(b"audio")
 
     def test_server_has_delivery_submission_persistence_and_read_guards(self):
-        source = (BACKEND_ROOT / "server.py").read_text(encoding="utf-8")
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                BACKEND_ROOT / "server.py",
+                BACKEND_ROOT / "app" / "ws" / "handlers" / "text.py",
+                BACKEND_ROOT / "app" / "ws" / "handlers" / "audio.py",
+            )
+        )
+        repository = (BACKEND_ROOT / "app" / "forms" / "repository.py").read_text(encoding="utf-8")
 
         self.assertGreaterEqual(source.count("contains_internal_transcription_prompt"), 3)
-        self.assertGreaterEqual(source.count("scrub_internal_transcription_prompts"), 5)
-        self.assertIn("internal_prompt_content_removed_before_persistence", source)
-        self.assertIn("internal_prompt_content_removed_during_form_read", source)
-        self.assertIn("internal_prompt_content_removed_during_latest_form_read", source)
+        self.assertGreaterEqual(repository.count("scrub_internal_transcription_prompts"), 5)
+        self.assertIn("internal_prompt_content_removed_before_persistence", repository)
+        self.assertIn("internal_prompt_content_removed_during_form_read", repository)
+        self.assertIn("internal_prompt_content_removed_during_latest_form_read", repository)
 
     def test_transcription_instruction_is_not_sent_as_user_content(self):
         source = (BACKEND_ROOT / "app" / "audio" / "stt.py").read_text(

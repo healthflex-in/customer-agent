@@ -203,7 +203,7 @@ def required_response_before_summary(state: InterviewState, history: list) -> di
     referral = str(state["form"].get("Referral", {}).get("Source", "")).strip()
     if not referral:
         response = (
-            "Last thing — how did you come to know about us? "
+            "Last thing — How did you come to know about us? "
             "(Friend/family, Google, Instagram, Facebook, YouTube, doctor referral, etc.)"
         )
         return {
@@ -307,7 +307,7 @@ def make_generate_question_node(llm_complete, system_prompt):
         )
         if not referral_asked and not referral_source_filled:
             response = (
-                "Last thing — how did you come to know about us? "
+                "Last thing — where did you hear about us? "
                 "(Friend/family, Google, Instagram, Facebook, YouTube, doctor referral, etc.)"
             )
             history.append({"role": "agent", "message": response})

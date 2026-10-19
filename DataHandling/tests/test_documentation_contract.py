@@ -11,28 +11,38 @@ class DocumentationContractTests(unittest.TestCase):
         cls.repo_root = cls.backend_root.parent
         cls.server_source = (cls.backend_root / "server.py").read_text(encoding="utf-8")
         cls.server_tree = ast.parse(cls.server_source)
+        cls.http_sources = [cls.server_source]
+        api_dir = cls.backend_root / "app" / "api"
+        cls.http_sources.extend(
+            path.read_text(encoding="utf-8")
+            for path in sorted(api_dir.glob("*.py"))
+            if path.name != "__init__.py"
+        )
         cls.api_document = (cls.backend_root / "docs" / "PUBLIC_API.md").read_text(
             encoding="utf-8"
         )
 
     def test_documented_http_routes_match_active_explicit_routes(self):
         active_routes = set()
-        for node in ast.walk(self.server_tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for decorator in node.decorator_list:
-                if not (
-                    isinstance(decorator, ast.Call)
-                    and isinstance(decorator.func, ast.Attribute)
-                    and isinstance(decorator.func.value, ast.Name)
-                    and decorator.func.value.id == "app"
-                    and decorator.func.attr
-                    in {"get", "post", "put", "patch", "delete", "websocket"}
-                    and decorator.args
-                    and isinstance(decorator.args[0], ast.Constant)
-                ):
+        for source in self.http_sources:
+            for node in ast.walk(ast.parse(source)):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                active_routes.add((decorator.func.attr.upper(), decorator.args[0].value))
+                for decorator in node.decorator_list:
+                    if not (
+                        isinstance(decorator, ast.Call)
+                        and isinstance(decorator.func, ast.Attribute)
+                        and isinstance(decorator.func.value, ast.Name)
+                        and decorator.func.value.id in {"app", "router"}
+                        and decorator.func.attr
+                        in {"get", "post", "put", "patch", "delete", "websocket"}
+                        and decorator.args
+                        and isinstance(decorator.args[0], ast.Constant)
+                    ):
+                        continue
+                    active_routes.add(
+                        (decorator.func.attr.upper(), decorator.args[0].value)
+                    )
 
         expected_routes = {
             ("GET", "/health"),

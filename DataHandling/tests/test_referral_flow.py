@@ -7,6 +7,7 @@ from src.graph.pure_functions.form_extraction import detect_form_correction
 from src.graph.pure_functions.referral import (
     is_referral_question,
     normalize_referral_source,
+    referral_answer,
 )
 from src.graph.pure_functions.summary import classify_summary_response
 from src.graph.state import get_fresh_interview_state
@@ -32,7 +33,18 @@ except ModuleNotFoundError as exc:
 class ReferralFlowRegressionTests(unittest.TestCase):
     def test_recognizes_referral_question_and_short_answer(self):
         self.assertTrue(is_referral_question("How did you come to know about us?"))
+        self.assertTrue(is_referral_question("Where did you hear about us?"))
         self.assertTrue(is_referral_question("How were you referred to us?"))
+        batched = (
+            "Could you also tell me:\n"
+            "- What is your usual activity or exercise routine? Do you smoke or drink alcohol?\n"
+            "- Where did you hear about us?"
+        )
+        self.assertEqual(
+            referral_answer(batched, "pilates, no, instagram"),
+            "instagram",
+        )
+        self.assertIsNone(referral_answer(batched, "pilates, no"))
         self.assertEqual(normalize_referral_source("I heard from a friend"), "Friend/word of mouth")
 
     def test_summary_referral_answer_is_a_concrete_correction(self):

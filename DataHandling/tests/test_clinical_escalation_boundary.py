@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 
-SERVER_PATH = Path(__file__).resolve().parents[1] / "server.py"
+SERVER_PATH = Path(__file__).resolve().parents[1] / "app" / "ws" / "handlers" / "text.py"
 
 
 class ClinicalEscalationBoundaryContractTests(unittest.TestCase):
@@ -16,7 +16,7 @@ class ClinicalEscalationBoundaryContractTests(unittest.TestCase):
         websocket = next(
             node
             for node in self.tree.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "websocket_endpoint"
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "handle_text_input"
         )
         source = ast.get_source_segment(self.source, websocket) or ""
         safety = source.index("assess_urgent_risk(")

@@ -96,8 +96,16 @@ class FormProgressArchitectureTests(unittest.TestCase):
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module == "app.forms.progress":
                 imported_names.update(alias.name for alias in node.names)
+        self.assertEqual(imported_names, {"calculate_form_progress"})
+
+        state_path = server_path.parent / "app" / "ws" / "state.py"
+        state_tree = ast.parse(state_path.read_text(encoding="utf-8"))
+        state_imports = set()
+        for node in state_tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "app.forms.progress":
+                state_imports.update(alias.name for alias in node.names)
         self.assertEqual(
-            imported_names,
+            state_imports,
             {"calculate_form_progress", "calculate_section_completion_status"},
         )
 
