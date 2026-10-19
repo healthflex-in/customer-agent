@@ -61,6 +61,7 @@ async def send_completed_form(websocket: WebSocket, client_state: dict, form: di
     client_state["is_recording"] = False
     client_state["received_audio_buffer"].clear()
     client_state["recording_start_time"] = None
+    client_state["pending_voice_input"] = None
     await websocket.send_text(json.dumps(build_completed_form_payload(client_state, form)))
     await run_blocking(
         record_chat_message,

@@ -102,17 +102,19 @@ def _boolean_env(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
-# Disabled by default. QA may retain original audio + paired STT output inside
-# the Docker container to investigate transcription problems.
+# Disabled by default. When enabled, original audio + paired STT output are
+# kept for at least DEBUG_AUDIO_RETENTION_HOURS (48h = 2 days) to investigate
+# transcription problems. Deployments mount DEBUG_AUDIO_DIR as a volume so
+# captures survive container restarts.
 DEBUG_AUDIO_CAPTURE: bool = _boolean_env("DEBUG_AUDIO_CAPTURE", False)
 DEBUG_AUDIO_DIR: str = os.getenv(
     "DEBUG_AUDIO_DIR", "/tmp/customer-agent-audio-debug"
 )
 DEBUG_AUDIO_RETENTION_HOURS: int = _positive_int_env(
-    "DEBUG_AUDIO_RETENTION_HOURS", 24
+    "DEBUG_AUDIO_RETENTION_HOURS", 48
 )
 DEBUG_AUDIO_MAX_TOTAL_MB: int = _positive_int_env(
-    "DEBUG_AUDIO_MAX_TOTAL_MB", 250
+    "DEBUG_AUDIO_MAX_TOTAL_MB", 2048
 )
 DEBUG_AUDIO_MAX_TOTAL_BYTES: int = DEBUG_AUDIO_MAX_TOTAL_MB * 1024 * 1024
 

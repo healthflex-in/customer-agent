@@ -61,7 +61,7 @@ class LegacyAudioCleanupTests(unittest.TestCase):
             self.assertNotIn("tts_cache", path.read_text(encoding="utf-8"))
 
     def test_commented_duplicate_server_snapshot_is_gone(self):
-        self.assertTrue(self.server_source.startswith("from fastapi import ("))
+        self.assertTrue(self.server_source.startswith("from fastapi import "))
         self.assertNotRegex(
             self.server_source,
             re.compile(r"(?m)^#\s*(?:async\s+)?def\s+websocket_endpoint\("),

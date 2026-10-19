@@ -9,13 +9,14 @@ import time
 
 from fastapi import WebSocket
 
+from app.audit.chat_history import resolve_patient_input_provenance
 from app.clinical.escalation import assess_urgent_risk, record_escalation
 from app.clinical.scope import assess_msk_intake_scope
 from app.config import DEFAULT_FORM_ID
 from app.content_safety import contains_internal_transcription_prompt
 from app.db.mongo import mongo
 from app.forms.instruments import apply_prom_answers
-from app.forms.lifecycle import COMPLETED as FORM_COMPLETED
+from app.forms.lifecycle import COMPLETED as FORM_COMPLETED, is_completed_form
 from app.forms.progress import (
     calculate_form_progress,
     calculate_section_completion_status,
@@ -40,11 +41,13 @@ from app.observability.tracing import (
 )
 from app.runtime.blocking import run_blocking
 from app.security.input import sanitize_patient_input
+from app.ws.completion import send_completed_form
 from app.ws.idempotency import RequestDecision
 from app.ws.thoughts import send_thought_update as _send_thought_update
 from src.graph.pure_functions.clarification import (
     boundary_response_with_pending_question,
     build_out_of_flow_response,
+    has_actionable_intake_fact,
     pending_intake_question,
 )
 from src.graph.server_adapter import (
@@ -122,14 +125,31 @@ async def handle_text_input(
 
     print(f"[text_input] Received patient input ({len(text_input)} chars)")
     print(f"[text_input] Current talk_mode: {health_agent.talk_mode}, history length: {len(health_agent.history)}")
+    _input_provenance = resolve_patient_input_provenance(
+        content=text_input,
+        payload=data,
+        pending_voice_input=client_state.get("pending_voice_input"),
+    )
+    # A delivered transcript belongs to at most one submitted
+    # message. Clear it even when the patient discarded it and
+    # typed something else, preventing stale file attribution.
+    client_state["pending_voice_input"] = None
+    _is_voice_input = (
+        _input_provenance.get("inputSource")
+        == "voice_transcription"
+    )
     await run_blocking(
         _record_chat_audit,
         client_state,
         role="patient",
         content=text_input,
-        message_type="text_input",
+        message_type=("voice_input" if _is_voice_input else "text_input"),
         request_id=data.get("requestId"),
         question_id=data.get("questionId"),
+        input_source=_input_provenance.get("inputSource"),
+        transcription_id=_input_provenance.get("transcriptionId"),
+        audio_capture_id=_input_provenance.get("audioCaptureId"),
+        audio_filename=_input_provenance.get("audioFilename"),
     )
 
     # Identify only fully validated multi-answer UI payloads.
@@ -233,6 +253,12 @@ async def handle_text_input(
             text_input, _last_agent_question
         )
     )
+    # A mixed turn may contain both a valid intake fact and
+    # a request for advice (for example, a severity update
+    # followed by a medication question). Let the graph save
+    # only the fact and return the same safety boundary.
+    if _boundary_response and has_actionable_intake_fact(text_input):
+        _boundary_response = None
     if _boundary_response:
         _boundary_response = boundary_response_with_pending_question(
             _boundary_response, _last_agent_question
@@ -551,7 +577,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                     # per-question PROM dict structure.
                     import copy as _cp_prom
                     _prom_injected_form = _cp_prom.deepcopy(_gf)
-                    await run_blocking(
+                    _prom_answer_saved = await run_blocking(
                         save_customer_info,
                         user_id=client_state.get("user_id", ""),
                         form_data=_prom_injected_form,
@@ -561,6 +587,8 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                         attempt_id=client_state.get("attempt_id"),
                         prom_snapshot=client_state.get("prom_snapshot"),
                     )
+                    if not _prom_answer_saved:
+                        raise RuntimeError("PROM answer persistence failed")
 
             # ── Re-ask unanswered PROM questions ──────────────────────────────
             # After injecting answers, check if any questions were left blank
@@ -634,15 +662,6 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                     client_state.get("tagged_turn_metas") or [],
                     _next_index,
                 )
-                client_state["tagged_turn_index"] = _new_index
-
-                _history = list(client_state.get("graph_history") or [])
-                _history.extend([
-                    {"role": "user", "message": text_input},
-                    {"role": "agent", "message": response_text},
-                ])
-                client_state["graph_history"] = _history
-
                 _previous_prom = client_state.get("prom_existing_data") or {}
                 _prom_template = client_state.get("tagged_form_template") or {}
                 _all_scales = list({**_previous_prom, **_prom_template}.keys())
@@ -661,6 +680,28 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                     "current_section": "PROM",
                     "missing_fields": [],
                 }
+                if _is_complete:
+                    _prom_completed_id = await run_blocking(
+                        save_customer_info,
+                        user_id=client_state.get("user_id", ""),
+                        form_data=_prom_injected_form or client_state.get("graph_form") or {},
+                        current_section="PROM",
+                        form_id=client_state.get("form_id", ""),
+                        preferred_doc_id=client_state.get("prom_source_doc_id"),
+                        lifecycle_status=FORM_COMPLETED,
+                        attempt_id=client_state.get("attempt_id"),
+                        prom_snapshot=client_state.get("prom_snapshot"),
+                    )
+                    if not _prom_completed_id:
+                        raise RuntimeError("PROM completion persistence failed")
+
+                client_state["tagged_turn_index"] = _new_index
+                _history = list(client_state.get("graph_history") or [])
+                _history.extend([
+                    {"role": "user", "message": text_input},
+                    {"role": "agent", "message": response_text},
+                ])
+                client_state["graph_history"] = _history
                 await send_text_message(
                     websocket,
                     client_state,
@@ -683,21 +724,42 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                     question_count=len(_structured_prom_answers),
                     complete=_is_complete,
                 )
-                if _is_complete:
-                    await run_blocking(
-                        save_customer_info,
-                        user_id=client_state.get("user_id", ""),
-                        form_data=_prom_injected_form or client_state.get("graph_form") or {},
-                        current_section="PROM",
-                        form_id=client_state.get("form_id", ""),
-                        preferred_doc_id=client_state.get("prom_source_doc_id"),
-                        lifecycle_status=FORM_COMPLETED,
-                        attempt_id=client_state.get("attempt_id"),
-                        prom_snapshot=client_state.get("prom_snapshot"),
-                    )
                 return
 
             client_state["_fetch_form_fn"] = fetch_form_by_id
+            # Refresh structured data from the exact persisted
+            # attempt before every graph turn. This makes MongoDB
+            # the source of truth after reconnects/concurrent stale
+            # sockets and prevents next-question generation from
+            # validating an older in-memory form.
+            _latest_attempt = await run_blocking(
+                fetch_form_by_id,
+                client_state.get("form_id", ""),
+                client_state.get("user_id", ""),
+                client_state.get("attempt_id"),
+            )
+            if is_completed_form(_latest_attempt):
+                await send_completed_form(
+                    websocket, client_state, _latest_attempt
+                )
+                return
+            if _latest_attempt and isinstance(
+                _latest_attempt.get("form_data"), dict
+            ):
+                import copy as _turn_copy
+                _latest_form_data = _turn_copy.deepcopy(
+                    _latest_attempt["form_data"]
+                )
+                if client_state.get("form_id") == DEFAULT_FORM_ID:
+                    from src.forms.loader import load_form as _turn_load_form
+                    _hydrated = _turn_load_form("FRM-01").empty_form()
+                    for _section, _fields in _latest_form_data.items():
+                        if _section in _hydrated and isinstance(_fields, dict):
+                            _hydrated[_section].update(_fields)
+                        elif _section.startswith("Additional Complaint ") and isinstance(_fields, dict):
+                            _hydrated[_section] = _fields
+                    _latest_form_data = _hydrated
+                client_state["graph_form"] = _latest_form_data
             # Capture next PROM turn index BEFORE graph runs so we can
             # override the response regardless of what the graph generates.
             _prom_next_turn_idx = (
@@ -709,6 +771,18 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                 client_state,
                 text_input,
                 _save_for_graph,
+            )
+            from src.graph.pure_functions.turn_tracking import (
+                current_complaint_index,
+                missing_field_ids,
+                update_loop_counters,
+                updated_field_ids,
+            )
+            _phase_before = graph_state.get("phase", "unknown")
+            _section_before = graph_state.get("current_section", "")
+            _missing_before = missing_field_ids(
+                graph_state.get("form", {}),
+                graph_state.get("form_sections", []),
             )
 
             # Attach Langfuse user/session context for this turn
@@ -754,15 +828,10 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                                                "handle_summary_response", "apply_correction",
                                                "handle_upload_response"):
                             streamed_tokens.append(token)
-                            # Don't stream tokens during PROM sessions —
-                            # the graph may generate FRM-01 intake questions
-                            # which we override below; streaming them would
-                            # cause a visible flash of wrong content.
-                            if not client_state.get("tagged_form_template"):
-                                await websocket.send_text(json.dumps({
-                                    "type": "token",
-                                    "content": token,
-                                }))
+                            # Buffer tokens until persistence succeeds.
+                            # Sending an update/confirmation token before
+                            # MongoDB accepts the mutation can tell a patient
+                            # that unsaved information was recorded.
                     elif chunk["type"] == "values":
                         result_state = chunk["data"]  # accumulate final state
             except Exception as _stream_err:
@@ -772,6 +841,150 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                     graph_state,
                 )
 
+            _result_form = result_state.get("form", {})
+            _result_sections = result_state.get(
+                "form_sections"
+            ) or list(_result_form)
+            _updated_fields = updated_field_ids(
+                graph_state.get("form", {}), _result_form
+            )
+            _missing_after = missing_field_ids(
+                _result_form, _result_sections
+            )
+            _question_field_ids = list(
+                result_state.get("question_field_ids") or []
+            )
+            (
+                _same_missing_count,
+                _same_question_count,
+                _loop_recovery,
+            ) = update_loop_counters(
+                client_state,
+                missing_ids=_missing_after,
+                question_ids=_question_field_ids,
+            )
+
+            if _loop_recovery and not _updated_fields and _question_field_ids:
+                # Re-read the attempt and narrow the question to one
+                # verified missing field. This cannot fabricate or
+                # complete data; it only prevents an identical batch
+                # from looping while surfacing the stuck field in logs.
+                _recovery_form = await run_blocking(
+                    fetch_form_by_id,
+                    client_state.get("form_id", ""),
+                    client_state.get("user_id", ""),
+                    client_state.get("attempt_id"),
+                )
+                _recovery_question_ids = list(_question_field_ids)
+                if _recovery_form and isinstance(
+                    _recovery_form.get("form_data"), dict
+                ):
+                    import copy as _recovery_copy
+                    _persisted_data = _recovery_copy.deepcopy(
+                        _recovery_form["form_data"]
+                    )
+                    if client_state.get("form_id") == DEFAULT_FORM_ID:
+                        from src.forms.loader import load_form as _recovery_load
+                        _recovery_hydrated = _recovery_load("FRM-01").empty_form()
+                        for _section, _fields in _persisted_data.items():
+                            if _section in _recovery_hydrated and isinstance(_fields, dict):
+                                _recovery_hydrated[_section].update(_fields)
+                            elif _section.startswith("Additional Complaint ") and isinstance(_fields, dict):
+                                _recovery_hydrated[_section] = _fields
+                        _persisted_data = _recovery_hydrated
+                    _persisted_missing = missing_field_ids(
+                        _persisted_data, list(_persisted_data)
+                    )
+                    result_state["form"] = _persisted_data
+                    result_state["form_sections"] = list(_persisted_data)
+                    _result_form = _persisted_data
+                    _result_sections = list(_persisted_data)
+                    _missing_after = _persisted_missing
+                    _recovery_question_ids = [
+                        field_id for field_id in _question_field_ids
+                        if field_id in _persisted_missing
+                    ] or list(_persisted_missing)
+                    _log.warning(
+                        "intake_loop_recovery",
+                        attempt_id=client_state.get("attempt_id"),
+                        session_id=client_state.get("session_id"),
+                        missing_fields=_persisted_missing,
+                        question_field_ids=_question_field_ids,
+                        same_question_count=_same_question_count,
+                        same_missing_field_count=_same_missing_count,
+                    )
+                if _recovery_question_ids:
+                    from src.graph.pure_functions.question_plan import (
+                        question_for_missing_fields,
+                    )
+                    from src.forms.loader import load_form as _loop_form
+                    _first_id = _recovery_question_ids[0]
+                    _first_section, _first_field = _first_id.split(".", 1)
+                    _focused = question_for_missing_fields(
+                        [(_first_section, _first_field)],
+                        _loop_form("FRM-01").field_labels,
+                    )
+                    result_state["response_text"] = (
+                        "I’m sorry this information still appears missing. "
+                        "Let’s verify one detail at a time.\n\n" + _focused
+                    )
+                    result_state["phase"] = "interviewing"
+                    result_state["current_section"] = _first_section
+                    result_state["missing_fields"] = [_first_field]
+                    result_state["question_field_ids"] = [_first_id]
+                    _question_field_ids = [_first_id]
+                else:
+                    # The database now has every required answer.
+                    # Return to review; never auto-complete without
+                    # the patient's explicit confirmation.
+                    from src.graph.pure_functions.summary import _fallback_summary
+                    result_state["response_text"] = _fallback_summary(
+                        result_state.get("form", {})
+                    )
+                    result_state["phase"] = "summary"
+                    result_state["missing_fields"] = []
+                    result_state["question_field_ids"] = []
+                    _question_field_ids = []
+                # The graph may have generated tokens for the
+                # pre-recovery question. Never release those
+                # after replacing the response from DB state.
+                streamed_tokens = []
+                if result_state.get("history"):
+                    result_state["history"][-1] = {
+                        "role": "agent",
+                        "message": result_state["response_text"],
+                    }
+
+            _summary_intent = result_state.get("summary_intent") or {}
+            _detected_intents = [
+                _summary_intent.get("intent")
+                or ("reports" if result_state.get("reports_intent") else "answer")
+            ]
+            _log.info(
+                "intake_turn_state",
+                attempt_id=client_state.get("attempt_id"),
+                session_id=client_state.get("session_id"),
+                phase_before=_phase_before,
+                phase_after=result_state.get("phase", "unknown"),
+                section_before=_section_before,
+                section_after=result_state.get("current_section", ""),
+                detected_intents=_detected_intents,
+                extracted_fields=_updated_fields,
+                updated_fields=_updated_fields,
+                missing_fields_before=_missing_before,
+                missing_fields_after=_missing_after,
+                current_complaint_index=current_complaint_index(
+                    result_state.get("current_section", "")
+                ),
+                question_field_ids=_question_field_ids,
+                same_question_count=_same_question_count,
+                same_missing_field_count=_same_missing_count,
+                completion_eligible=(
+                    not _missing_after
+                    and result_state.get("phase") in {"summary", "complete"}
+                ),
+            )
+
             print(f"[timing] turn_total={(time.perf_counter() - _turn_t0) * 1000:.0f}ms "
                   f"phase={result_state.get('phase') if result_state else 'unknown'}")
 
@@ -780,8 +993,6 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                     _lf_ctx.__exit__(None, None, None)
                 except Exception:
                     pass
-
-            sync_client_state_from_graph(client_state, result_state)
 
             # NOTE: We do NOT sync health_agent.form here.
             # health_agent is a global singleton — writing to it from
@@ -806,6 +1017,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
             # graph's response_text and serve the correct next tagged turn.
             _prom_override_meta = None
             _prom_session_complete = False
+            _prom_persisted_tagged_index = None
             if _prom_next_turn_idx is not None:
                 _tt_list = client_state.get("tagged_turns") or []
                 _tt_metas = client_state.get("tagged_turn_metas") or []
@@ -815,11 +1027,11 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                         _tt_metas[_prom_next_turn_idx]
                         if _prom_next_turn_idx < len(_tt_metas) else None
                     )
-                    client_state["tagged_turn_index"] = _prom_next_turn_idx + 1
+                    _prom_persisted_tagged_index = _prom_next_turn_idx + 1
                     print(f"[prom] override turn {_prom_next_turn_idx}, next_idx={_prom_next_turn_idx + 1}")
                 else:
                     response_text = "Thank you for completing the assessment! Your responses have been recorded."
-                    client_state["tagged_turn_index"] = _prom_next_turn_idx
+                    _prom_persisted_tagged_index = _prom_next_turn_idx
                     _prom_session_complete = True
 
             # Opt 3: use cached form for progress — no blocking DB fetch per turn
@@ -838,7 +1050,64 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
             else:
                 progress = calculate_form_progress(_cached_form)
 
-            # Send response to client IMMEDIATELY
+            # Persist the mutation before claiming success to the
+            # patient or calculating UI state from MongoDB. The old
+            # send-then-save order could display an update that was
+            # lost when the socket disconnected between those steps.
+            _save_user_id = client_state.get("user_id", "")
+            _save_form_id = client_state.get("form_id", "")
+            _save_form = result_state.get("form", {})
+            # For PROM forms: answers were already saved immediately after injection
+            # above (in per-question format). Skip the post-graph collapse-save to
+            # avoid overwriting the per-question dict structure with empty strings
+            # if the graph didn't preserve the injected answers in result_state["form"].
+            if client_state.get("tagged_form_template"):
+                if _prom_session_complete:
+                    _persisted_form_id = await run_blocking(
+                        save_customer_info,
+                        user_id=_save_user_id,
+                        form_data=_prom_injected_form or client_state.get("graph_form") or {},
+                        current_section="PROM",
+                        form_id=_save_form_id,
+                        preferred_doc_id=client_state.get("prom_source_doc_id"),
+                        lifecycle_status=FORM_COMPLETED,
+                        attempt_id=client_state.get("attempt_id"),
+                        prom_snapshot=client_state.get("prom_snapshot"),
+                    )
+                    if not _persisted_form_id:
+                        raise RuntimeError("PROM completion persistence failed")
+            else:
+                _save_section = (
+                    "Completed" if result_state.get("phase") == "complete"
+                    else result_state.get("current_section", "")
+                )
+                _persisted_form_id = await run_blocking(
+                    _save_for_graph,
+                    _save_user_id, _save_form, _save_section, _save_form_id,
+                    None, None,
+                    FORM_COMPLETED if result_state.get("phase") == "complete" else None,
+                    client_state.get("attempt_id"),
+                )
+                if not _persisted_form_id:
+                    raise RuntimeError("Intake turn persistence failed")
+
+            # Advance in-memory navigation only after MongoDB has
+            # accepted the form mutation. If persistence fails,
+            # the patient receives an error and the previous
+            # socket state remains authoritative for a retry.
+            sync_client_state_from_graph(client_state, result_state)
+            if _prom_persisted_tagged_index is not None:
+                client_state["tagged_turn_index"] = _prom_persisted_tagged_index
+
+            # Preserve the existing token protocol, but release
+            # buffered tokens only after the clinical state is durable.
+            if not client_state.get("tagged_form_template"):
+                for _token in streamed_tokens:
+                    await websocket.send_text(json.dumps({
+                        "type": "token",
+                        "content": _token,
+                    }))
+
             await send_text_message(
                 websocket,
                 client_state,
@@ -857,41 +1126,6 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
                 force_request_attachment=bool(result_state.get("request_attachment")),
                 question_meta=_prom_override_meta if _prom_override_meta is not None else result_state.get("tagged_question_meta"),
             )
-
-            # Persist after sending the response, but await completion so a
-            # disconnect/shutdown cannot silently abandon the clinical save.
-            _save_user_id = client_state.get("user_id", "")
-            _save_form_id = client_state.get("form_id", "")
-            _save_form = result_state.get("form", {})
-            # For PROM forms: answers were already saved immediately after injection
-            # above (in per-question format). Skip the post-graph collapse-save to
-            # avoid overwriting the per-question dict structure with empty strings
-            # if the graph didn't preserve the injected answers in result_state["form"].
-            if client_state.get("tagged_form_template"):
-                if _prom_session_complete:
-                    await run_blocking(
-                        save_customer_info,
-                        user_id=_save_user_id,
-                        form_data=_prom_injected_form or client_state.get("graph_form") or {},
-                        current_section="PROM",
-                        form_id=_save_form_id,
-                        preferred_doc_id=client_state.get("prom_source_doc_id"),
-                        lifecycle_status=FORM_COMPLETED,
-                        attempt_id=client_state.get("attempt_id"),
-                        prom_snapshot=client_state.get("prom_snapshot"),
-                    )
-            else:
-                _save_section = (
-                    "Completed" if result_state.get("phase") == "complete"
-                    else result_state.get("current_section", "")
-                )
-                await run_blocking(
-                    _save_for_graph,
-                    _save_user_id, _save_form, _save_section, _save_form_id,
-                    None, None,
-                    FORM_COMPLETED if result_state.get("phase") == "complete" else None,
-                    client_state.get("attempt_id"),
-                )
 
         # ── HEALTHAGENT FALLBACK PATH ───────────────────────
         else:

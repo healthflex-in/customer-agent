@@ -273,6 +273,11 @@ def record_client_chat(
     error_code: object = None,
     phase: object = None,
     section: object = None,
+    input_source: object = None,
+    transcription_id: object = None,
+    audio_capture_id: object = None,
+    audio_filename: object = None,
+    event_key: object = None,
 ) -> bool:
     """Persist one short-lived transcript message without exposing it to logs."""
 
@@ -298,5 +303,10 @@ def record_client_chat(
         request_id=request_id,
         question_id=question_id,
         error_code=error_code,
+        input_source=input_source,
+        transcription_id=transcription_id,
+        audio_capture_id=audio_capture_id,
+        audio_filename=audio_filename,
+        event_key=event_key,
         retention_days=CHAT_HISTORY_RETENTION_DAYS,
     )
