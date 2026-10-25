@@ -8,8 +8,8 @@ _FIELD_TOPIC_TERMS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "History & Diagnostics",
         "Current Lifestyle",
         (
-            "smok", "alcohol", "drink alcohol", "exercise", "workout",
-            "activity level", "physically active", "occupation", "your job",
+            "exercise", "workout", "activity level", "physically active",
+            "occupation", "your job",
         ),
     ),
     (

@@ -44,11 +44,11 @@ def make_advance_section_node():
             # Increment question_round when both sections in a round are complete:
             # Round 0 ends after Previous Consultations (sections 0+1 done)
             # Round 1 ends after History & Diagnostics (sections 2+3 done)
-            # Round 2 ends after Referral (sections 4+5 done)
+            # Round 2 ends after Treatment Goals (section 4 done)
             round_end_sections = {
                 "Previous Consultations": 1,
                 "History & Diagnostics": 2,
-                "Referral": 3,
+                "Treatment Goals": 3,
             }
             if current_section in round_end_sections:
                 new_round = round_end_sections[current_section]

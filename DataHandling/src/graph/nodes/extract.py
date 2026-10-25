@@ -213,10 +213,6 @@ from src.graph.pure_functions.clarification import (
 )
 from src.graph.pure_functions.question_repetition import asks_about_answered_field
 from src.graph.pure_functions.lifestyle import merge_lifestyle_answer
-from src.graph.pure_functions.referral import (
-    is_referral_question,
-    normalize_referral_source,
-)
 from src.graph.pure_functions.summary import classify_reports_intent
 from src.prompts import FORMAT_PROMPT
 
@@ -692,10 +688,10 @@ Still empty in "{current_section}":
 
 For EACH field above: did the patient's reply address it — directly OR by negating it?
 - If YES (positive answer) → write the value using their words
-- If they negated it ("no", "nope", "don't", "never", "haven't", "i dont have any") → write a clear negative like "None", "No past surgeries", "Does not smoke or drink", "No exercise"
+- If they negated it ("no", "nope", "don't", "never", "haven't", "i dont have any") → write a clear negative like "None", "No past surgeries", or "No exercise"
 - If truly irrelevant to that field → return null
 
-IMPORTANT: negations count as answers. "i dont have any past surgeries" fills Surgical History. "i dont smoke" fills lifestyle.
+IMPORTANT: negations count as answers. "i dont have any past surgeries" fills Surgical History. For Current Lifestyle, extract only work/occupation and activity/exercise; never ask for or extract other habits.
 
 Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
 
@@ -774,75 +770,10 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                             updated_form[section][field] = fill_value
                             print(f"[sweep_fill] Filled {section}.{field}")
 
+        # Keep the extracted graph form canonical even if an older state or
+        # model payload supplied the retired discovery section.
+        updated_form.pop("Referral", None)
         result_extra = {}
-
-        # ── Referral field: update only when the answer is actually a referral ──────────
-        # Guard against medical/symptom answers being stored as referral source.
-        # If the user's response looks like a symptom or treatment answer, it means
-        # a previous question went unanswered — don't store as referral, re-ask later.
-        _stored_referral = str(
-            form.get("Referral", {}).get("Source", "")
-        ).strip()
-        _referral_turn = is_referral_question(last_agent_q) or (
-            state.get("referral_asked", False) and not _stored_referral
-        )
-        if _referral_turn:
-            from src.graph.pure_functions.referral import referral_answer
-            _ref_input = referral_answer(last_agent_q, user_input) or ""
-            _is_null = _ref_input.lower() in {"no", "nope", "nah", "none", "n/a", "na", ""}
-
-            # Farewell/closing signals — don't store goodbyes as referral source
-            _farewell_signals = [
-                "bye", "goodbye", "good bye", "bye-bye", "see you", "take care",
-                "thank you bye", "thanks bye", "okay bye", "ok bye", "alright bye",
-                "that's it", "that is it", "that's all", "nothing else", "all done",
-                "have a good", "have a nice", "cheerio",
-            ]
-            _is_farewell = any(s in _ref_input.lower() for s in _farewell_signals)
-
-            # Medical signals: if the answer sounds like symptoms/treatment, it's NOT a referral
-            _medical_signals = [
-                "pain", "relief", "hurt", "ache", "ice", "heat", "medicine", "tablet",
-                "injection", "exercise", "stretch", "rest", "apply", "helps", "worse",
-                "better", "neck", "back", "knee", "shoulder", "hip", "wrist", "ankle",
-                "head", "spine", "swelling", "stiffness", "doctor told", "physio told",
-                "improve", "improving", "same", "getting worse",
-            ]
-            _is_medical = any(s in _ref_input.lower() for s in _medical_signals)
-
-            if _is_farewell:
-                print("[referral_fill] Farewell detected; referral left unchanged")
-                result_extra = {}  # Leave referral as-is; interview is ending anyway
-            elif _is_medical:
-                # This is a medical answer, not a referral — let extraction handle it
-                # and mark referral as not yet asked so it gets re-asked next turn
-                print("[referral_fill] Medical answer detected; referral will be re-asked")
-                result_extra = {"referral_asked": False}
-            elif _ref_input and not _is_null:
-                matched = normalize_referral_source(_ref_input)
-                # A short direct response to the explicit referral question may
-                # contain a valid campaign/source name outside the known list.
-                # Long or medical answers are never stored as referral data.
-                if matched is None and len(_ref_input.split()) <= 8 and not _is_medical:
-                    matched = _ref_input
-                if matched:
-                    updated_form = dict(updated_form)
-                    updated_form["Referral"] = dict(updated_form.get("Referral", {}))
-                    updated_form["Referral"]["Source"] = matched
-                    print("[referral_fill] Referral source recorded")
-                    result_extra = {"referral_asked": True}
-
-                    # This question was prefetched before the current answer was
-                    # merged. Discard it if it asks referral again; generation will
-                    # use the updated history/form instead.
-                    if pending_q and is_referral_question(pending_q):
-                        pending_q = None
-                else:
-                    # Do not overwrite a valid LLM extraction with None. Keep the
-                    # question eligible for one clear retry instead.
-                    result_extra = {"referral_asked": False}
-            else:
-                result_extra = {"referral_asked": True}
 
         # Run the guard again because fallback gap-fill also uses an LLM.
         updated_form = sanitize_extracted_form(form, updated_form)

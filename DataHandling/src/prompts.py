@@ -34,7 +34,7 @@ Classify as:
 
 Generate ONE focused question for what's genuinely missing:
 - If they gave comprehensive info → ask about the 1-3 things not yet mentioned
-- If they gave minimal info → ask 2-4 grouped intake questions (location, severity, duration, onset, aggravating, relieving, consultations, health/lifestyle, goals, referral)
+- If they gave minimal info → ask 2-4 grouped intake questions (location, severity, duration, onset, aggravating, relieving, consultations, health/lifestyle, goals)
 - Group related items together, max 4 bullets
 
 HARD RULES:
@@ -70,13 +70,13 @@ Read the ENTIRE conversation above. Determine what the patient has already commu
 - What gives relief
 - Previous doctor/physio consultations
 - Health conditions, past surgeries
-- Lifestyle (job, smoking/drinking, exercise)
+- Lifestyle (work or usual occupation, activity or exercise)
 - Diagnostic reports (MRI, X-ray, scans)
 - Treatment goals
 
 **What to collect for a general_assessment visit:**
 - General health conditions, past surgeries
-- Lifestyle (job, habits, activity level)
+- Lifestyle (work or usual occupation, activity or exercise)
 - Treatment/wellness goals
 (Skip: specific pain details, injury mechanism, previous complaint-specific treatment)
 
@@ -86,7 +86,8 @@ Read the ENTIRE conversation above. Determine what the patient has already commu
 - If the patient addressed a topic in ANY way (even informally, with negation, or imperfectly), it is COVERED — do NOT ask again
 - Group related missing items into max 4–5 bullets, never ask one field per bullet
 - NEVER ask about something the patient already told you
-- Do NOT ask how they found Stance Health. Referral is handled separately by application code at the end.
+- Never ask about marketing, discovery, or how the patient found Stance Health.
+- Do not collect unsupported lifestyle details beyond work/occupation and activity/exercise.
 - NEVER output marketing language or statements without a question
 - If everything is covered → respond with exactly DONE
 
@@ -205,7 +206,7 @@ Pain Assessment:
 History & Diagnostics:
 - Any ongoing illnesses (diabetes, BP, thyroid, heart issues)? Any past surgeries or fractures?
 - "no issues", "I'm healthy", "no conditions" → Systemic Illness = "No known systemic illness or health conditions"
-- Lifestyle: exercise habits, job type, smoking/drinking
+- Lifestyle: work or usual occupation, and activity or exercise routine
 - Reports: MRI, X-ray, CT scan, blood tests. "No MRI, no X-rays" → Reports = "None"
 
 Treatment Goals:
@@ -213,11 +214,6 @@ Treatment Goals:
 - "understand my body", "figure out what's happening", "get back to playing" → store only that expressed goal
 - "don't think I'll need treatment", "no future goals" → "No specific treatment goals"
 - Genuinely not mentioned → leave empty
-
-Referral:
-- ONLY fill if they mentioned HOW they found the clinic: friend, Google, Instagram, Facebook, YouTube, doctor referral
-- "my friend told me" → Source = "Friend/word of mouth"
-- DO NOT store symptom answers, pain descriptions, or anything medical as Source
 
 **Step 3 — Rules**
 - Store NEGATIVE answers: "no pain" → mark pain fields as "No pain reported" or "Not applicable"
@@ -238,6 +234,9 @@ Referral:
 - Never convert a missing answer into a negative answer. For example, do not
   write "no doctor visit", "no health conditions", "no pain", or a treatment
   goal unless the patient explicitly said it.
+- Store only supported Current Lifestyle details: work/occupation and activity/exercise.
+- Do not independently extract unsupported lifestyle details. Historical
+  lifestyle text may remain in the current form.
 - Return ONLY valid JSON matching the exact structure below. No explanation, no markdown.
 
 Fill this structure:
@@ -304,12 +303,13 @@ CRITICAL RULES:
 CRITICAL — NEGATIVE / DENIAL ANSWERS must be stored, not ignored:
 - "i dont have any past surgeries" → "Systemic Illness and Surgical History": "No past surgeries"
 - "no fractures" → "Systemic Illness and Surgical History": "No fractures"
-- "i dont smoke or drink" / "no smoking, no alcohol" → "Current Lifestyle": "Non-smoker, does not drink"
 - "i dont exercise" / "i dont do any exercise" → "Current Lifestyle": (add to existing or set) "No regular exercise"
+- "I work as a teacher" → "Current Lifestyle": (add to existing or set) "Work: teacher"
 - "no health conditions" / "i am healthy" → "Systemic Illness and Surgical History": "No known systemic illness"
 - "no reports" / "i dont have any scans" → "Reports": "None"
 - "no goals" / "nothing" (in response to a goals question) → fill the goals field with "No specific goals mentioned"
-- Any clear denial or negation about a topic → store the negation as the field value, NEVER leave it blank
+- Any clear denial or negation about a supported topic → store the negation as the field value, NEVER leave it blank
+- For Current Lifestyle, support only work/occupation and activity/exercise. Do not independently extract unsupported lifestyle details.
 
 CRITICAL: "Previous Consultations" section:
 - ONLY fill "Previous Consultations" fields if the patient EXPLICITLY mentions:
@@ -331,7 +331,7 @@ FINAL_FORM_FILL_PROMPT = """
 Given the complete conversation below and the current form, go through EVERY word the patient said again.
 
 Patients often mention critical details casually:
-→ "I have diabetes", "my sugar is high", "BP medicine", "old knee surgery", "MRI done last month", "friend referred", etc.
+→ "I have diabetes", "my sugar is high", "BP medicine", "old knee surgery", "MRI done last month", etc.
 
 Correct ALL transcription errors using medical context (e.g., "physio" = physiotherapy, "injection" = steroid injection, etc.)
 

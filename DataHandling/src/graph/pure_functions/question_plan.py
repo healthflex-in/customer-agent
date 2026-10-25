@@ -1,9 +1,4 @@
 """Deterministic required-field questions for the FRM-01 intake."""
-
-from __future__ import annotations
-
-
-# Referral is intentionally excluded: it has one dedicated final-question flow.
 REQUIRED_FIELD_QUESTIONS = {
     "Primary Complaint": "What is the main problem bothering you?",
     "Duration of the Issue": "How long have you been experiencing this issue?",
@@ -25,7 +20,7 @@ REQUIRED_FIELD_QUESTIONS = {
         "Do you have any other health conditions, past surgeries, or fractures?"
     ),
     "Current Lifestyle": (
-        "What is your usual activity or exercise routine? Do you smoke or drink alcohol?"
+        "What is your usual activity or exercise routine?"
     ),
     "Reports": "Do you have any related X-rays, MRI, CT scans, or blood reports?",
     "Short-Term Goals (within 3 months)": (
@@ -39,15 +34,11 @@ REQUIRED_FIELD_QUESTIONS = {
     ),
 }
 
-REFERRAL_SOURCE_QUESTION = "Where did you hear about us?"
-
 LIFESTYLE_COMPONENT_QUESTIONS = {
     "Current Lifestyle — Work": "What is your work or usual occupation?",
     "Current Lifestyle — Activity or Exercise": (
         "What is your usual activity or exercise routine?"
-    ),
-    "Current Lifestyle — Smoking": "Do you smoke or use tobacco?",
-    "Current Lifestyle — Alcohol": "Do you drink alcohol?",
+    )
 }
 
 
@@ -58,9 +49,6 @@ def question_for_missing_fields(
 
     prompts = []
     for _, field in missing[:max_fields]:
-        if field == "Source":
-            prompts.append(REFERRAL_SOURCE_QUESTION)
-            continue
         prompts.append(
             REQUIRED_FIELD_QUESTIONS.get(
                 field,

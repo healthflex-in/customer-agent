@@ -49,6 +49,9 @@ def extract_form_data_from_text(
     Extracted from HealthAgent.formatter(). Pure — returns new form, does not mutate input.
     """
     updated_form = copy.deepcopy(form)
+    # Referral/source is retired from customer intake. Ignore a stale resumed
+    # form or model-shaped input before it can influence extraction or summary.
+    updated_form.pop("Referral", None)
     example_output = '{"Patient Information": {"Age": "35", "Gender": "male"}}'
 
     # Include the last agent question when available — critical for short/denial
@@ -104,11 +107,6 @@ def extract_form_data_from_text(
         updated_form = _post_process_history_diagnostics(
             updated_form, formatted_data, user_input
         )
-        updated_form = _post_process_referral(updated_form)
-        # Always run — "How did you hear about us?" is asked in Round 0 while
-        # current_section is still on another section, so we can't gate on "Referral".
-        # The function guards itself: if Source is already filled it returns immediately.
-        updated_form = _post_process_referral_from_input(updated_form, user_input)
 
         filled_count = sum(
             1
@@ -212,73 +210,6 @@ def _post_process_history_diagnostics(form: dict, formatted_data: dict, user_inp
     return form
 
 
-def _post_process_referral_from_input(form: dict, user_input: str) -> dict:
-    """
-    When the extraction LLM fails on short referral answers ('google', 'youtube',
-    'yes my friend'), directly map the user_input to Source if it's still empty.
-    Only runs when current_section == 'Referral'.
-    """
-    if "Referral" not in form:
-        return form
-    source = str(form["Referral"].get("Source", "") or "").strip()
-    if source:
-        return form  # Already filled by extraction — nothing to do
-
-    user_lower = user_input.lower().strip()
-
-    # Known referral/discovery channels — extract the CHANNEL NAME, not the raw sentence
-    channel_map = {
-        "youtube": "YouTube", "instagram": "Instagram", "facebook": "Facebook",
-        "google": "Google", "twitter": "Twitter", "whatsapp": "WhatsApp",
-        "social media": "Social media", "online": "Found online",
-        "website": "Stance Health website", "ad ": "Online ad", "advert": "Online ad",
-        "friend": "Friend/word of mouth", "family": "Family referral",
-        "relative": "Family referral", "colleague": "Colleague referral",
-        "word of mouth": "Word of mouth", "newspaper": "Newspaper",
-        "doctor referred": "Doctor referral", "referred by": "Referral",
-        "podcast": "Podcast", "blog": "Blog/article",
-    }
-    matched_channel = None
-    for kw, label in channel_map.items():
-        if kw in user_lower:
-            matched_channel = label
-            break
-
-    if matched_channel:
-        form["Referral"]["Source"] = matched_channel
-        print("[referral_fill] Source normalized to a known channel")
-    elif user_lower not in {"no", "nope", "nah", "none", "nothing", "n/a"}:
-        # Any other non-negative answer: store as-is and let validate_section decide
-        form["Referral"]["Source"] = user_input.strip()
-        print("[referral_fill] Source filled using deterministic fallback")
-    return form
-
-
-def _post_process_referral(form: dict) -> dict:
-    if "Referral" not in form:
-        return form
-    source = str(form["Referral"].get("Source", "") or "").strip()
-    if not source:
-        return form
-    lower = source.lower()
-    invalid = {"yes", "no", "none", "n/a", "na", "nil", "nothing", "0"}
-    clinician_kws = ["doctor", "dr ", "dr.", "orthopedic", "orthopaedic", "ortho",
-                     "physio", "physiotherapist", "surgeon", "consultant", "specialist",
-                     "hospital", "clinic", "center", "centre"]
-    referral_kws = ["friend", "family", "relative", "colleague", "google", "instagram",
-                    "facebook", "youtube", "social media", "online", "website",
-                    "ad ", "advert", "advertisement", "referral"]
-    should_clear = lower in invalid
-    if not should_clear:
-        has_clinician = any(kw in lower for kw in clinician_kws)
-        has_channel = any(kw in lower for kw in referral_kws)
-        if has_clinician and not has_channel:
-            should_clear = True
-    if should_clear:
-        form["Referral"]["Source"] = ""
-    return form
-
-
 def detect_form_correction(
     user_input: str,
     form: dict,
@@ -294,24 +225,10 @@ def detect_form_correction(
         from src.graph.pure_functions.correction_consistency import (
             detect_pain_location_correction,
         )
-        from src.graph.pure_functions.referral import normalize_referral_source
 
         pain_location_correction = detect_pain_location_correction(user_input, form)
         if pain_location_correction:
             return pain_location_correction
-
-        referral_source = normalize_referral_source(user_input)
-        if referral_source:
-            return {
-                "is_correction": True,
-                "confidence": "high",
-                "old_value": form.get("Referral", {}).get("Source", ""),
-                "new_value": referral_source,
-                "field_name": "Source",
-                "section_name": "Referral",
-                "needs_clarification": False,
-                "clarification_question": "",
-            }
 
     try:
         if is_summary_mode:
@@ -334,8 +251,9 @@ Valid form schema:
 {schema_text}
 
 Analyze the message semantically. Identify ALL independent corrections in the
-same message. A visible lifestyle detail (Work, Activity/Exercise, Smoking, or
-Alcohol) is a component of History & Diagnostics -> Current Lifestyle.
+same message. Work and Activity/Exercise are components of History &
+Diagnostics -> Current Lifestyle. Other lifestyle text is historical context,
+not an independently editable component.
 
 Do not copy command language such as "please update", "add", or "change" into
 new_value. Store only the clinical fact the patient wants recorded. If the
@@ -350,7 +268,7 @@ Respond with a JSON object:
       {{
         "operation": "update" | "clear",
         "section_name": "section name or visible lifestyle component container",
-        "field_name": "field name or Work/Activity/Smoking/Alcohol",
+        "field_name": "field name or Work/Activity",
         "new_value": "clinical value only; empty only for clear"
       }}
     ],

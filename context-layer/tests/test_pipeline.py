@@ -161,3 +161,22 @@ def test_load_intake_forward_fills_previous_intake_for_later_appointment(monkeyp
     # most recent intake dated on/before it (the Aug 12th one).
     assert category == "knee_pain"
     assert form_data["Present Complaint"]["Primary Complaint"] == "Knee pain from running"
+
+
+def test_historical_referral_is_excluded_from_recommendation_context_without_mutation():
+    from app import service
+
+    mongo_form = {
+        "Present Complaint": {"Primary Complaint": "Knee pain"},
+        "Referral": {"Source": "Private campaign"},
+        "History & Diagnostics": {"Source": "Clinical provenance"},
+    }
+
+    safe = service._without_historical_referral(mongo_form)
+
+    assert "Referral" not in safe
+    assert safe["Present Complaint"]["Primary Complaint"] == "Knee pain"
+    assert safe["History & Diagnostics"]["Source"] == "Clinical provenance"
+    assert mongo_form["Referral"]["Source"] == "Private campaign"
+    assert "Private campaign" not in service._blob(safe)
+    assert "Private campaign" not in service._patient_context(safe, ["knee_pain"], set())

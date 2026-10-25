@@ -28,13 +28,6 @@ _LIFESTYLE_COMPONENTS = {
     "exercise": "activity",
     "exercise routine": "activity",
     "activity exercise": "activity",
-    "smoke": "smoking",
-    "smoking": "smoking",
-    "tobacco": "smoking",
-    "drink": "alcohol",
-    "drinking": "alcohol",
-    "alcohol": "alcohol",
-    "alcohol use": "alcohol",
 }
 
 
@@ -103,9 +96,6 @@ _FIELD_ALIASES = {
         "Treatment Goals",
         "Specific Expectations from Treatment",
     ),
-    "referral": ("Referral", "Source"),
-    "source": ("Referral", "Source"),
-    "heard about us": ("Referral", "Source"),
 }
 
 

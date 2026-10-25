@@ -1,20 +1,9 @@
-"""
-Node factories for generating questions and the final summary.
-
-Key behaviours:
-- The LLM acts as a conductor: it sees full conversation context, the current form
-  state, and the visit type — then decides the single best next question to ask.
-- Visit context (specific_complaint / general_assessment / clinic_inquiry) drives
-  which sections are relevant; the LLM skips irrelevant questions naturally.
-- The referral question ("How did you hear about us?") is asked exactly once, at
-  the end, by code — not left to the LLM to forget or repeat.
-"""
+"""Node factories for generating clinical intake questions and the final summary."""
 import time as _time
 from langgraph.config import get_stream_writer
 from src.graph.state import InterviewState
 from src.graph.pure_functions.summary import generate_interview_summary
 from src.graph.pure_functions.form_validation import get_all_missing_fields, validate_section as _vs
-from src.graph.pure_functions.referral import is_referral_question
 from src.graph.pure_functions.question_repetition import asks_about_answered_field
 from src.graph.pure_functions.question_plan import question_for_missing_fields
 from src.prompts import INTELLIGENT_QUESTION_PROMPT
@@ -30,7 +19,6 @@ _FIELD_LABELS = _FRM01.field_labels
 def _get_relevant_missing(form: dict, form_sections: list, visit_context: str) -> list[tuple]:
     """Return [(section, field), ...] for missing fields relevant to this visit type."""
     all_missing = get_all_missing_fields(form, form_sections)
-    all_missing.pop("Referral", None)  # handled separately
 
     if visit_context == "general_assessment":
         for sec in _SKIP_FOR_GENERAL:
@@ -200,21 +188,6 @@ def required_response_before_summary(state: InterviewState, history: list) -> di
             ],
         }
 
-    referral = str(state["form"].get("Referral", {}).get("Source", "")).strip()
-    if not referral:
-        response = (
-            "Last thing — How did you come to know about us? "
-            "(Friend/family, Google, Instagram, Facebook, YouTube, doctor referral, etc.)"
-        )
-        return {
-            "response_text": response,
-            "history": history + [{"role": "agent", "message": response}],
-            "phase": "interviewing",
-            "current_section": "Referral",
-            "referral_asked": True,
-            "missing_fields": ["Source"],
-            "question_field_ids": ["Referral.Source"],
-        }
     return None
 
 
@@ -245,7 +218,6 @@ def make_generate_question_node(llm_complete, system_prompt):
         form_sections = state["form_sections"]
         question_round = state["question_round"]
         history = list(state["history"])
-        referral_asked = state.get("referral_asked", False)
         visit_context = state.get("visit_context", "unknown")
 
         # ── Tagged turns: use pre-batched questions when available ────────────
@@ -278,15 +250,7 @@ def make_generate_question_node(llm_complete, system_prompt):
             # required field visible to the patient before summary/completion.
             response = _fallback_missing_question(flat_missing)
 
-            referral_source_filled = bool(
-                str(form.get("Referral", {}).get("Source", "")).strip()
-            )
-            if is_referral_question(response) and (
-                referral_asked or referral_source_filled
-            ):
-                print("[generate] Suppressed repeated referral question")
-                response = _fallback_missing_question(flat_missing)
-            elif asks_about_answered_field(response, form):
+            if asks_about_answered_field(response, form):
                 print("[generate] Suppressed question about an answered field")
                 response = _fallback_missing_question(flat_missing)
 
@@ -296,38 +260,9 @@ def make_generate_question_node(llm_complete, system_prompt):
             patch["question_field_ids"] = [
                 f"{section}.{field}" for section, field in flat_missing[:4]
             ]
-            if is_referral_question(response):
-                patch["referral_asked"] = True
             return patch
 
-        # ── All non-referral fields done — ask referral exactly once ──────────
-        # Only ask if Source isn't already filled (e.g. patient mentioned it earlier)
-        referral_source_filled = bool(
-            form.get("Referral", {}).get("Source", "").strip()
-        )
-        if not referral_asked and not referral_source_filled:
-            response = (
-                "Last thing — where did you hear about us? "
-                "(Friend/family, Google, Instagram, Facebook, YouTube, doctor referral, etc.)"
-            )
-            history.append({"role": "agent", "message": response})
-            writer({"stage": "Formulating next question", "detail": "Ready", "status": "done"})
-            return {
-                "response_text": response,
-                "history": history,
-                "referral_asked": True,
-                "question_field_ids": ["Referral.Source"],
-            }
-        elif referral_source_filled and not referral_asked:
-            # generate_question has a terminal graph edge. A flags-only return
-            # ends the turn with no response and leaves the UI processing forever.
-            # Summarize in this same turn, even if the source came from extraction
-            # rather than the deterministic known-channel recognizer.
-            result = _make_summary(state, history)
-            result["referral_asked"] = True
-            return result
-
-        # ── All fields done including referral — generate summary ─────────────
+        # ── All required clinical fields are complete — generate summary ──────
         writer({"stage": "Formulating next question", "detail": "Generating summary", "status": "active"})
         return _make_summary(state, history)
 

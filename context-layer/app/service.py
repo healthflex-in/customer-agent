@@ -121,8 +121,18 @@ def _dedupe(candidates):
     return list(best.values())
 
 
+def _without_historical_referral(form_data: dict) -> dict:
+    """Return a copied intake form excluding the retired top-level Referral data."""
+    clean_form = dict(form_data) if isinstance(form_data, dict) else {}
+    clean_form.pop("Referral", None)
+    return clean_form
+
+
 def get_recommendations(user_id, appointment_id, report_id=None, *, force: bool = False) -> dict:
     form_data, category = _load_intake(user_id, appointment_id)
+    # Mongo-derived documents may predate the intake change. Use a copied,
+    # sanitized object for every recommendation, cache, and LLM sink.
+    form_data = _without_historical_referral(form_data)
     ctx = ctxmgr.activate(user_id, appointment_id)
     source_hash = ctxmgr.form_hash(form_data)
 

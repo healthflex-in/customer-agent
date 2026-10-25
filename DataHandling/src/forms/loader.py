@@ -38,7 +38,6 @@ class FormDefinition:
     visit_types: dict         # {visit_type_key: VisitType}
     predefined_questions: tuple  # (PredefinedQuestion, ...)
     general_visit_q1: str
-    referral_question: str
 
     def empty_form(self) -> dict:
         """Return a fresh blank form dict. Call this instead of deepcopy(template)."""
@@ -139,7 +138,6 @@ def _parse(raw: str, form_id: str) -> FormDefinition:
         visit_types=_parse_visit_types(blocks.get("Visit Types", "")),
         predefined_questions=_parse_predefined_questions(blocks.get("Predefined Questions", "")),
         general_visit_q1=_parse_text_block(blocks.get("General Visit First Question", "")),
-        referral_question=_parse_text_block(blocks.get("Referral Question", "")),
     )
 
 

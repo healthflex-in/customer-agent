@@ -151,18 +151,6 @@ def classify_summary_response(
             "wants_upload": None,
         }
 
-    # Explicit habit corrections are schema-aware updates. Alcohol/smoking are
-    # components inside Current Lifestyle, not new complaints or questions.
-    if re.search(r"\b(?:update|change|correct|actually|but)\b", normalized) and re.search(
-        r"\b(?:smoke|smoking|drink|drinks|drinking|alcohol)\b", normalized
-    ):
-        return {
-            "intent": "request_change",
-            "correction_text": user_input.strip(),
-            "has_reports": None,
-            "wants_upload": None,
-        }
-
     from src.graph.pure_functions.additional_complaint import is_explicit_symptom_addition
     if is_explicit_symptom_addition(user_input):
         from src.graph.pure_functions.additional_complaint import (
@@ -172,18 +160,6 @@ def classify_summary_response(
                 "addition_text": concise_additional_complaint(user_input),
                 "has_reports": None, "wants_upload": None}
 
-    # A direct channel answer at summary time commonly follows a referral
-    # question that was displayed just before a reconnect/race. Treat it as a
-    # concrete field update, never as an ambiguous generic correction.
-    from src.graph.pure_functions.referral import normalize_referral_source
-
-    if normalize_referral_source(user_input):
-        return {
-            "intent": "request_change",
-            "correction_text": user_input.strip(),
-            "has_reports": None,
-            "wants_upload": None,
-        }
     vague_change_responses = {
         "no", "nope", "incorrect", "wrong", "not correct", "not right",
         "this is incorrect", "this is wrong", "this is not correct",

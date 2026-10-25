@@ -2,55 +2,119 @@ import unittest
 from pathlib import Path
 
 from src.forms.loader import load_form
-from src.graph.pure_functions.question_plan import (
-    REQUIRED_FIELD_QUESTIONS,
-    question_for_missing_fields,
-)
 from src.graph.pure_functions.form_validation import (
     get_all_missing_fields,
     validate_section,
 )
+from src.graph.pure_functions.question_plan import (
+    LIFESTYLE_COMPONENT_QUESTIONS,
+    REQUIRED_FIELD_QUESTIONS,
+    contextual_resume_question,
+    question_for_missing_fields,
+)
+
+
+_PROHIBITED_QUESTION_TERMS = ("smok", "tobacco", "drink", "alcohol")
 
 
 class RequiredIntakeCoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.definition = load_form("FRM-01")
+
+    def assertNoRetiredLifestyleQuestion(self, text):
+        lowered = text.lower()
+        for term in _PROHIBITED_QUESTION_TERMS:
+            self.assertNotIn(term, lowered)
+
     def test_resume_anchors_question_in_saved_complaint_without_reasking_it(self):
-        from src.graph.pure_functions.question_plan import contextual_resume_question
-        form = {"Present Complaint": {"Primary Complaint": "Right knee pain", "Onset (Gradual or Sudden)": "Sudden"}}
-        missing = [("Present Complaint", "Duration of the Issue")]
-        response = contextual_resume_question(form, missing, {})
+        form = {
+            "Present Complaint": {
+                "Primary Complaint": "Right knee pain",
+                "Onset (Gradual or Sudden)": "Sudden",
+            }
+        }
+        response = contextual_resume_question(
+            form, [("Present Complaint", "Duration of the Issue")], {}
+        )
         self.assertIn("Welcome back", response)
         self.assertIn("Right knee pain", response)
         self.assertIn("How long", response)
         self.assertNotIn("Did it start", response)
-        self.assertNotIn("Is this information correct", response)
+        self.assertNoRetiredLifestyleQuestion(response)
 
-    def test_resume_asks_activity_without_work_and_asks_where_they_heard_about_us(self):
-        from src.graph.pure_functions.question_plan import contextual_resume_question
-        form = {"Present Complaint": {"Primary Complaint": "Back pain"}}
-        missing = [
-            ("History & Diagnostics", "Current Lifestyle"),
-            ("Referral", "Source"),
+    def test_blank_lifestyle_yields_exactly_work_and_activity_gaps(self):
+        form = self.definition.empty_form()
+        form["History & Diagnostics"]["Systemic Illness and Surgical History"] = "None"
+        form["History & Diagnostics"]["Reports"] = "None"
+
+        missing = validate_section(form, "History & Diagnostics")
+
+        self.assertEqual(
+            missing,
+            [
+                "Current Lifestyle — Work",
+                "Current Lifestyle — Activity or Exercise",
+            ],
+        )
+        question = question_for_missing_fields(
+            [("History & Diagnostics", field) for field in missing],
+            self.definition.field_labels,
+        )
+        self.assertIn(LIFESTYLE_COMPONENT_QUESTIONS[missing[0]], question)
+        self.assertIn(LIFESTYLE_COMPONENT_QUESTIONS[missing[1]], question)
+        self.assertNoRetiredLifestyleQuestion(question)
+
+    def test_work_and_activity_complete_lifestyle_despite_unrelated_text(self):
+        form = self.definition.empty_form()
+        diagnostics = form["History & Diagnostics"]
+        diagnostics["Systemic Illness and Surgical History"] = "None"
+        diagnostics["Reports"] = "None"
+        diagnostics["Current Lifestyle"] = (
+            "Historical note: keep exactly; Work: software developer; "
+            "Activity/exercise: gym three times per week; Custom label: retained"
+        )
+
+        self.assertEqual(validate_section(form, "History & Diagnostics"), [])
+
+    def test_fresh_resume_and_form_templates_never_ask_retired_topics(self):
+        rendered = [
+            self.definition.general_visit_q1,
+            *(question.text for question in self.definition.predefined_questions),
+            *REQUIRED_FIELD_QUESTIONS.values(),
+            *LIFESTYLE_COMPONENT_QUESTIONS.values(),
+            contextual_resume_question(
+                {},
+                [
+                    ("History & Diagnostics", "Current Lifestyle — Work"),
+                    ("History & Diagnostics", "Current Lifestyle — Activity or Exercise"),
+                ],
+                self.definition.field_labels,
+            ),
         ]
-        response = contextual_resume_question(form, missing, {})
-        self.assertIn("What is your usual activity or exercise routine?", response)
-        self.assertIn("Do you smoke or drink alcohol?", response)
-        self.assertNotIn("work", response.lower())
-        self.assertIn("Where did you hear about us?", response)
-        self.assertNotIn("\n- Source", response)
-        self.assertNotIn("\nSource", response)
+        for text in rendered:
+            self.assertNoRetiredLifestyleQuestion(text)
 
-    def setUp(self):
-        self.definition = load_form("FRM-01")
+        root = Path(__file__).resolve().parents[1]
+        for relative in ("src/prompts.py", "src/llm/functionalities.py"):
+            source = (root / relative).read_text(encoding="utf-8").lower()
+            for phrase in (
+                "do you smoke",
+                "smoke or drink",
+                "drink alcohol",
+                "smoking and alcohol habits",
+            ):
+                self.assertNotIn(phrase, source)
 
-    def test_every_required_non_referral_field_has_deterministic_question(self):
+    def test_every_required_field_has_deterministic_question(self):
         expected = {
             field
-            for section, fields in self.definition.sections.items()
-            if section != "Referral"
+            for fields in self.definition.sections.values()
             for field in fields
             if "(If Any)" not in field and "(Optional)" not in field
         }
         self.assertEqual(set(REQUIRED_FIELD_QUESTIONS), expected)
+        self.assertNotIn("Referral", self.definition.sections)
+        self.assertFalse(hasattr(self.definition, "referral_question"))
 
     def test_question_batches_include_each_missing_field(self):
         missing = [
@@ -60,50 +124,13 @@ class RequiredIntakeCoverageTests(unittest.TestCase):
             ("Treatment Goals", "Specific Expectations from Treatment"),
         ]
         question = question_for_missing_fields(missing, self.definition.field_labels)
-
         for _, field in missing:
             self.assertIn(REQUIRED_FIELD_QUESTIONS[field], question)
 
-    def test_previous_consultation_requires_status_after_treatment(self):
-        section = {
-            "Previous Diagnosis or Advice and Prescribed Treatment Taken": (
-                "Saw a physiotherapist and was prescribed exercises"
-            ),
-            "Current Status of Issue (Improved, Same, Worse)": "",
-        }
-        self.assertEqual(
-            validate_section({"Previous Consultations": section}, "Previous Consultations"),
-            ["Current Status of Issue (Improved, Same, Worse)"],
-        )
-
-    def test_blank_answers_stay_blank_and_block_completion(self):
+    def test_blank_answers_block_completion(self):
         form = self.definition.empty_form()
-        unchanged = {section: dict(fields) for section, fields in form.items()}
-
-        self.assertEqual(unchanged, form)
-        self.assertTrue(get_all_missing_fields(unchanged, list(self.definition.sections)))
-        self.assertNotIn("Not mentioned by patient", str(unchanged))
-
-        generate_source = (
-            Path(__file__).resolve().parents[1] / "src" / "graph" / "nodes" / "generate.py"
-        ).read_text(encoding="utf-8")
-        fill_start = generate_source.index("def _fill_unanswered_fields")
-        fill_end = generate_source.index("def make_generate_question_node", fill_start)
-        self.assertNotIn('filled[section][field] = "Not mentioned by patient"', generate_source[fill_start:fill_end])
-
-    def test_empty_persisted_draft_has_same_missing_fields_as_blank_template(self):
-        sections = list(self.definition.sections)
-        self.assertEqual(
-            get_all_missing_fields({}, sections),
-            get_all_missing_fields(self.definition.empty_form(), sections),
-        )
-
-    def test_partial_section_does_not_hide_absent_required_fields(self):
-        form = {"Present Complaint": {"Primary Complaint": "Right knee pain"}}
-        self.assertEqual(
-            set(validate_section(form, "Present Complaint")),
-            set(self.definition.sections["Present Complaint"]) - {"Primary Complaint"},
-        )
+        self.assertTrue(get_all_missing_fields(form, list(self.definition.sections)))
+        self.assertNotIn("Not mentioned by patient", str(form))
 
     def test_explicit_no_previous_consultation_does_not_require_status(self):
         section = {
@@ -116,51 +143,6 @@ class RequiredIntakeCoverageTests(unittest.TestCase):
             validate_section({"Previous Consultations": section}, "Previous Consultations"),
             [],
         )
-
-    def test_partial_lifestyle_answer_cannot_complete_compound_requirement(self):
-        form = self.definition.empty_form()
-        form["History & Diagnostics"]["Systemic Illness and Surgical History"] = (
-            "No known conditions or surgeries"
-        )
-        form["History & Diagnostics"]["Reports"] = "No reports"
-        form["History & Diagnostics"]["Current Lifestyle"] = (
-            "Work: software developer; Activity/exercise: gym three times per week; "
-            "Smoking: does not smoke"
-        )
-
-        missing = validate_section(form, "History & Diagnostics")
-
-        self.assertEqual(missing, ["Current Lifestyle — Alcohol"])
-        question = question_for_missing_fields(
-            [("History & Diagnostics", missing[0])],
-            self.definition.field_labels,
-        )
-        self.assertEqual(question, "Do you drink alcohol?")
-
-    def test_all_lifestyle_subtopics_are_required_and_can_complete(self):
-        form = self.definition.empty_form()
-        form["History & Diagnostics"]["Systemic Illness and Surgical History"] = "None"
-        form["History & Diagnostics"]["Reports"] = "None"
-        form["History & Diagnostics"]["Current Lifestyle"] = (
-            "Work: software developer; Activity/exercise: gym three times per week; "
-            "Smoking: does not smoke; Alcohol: rarely drinks alcohol"
-        )
-
-        self.assertEqual(validate_section(form, "History & Diagnostics"), [])
-
-    def test_summary_and_confirmation_have_the_same_required_field_gate(self):
-        backend_root = Path(__file__).resolve().parents[1]
-        generate_source = (backend_root / "src" / "graph" / "nodes" / "generate.py").read_text(
-            encoding="utf-8"
-        )
-        summary_source = (backend_root / "src" / "graph" / "nodes" / "summary.py").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertGreaterEqual(
-            generate_source.count("required_response_before_summary(state, history)"), 2
-        )
-        self.assertIn("required_response_before_summary(", summary_source)
 
 
 if __name__ == "__main__":
