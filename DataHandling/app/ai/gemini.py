@@ -39,6 +39,7 @@ def build_gemini_text_completer(
     operation: str,
     temperature: float,
     timeout_ms: int = GEMINI_REQUEST_TIMEOUT_MS,
+    json_output: bool = False,
 ) -> Callable[[str], str] | None:
     """Return a prompt completer for one Gemini model, or None when no key exists.
 
@@ -65,6 +66,7 @@ def build_gemini_text_completer(
         generation_config = types.GenerateContentConfig(
             temperature=temperature,
             thinking_config=types.ThinkingConfig(**thinking.as_kwargs()),
+            response_mime_type="application/json" if json_output else None,
         )
 
         def complete(prompt: str) -> str:
@@ -109,13 +111,17 @@ def build_gemini_text_completer(
 
 
 def build_gemini_reasoning_completer() -> Callable[[str], str] | None:
-    """Build the form-extraction completer for the configured Gemini model."""
+    """Build the form-extraction completer for the configured Gemini model.
+
+    Every caller of this completer expects a JSON object back.
+    """
 
     try:
         return build_gemini_text_completer(
             MODEL_REGISTRY.reasoning,
             operation="form_extraction",
             temperature=0.1,
+            json_output=True,
         )
     except Exception as error:
         print(f"[graph] Reasoning LLM initialization failed: {error_type(error)}")

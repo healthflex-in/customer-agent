@@ -3,6 +3,7 @@ Node factory functions for correction detection and application.
 """
 from src.graph.state import InterviewState
 from src.graph.pure_functions.form_extraction import detect_form_correction, apply_form_correction
+from src.graph.pure_functions.summary import SUMMARY_FOLLOW_UP
 
 
 def make_detect_correction_node(llm_complete):
@@ -108,10 +109,7 @@ def make_apply_correction_node(llm_complete):
                         " I couldn't safely match one other requested change; "
                         "please state that detail separately."
                     )
-                response_text += (
-                    " Would you like to update anything else? If everything is "
-                    "correct, reply 'done' or 'yes' to confirm."
-                )
+                response_text += f" {SUMMARY_FOLLOW_UP}"
             else:
                 response_text = (
                     failures[0] if failures else
@@ -148,7 +146,7 @@ def make_apply_correction_node(llm_complete):
                     if correction_data.get("lifestyle_already_current")
                     else "lifestyle information"
                 )
-            message = "I've updated " + "; ".join(changes) + ". Would you like to update anything else? If everything is correct, you can confirm."
+            message = "I've updated " + "; ".join(changes) + f". {SUMMARY_FOLLOW_UP}"
             return {"form": updated_form, "correction_applied": True,
                     "response_text": message,
                     "history": history + [{"role": "agent", "message": message}]}

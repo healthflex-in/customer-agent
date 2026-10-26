@@ -854,106 +854,11 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
             _question_field_ids = list(
                 result_state.get("question_field_ids") or []
             )
-            (
-                _same_missing_count,
-                _same_question_count,
-                _loop_recovery,
-            ) = update_loop_counters(
+            _same_missing_count, _same_question_count = update_loop_counters(
                 client_state,
                 missing_ids=_missing_after,
                 question_ids=_question_field_ids,
             )
-
-            if _loop_recovery and not _updated_fields and _question_field_ids:
-                # Re-read the attempt and narrow the question to one
-                # verified missing field. This cannot fabricate or
-                # complete data; it only prevents an identical batch
-                # from looping while surfacing the stuck field in logs.
-                _recovery_form = await run_blocking(
-                    fetch_form_by_id,
-                    client_state.get("form_id", ""),
-                    client_state.get("user_id", ""),
-                    client_state.get("attempt_id"),
-                )
-                _recovery_question_ids = list(_question_field_ids)
-                if _recovery_form and isinstance(
-                    _recovery_form.get("form_data"), dict
-                ):
-                    import copy as _recovery_copy
-                    _persisted_data = _recovery_copy.deepcopy(
-                        _recovery_form["form_data"]
-                    )
-                    if client_state.get("form_id") == DEFAULT_FORM_ID:
-                        from src.forms.loader import load_form as _recovery_load
-                        _recovery_hydrated = _recovery_load("FRM-01").empty_form()
-                        for _section, _fields in _persisted_data.items():
-                            if _section in _recovery_hydrated and isinstance(_fields, dict):
-                                _recovery_hydrated[_section].update(_fields)
-                            elif _section.startswith("Additional Complaint ") and isinstance(_fields, dict):
-                                _recovery_hydrated[_section] = _fields
-                        _persisted_data = _recovery_hydrated
-                    _persisted_missing = missing_field_ids(
-                        _persisted_data, list(_persisted_data)
-                    )
-                    result_state["form"] = _persisted_data
-                    result_state["form_sections"] = list(_persisted_data)
-                    _result_form = _persisted_data
-                    _result_sections = list(_persisted_data)
-                    _missing_after = _persisted_missing
-                    _recovery_question_ids = [
-                        field_id for field_id in _question_field_ids
-                        if field_id in _persisted_missing
-                    ] or list(_persisted_missing)
-                    _log.warning(
-                        "intake_loop_recovery",
-                        attempt_id=client_state.get("attempt_id"),
-                        session_id=client_state.get("session_id"),
-                        missing_fields=_persisted_missing,
-                        question_field_ids=_question_field_ids,
-                        same_question_count=_same_question_count,
-                        same_missing_field_count=_same_missing_count,
-                    )
-                if _recovery_question_ids:
-                    from src.graph.pure_functions.question_plan import (
-                        question_for_missing_fields,
-                    )
-                    from src.forms.loader import load_form as _loop_form
-                    _first_id = _recovery_question_ids[0]
-                    _first_section, _first_field = _first_id.split(".", 1)
-                    _focused = question_for_missing_fields(
-                        [(_first_section, _first_field)],
-                        _loop_form("FRM-01").field_labels,
-                    )
-                    result_state["response_text"] = (
-                        "I’m sorry this information still appears missing. "
-                        "Let’s verify one detail at a time.\n\n" + _focused
-                    )
-                    result_state["phase"] = "interviewing"
-                    result_state["current_section"] = _first_section
-                    result_state["missing_fields"] = [_first_field]
-                    result_state["question_field_ids"] = [_first_id]
-                    _question_field_ids = [_first_id]
-                else:
-                    # The database now has every required answer.
-                    # Return to review; never auto-complete without
-                    # the patient's explicit confirmation.
-                    from src.graph.pure_functions.summary import _fallback_summary
-                    result_state["response_text"] = _fallback_summary(
-                        result_state.get("form", {})
-                    )
-                    result_state["phase"] = "summary"
-                    result_state["missing_fields"] = []
-                    result_state["question_field_ids"] = []
-                    _question_field_ids = []
-                # The graph may have generated tokens for the
-                # pre-recovery question. Never release those
-                # after replacing the response from DB state.
-                streamed_tokens = []
-                if result_state.get("history"):
-                    result_state["history"][-1] = {
-                        "role": "agent",
-                        "message": result_state["response_text"],
-                    }
 
             _summary_intent = result_state.get("summary_intent") or {}
             _detected_intents = [

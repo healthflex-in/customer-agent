@@ -132,18 +132,20 @@ class RequiredIntakeCoverageTests(unittest.TestCase):
         self.assertTrue(get_all_missing_fields(form, list(self.definition.sections)))
         self.assertNotIn("Not mentioned by patient", str(form))
 
-    def test_explicit_no_previous_consultation_does_not_require_status(self):
-        section = {
-            "Previous Diagnosis or Advice and Prescribed Treatment Taken": (
-                "None — no previous consultations"
-            ),
-            "Current Status of Issue (Improved, Same, Worse)": "",
-        }
-        self.assertEqual(
-            validate_section({"Previous Consultations": section}, "Previous Consultations"),
-            [],
-        )
-
+    def test_dependent_field_waits_for_its_parent_answer(self):
+        parent = "Previous Diagnosis or Advice and Prescribed Treatment Taken"
+        status = "Current Status of Issue (Improved, Same, Worse)"
+        cases = [
+            ({parent: "", status: ""}, [parent]),
+            ({parent: "Physio advised rest", status: ""}, [status]),
+            ({parent: "Never consulted anyone", status: "Not applicable"}, []),
+        ]
+        for section, expected in cases:
+            with self.subTest(section=section):
+                self.assertEqual(
+                    validate_section({"Previous Consultations": section}, "Previous Consultations"),
+                    expected,
+                )
 
 if __name__ == "__main__":
     unittest.main()

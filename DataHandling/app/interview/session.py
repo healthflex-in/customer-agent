@@ -42,7 +42,8 @@ def new_client_state() -> dict:
         "graph_reports_uploaded": False,
         "graph_awaiting_report_upload": False,
         "graph_attempts_on_current_section": 0,
-        # Same-question loop detection (see turn_tracking.update_loop_counters)
+        "graph_question_ask_counts": {},
+        # Repeat-question telemetry (see turn_tracking.update_loop_counters)
         "last_missing_field_set": None,
         "last_question_field_ids": None,
         "same_missing_field_count": 0,
@@ -83,6 +84,7 @@ def reset_health_agent_for_new_interview(client_state: dict, new_user_id: str, a
     client_state["prom_snapshot"] = None
     client_state["prom_source_doc_id"] = None
     client_state["pending_voice_input"] = None
+    client_state["graph_question_ask_counts"] = {}
     client_state["last_missing_field_set"] = None
     client_state["last_question_field_ids"] = None
     client_state["same_missing_field_count"] = 0

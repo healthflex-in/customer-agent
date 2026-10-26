@@ -11,6 +11,29 @@ from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
 
 
+# Both questions take the same answers: "no" approves the summary, anything
+# else names what to change.
+SUMMARY_QUESTION = (
+    "Is there anything you'd like to change? Reply 'no' if everything is "
+    "correct, or tell me what to change."
+)
+SUMMARY_FOLLOW_UP = (
+    "Is there anything else you'd like to change? Reply 'no' if everything is "
+    "correct, or tell me what to change."
+)
+_APPROVALS = {
+    "no", "nope", "nah", "no changes", "no change", "nothing", "nothing to change",
+    "confirm", "confirmed", "correct", "all correct", "everything is correct",
+    "looks good", "all good", "done", "ok", "okay", "ok done", "okay done",
+    "no thanks", "no thank you", "that s all", "thats all",
+}
+_CHANGE_WITHOUT_DETAIL = {
+    "yes", "yeah", "yep", "yes please", "i want to change something",
+    "i want to make changes", "i would like to make changes",
+    "i would like to make any changes", "something is wrong",
+}
+
+
 _REPORT_UPLOAD_DEFERRAL = re.compile(
     r"^(?:i\s+)?(?:will|shall|can)\s+(?:share|upload|attach|send)"
     r"(?:\s+(?:it|them|the\s+reports?))?\s+later\b|"
@@ -76,7 +99,7 @@ def _fallback_summary(form: dict) -> str:
                 parts.append(f"\n{section}:")
                 for k, v in non_empty.items():
                     parts.append(f"- {k}: {v}")
-    parts.append("\nIs this information correct, or would you like to make any changes?")
+    parts.append(f"\n{SUMMARY_QUESTION}")
     return "\n".join(parts)
 
 
@@ -127,11 +150,7 @@ def classify_summary_response(
         return {"intent": "has_reports", "wants_upload": False,
                 "upload_claimed": True, "correction_text": None}
 
-    if normalized in {
-        "yes", "correct", "looks good", "that is right", "thats right",
-        "done", "ok done", "okay done", "all done", "finished",
-        "yes done", "yes correct",
-    }:
+    if normalized in _APPROVALS:
         return {
             "intent": "confirm",
             "correction_text": None,
@@ -160,18 +179,7 @@ def classify_summary_response(
                 "addition_text": concise_additional_complaint(user_input),
                 "has_reports": None, "wants_upload": None}
 
-    vague_change_responses = {
-        "no", "nope", "incorrect", "wrong", "not correct", "not right",
-        "this is incorrect", "this is wrong", "this is not correct",
-        "that is incorrect", "that is wrong", "that is not correct",
-        "it is incorrect", "it is wrong", "it is not correct",
-        "i want to make changes", "i want some changes", "i want a change",
-        "want to make changes", "want some changes", "make changes",
-        "i would like to make changes", "i would like to make some changes",
-        "i would like to make any changes", "i need to change something",
-        "change something",
-    }
-    if normalized in vague_change_responses:
+    if normalized in _CHANGE_WITHOUT_DETAIL:
         return {
             "intent": "request_change",
             "correction_text": None,
@@ -180,7 +188,7 @@ def classify_summary_response(
         }
 
     prompt = f"""You are assisting with a medical intake interview. The patient has just been shown
-a summary and asked: "Is this information correct, or would you like to make any changes?"
+a summary and asked: "{SUMMARY_QUESTION}"
 
 SUMMARY SHOWN TO THE PATIENT:
 {summary_text}
@@ -189,15 +197,14 @@ The patient responded: "{user_input}"
 
 Classify their intent. Choose EXACTLY ONE intent from below:
 
-- "confirm": patient says YES — the summary is correct (e.g. "yes", "correct", "looks good", "that's right", "ok", "sure", "yep")
+- "confirm": patient has nothing to change — the summary is correct (e.g. "no", "nothing", "it's all correct", "looks good", "no changes needed")
 - "new_complaint": patient reveals an ADDITIONAL specific health issue, pain, or symptom that was NOT in the summary
   Use when: patient says "i have neck pain", "actually my knee hurts", "i forgot to mention my back", "i have a complaint", "wait i have pain" etc.
   This means they want to ADD new medical information, not correct existing data.
   Set addition_text to ONLY the concise clinical complaint (for example
   "tingling in the left fingers"), never the patient's instruction words.
 - "request_change": patient wants to CORRECT or UPDATE something already stated in the summary
-  CRITICAL: "no" in response to "Is this correct?" → request_change (no, it is NOT correct)
-  Also: "not right", "wrong", "incorrect", "change X to Y", "actually it was X"
+  ("yes", "something is wrong", "change X to Y", "actually it was X")
   Set correction_text to null when the patient only says that something is wrong or asks to make
   changes without identifying the information and its corrected value. Otherwise set it to the
   patient's exact correction request.

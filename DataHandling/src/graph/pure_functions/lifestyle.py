@@ -172,6 +172,16 @@ def lifestyle_components(value: str | None) -> set[str]:
     return found
 
 
+def lifestyle_component_value(value: str | None, component: str) -> str:
+    """Return the saved answer for one supported component, or an empty string."""
+
+    for part in format_lifestyle_value(value).split(";"):
+        label, separator, answer = part.partition(":")
+        if separator and _LABEL_TO_COMPONENT.get(label.strip().lower()) == component:
+            return answer.strip()
+    return ""
+
+
 def missing_lifestyle_components(value: str | None) -> list[str]:
     found = lifestyle_components(value)
     return [

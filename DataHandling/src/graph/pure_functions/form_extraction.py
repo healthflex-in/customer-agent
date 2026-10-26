@@ -9,6 +9,7 @@ from typing import Callable, Optional
 
 from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
+from src.graph.pure_functions.summary import SUMMARY_FOLLOW_UP
 from src.prompts import TEMPLATE_PROMPT, CORRECTION_DETECTION_PROMPT
 
 
@@ -366,8 +367,7 @@ def apply_form_correction(
         diagnostics["Current Lifestyle"] = changed
         msg = (
             f"I've updated {target.component} in your lifestyle information. "
-            "Would you like to update anything else? If everything is correct, "
-            "reply 'done' or 'yes' to confirm."
+            f"{SUMMARY_FOLLOW_UP}"
         )
         return updated_form, True, msg
 
@@ -403,8 +403,5 @@ def apply_form_correction(
         else:
             related_text = ", ".join(related_changes[:-1]) + f", and {related_changes[-1]}"
         msg += f" I also {related_text} so the record stays consistent."
-    msg += (
-        " Would you like to update anything else? If everything is correct, "
-        "reply 'done' or 'yes' to confirm."
-    )
+    msg += f" {SUMMARY_FOLLOW_UP}"
     return updated_form, True, msg

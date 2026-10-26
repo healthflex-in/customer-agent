@@ -259,10 +259,15 @@ def additional_complaint_removal_target(text, form, active_section=None):
 
 
 def capture_additional_complaint(form, text):
-    updated = copy.deepcopy(form)
     complaint = validated_additional_complaint(text)
     if complaint is None:
-        return updated, None
+        return copy.deepcopy(form), None
+    return add_complaint_section(form, complaint)
+
+
+def add_complaint_section(form, complaint):
+    """Add an Additional Complaint section for ``complaint``, reusing a match."""
+    updated = copy.deepcopy(form)
     existing = [name for name in updated if name.startswith("Additional Complaint ")]
     for name in existing:
         if str(updated[name].get("Primary Complaint", "")).strip().lower() == complaint.lower():

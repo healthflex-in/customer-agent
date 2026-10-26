@@ -61,7 +61,7 @@ Duration of the Issue: How long they've had this
 Onset (Gradual or Sudden): Whether it started suddenly or gradually
 Mechanism of Injury or Cause: What caused it / how it started
 Previous Diagnosis or Advice and Prescribed Treatment Taken: Previous doctor/physio visits and what they said
-Current Status of Issue (Improved, Same, Worse): Whether the condition has improved, stayed same, or worsened
+Current Status of Issue (Improved, Same, Worse): How the issue is now, compared with before the previous treatment (improved, the same, or worse)
 Primary Location of Pain: Exactly where the pain is
 Severity (1-10): Pain severity on a scale of 0–10
 Aggravating Factors: What makes it worse
@@ -72,6 +72,20 @@ Reports: Any MRI, X-ray, CT scan, or blood reports
 Short-Term Goals (within 3 months): What they want to achieve in the next 3 months
 Long-Term Goals (after 3 months): Their long-term health/activity goal
 Specific Expectations from Treatment: What they expect from this treatment
+
+---
+
+## Field Rules
+
+### Onset (Gradual or Sudden)
+values: Gradual, Sudden
+
+### Current Status of Issue (Improved, Same, Worse)
+values: Improved, Same, Worse
+applies_when_answered: Previous Diagnosis or Advice and Prescribed Treatment Taken
+
+### Severity (1-10)
+scale: 0-10
 
 ---
 

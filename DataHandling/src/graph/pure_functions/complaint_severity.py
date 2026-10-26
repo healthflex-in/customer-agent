@@ -1,5 +1,4 @@
 """Bind numeric pain ratings to a unique complaint, never a combined score."""
-import copy
 import re
 
 SCORE = re.compile(r"\b(10|[0-9])\s*(?:out\s+of|/)\s*10\b", re.I)
@@ -127,17 +126,3 @@ def explicit_severity_updates(form, text, active_section=None, context_question=
                 updates[matched[0]] = score[1] + "/10"
     return updates
 
-
-def reconcile_severities(original, extracted, text, active_section=None, context_question=None):
-    result = copy.deepcopy(extracted)
-    targets = complaint_targets(original)
-    if len(targets) > 1:
-        # Do not trust a full-conversation model to overwrite other complaints'
-        # ratings. Only this turn's explicitly scoped score can update them.
-        for section, field, _ in targets:
-            result.setdefault(section, {})[field] = original[section][field]
-    for (section, field), value in explicit_severity_updates(
-        original, text, active_section, context_question
-    ).items():
-        result.setdefault(section, {})[field] = value
-    return result

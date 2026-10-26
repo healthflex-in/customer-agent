@@ -5,8 +5,14 @@ then handle the result (confirm, change, reports, etc.).
 from typing import Callable
 
 from src.graph.state import InterviewState
-from src.graph.pure_functions.summary import classify_summary_response, _fallback_summary, reports_with_verified_upload
-from src.graph.nodes.generate import required_response_before_summary
+from src.graph.pure_functions.summary import (
+    SUMMARY_FOLLOW_UP,
+    SUMMARY_QUESTION,
+    classify_summary_response,
+    _fallback_summary,
+    reports_with_verified_upload,
+)
+from src.graph.nodes.generate import next_intake_step
 
 
 def make_classify_summary_intent_node(llm_complete: Callable[[str], str]):
@@ -200,8 +206,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             if section in updated_form and replacement:
                 updated_form[section]["Primary Complaint"] = replacement
                 response_text = (
-                    f"I've corrected the additional concern to {replacement}. "
-                    "Would you like to update anything else? If everything is correct, you can confirm."
+                    f"I've corrected the additional concern to {replacement}. {SUMMARY_FOLLOW_UP}"
                 )
                 return {
                     "form": updated_form,
@@ -212,18 +217,17 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                     ],
                 }
         elif intent == "confirm":
-            required_response = required_response_before_summary(
-                state, list(state["history"])
-            )
-            if required_response is not None:
+            step = next_intake_step(state, list(state["history"]))
+            if step["phase"] == "interviewing":
                 # An old/resumed session may reach summary with legacy blank
                 # fields. Never terminally complete it until it goes through
                 # the same required-field gate as fresh interviews.
-                return required_response
+                return step
             response_text = (
                 "Thank you for confirming. Your medical information has been recorded. "
                 "You can now close this page. Our team will review your information and get back to you soon."
             )
+            patch["form"] = step["form"]
             patch["phase"] = "complete"
             patch["response_text"] = response_text
             patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
@@ -248,15 +252,14 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                              response_text=response_text,
                              history=state["history"] + [{"role": "agent", "message": response_text}])
             elif state.get("reports_uploaded") and wants_upload is False and not summary_intent.get("upload_claimed"):
-                response_text = "Your uploaded documents remain attached. You can share the additional reports directly with your clinician. Is the summary otherwise correct?"
+                response_text = f"Your uploaded documents remain attached. You can share the additional reports directly with your clinician. {SUMMARY_FOLLOW_UP}"
                 patch.update(awaiting_report_upload=False, request_attachment=False,
                              response_text=response_text,
                              history=state["history"] + [{"role": "agent", "message": response_text}])
             elif state.get("reports_uploaded"):
                 response_text = (
                     "The documents you just uploaded are already attached to this assessment. "
-                    "I've updated your report information to reflect the upload. Is the summary otherwise correct, "
-                    "or would you like to change any information?"
+                    f"I've updated your report information to reflect the upload. {SUMMARY_FOLLOW_UP}"
                 )
                 patch["awaiting_report_upload"] = False
                 patch["request_attachment"] = False
@@ -266,14 +269,14 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                 response_text = (
                     "Thank you for letting me know. I cannot verify an attached file for this assessment yet. "
                     "You can continue reviewing your summary and share the documents with your clinician. "
-                    "Is the summary correct, or would you like to change anything?"
+                    f"{SUMMARY_QUESTION}"
                 )
                 patch["awaiting_report_upload"] = False
                 patch["request_attachment"] = False
                 patch["response_text"] = response_text
                 patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]
             elif wants_upload is False:
-                response_text = "You can share your reports directly with your clinician. Is the summary correct, or would you like to change anything?"
+                response_text = f"You can share your reports directly with your clinician. {SUMMARY_QUESTION}"
                 patch["awaiting_report_upload"] = False
                 patch["request_attachment"] = False
                 patch["response_text"] = response_text
@@ -311,7 +314,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                     "No relevant diagnostic reports available for this issue"
                 )
             patch["form"] = updated_form
-            response_text = "I've noted your report information. Is the summary otherwise correct, or would you like to change anything?"
+            response_text = f"I've noted your report information. {SUMMARY_FOLLOW_UP}"
             patch.update(response_text=response_text, awaiting_report_upload=False,
                          request_attachment=False,
                          history=state["history"] + [{"role": "agent", "message": response_text}])
@@ -334,7 +337,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
         elif intent == "question":
             response_text = (
                 "I'm here to help. This summary reflects the medical information you shared. "
-                "You can confirm it's correct, ask to change any detail, or let me know if you have diagnostic reports to add."
+                f"You can also let me know if you have diagnostic reports to add. {SUMMARY_QUESTION}"
             )
             patch["response_text"] = response_text
             patch["history"] = state["history"] + [{"role": "agent", "message": response_text}]

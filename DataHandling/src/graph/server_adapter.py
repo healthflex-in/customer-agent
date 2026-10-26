@@ -146,6 +146,7 @@ def build_graph_state(
         correction_applied=False,
         direct_response_handled=False,
         question_field_ids=[],
+        question_ask_counts=dict(client_state.get("graph_question_ask_counts") or {}),
         # Orchestrator
         orchestrator_question_id=client_state.get("current_question_id"),
         orchestrator_question_text=None,
@@ -198,6 +199,9 @@ def sync_client_state_from_graph(
     )
     client_state["graph_attempts_on_current_section"] = result_state.get(
         "attempts_on_current_section", 0
+    )
+    client_state["graph_question_ask_counts"] = dict(
+        result_state.get("question_ask_counts") or {}
     )
     visit_context = result_state.get("visit_context", "unknown")
     if visit_context and visit_context != "unknown":
@@ -408,6 +412,7 @@ def init_graph_state_in_client(
     client_state["graph_reports_uploaded"] = False
     client_state["graph_awaiting_report_upload"] = False
     client_state["graph_attempts_on_current_section"] = 0
+    client_state["graph_question_ask_counts"] = {}
     client_state["graph_visit_context"] = "unknown"
     # Tagged turns — set by server.py after fetching from MongoDB; preserve if already set
     if "tagged_turns" not in client_state:

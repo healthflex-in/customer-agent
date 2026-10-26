@@ -54,6 +54,7 @@ class InterviewState(TypedDict):
     # ── Pre-computed next question (set by extract, consumed by generate) ──
     pending_question: Optional[str]
     question_field_ids: list[str]
+    question_ask_counts: dict      # "Section.Field" -> times the question was shown
 
     # ── MCP question recommendations (dev only, set on first turn) ──────────
     mcp_questions: Optional[list]
@@ -101,6 +102,7 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         orchestrator_question_text=None,
         pending_question=None,
         question_field_ids=[],
+        question_ask_counts={},
         mcp_questions=None,
         tagged_turns=None,
         tagged_turn_metas=None,
