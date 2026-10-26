@@ -20,6 +20,10 @@ from app.db.serializers import normalize_user_id, serialize_datetime
 from app.forms.attempts import add_attempt_write_scope, resolve_form_attempt_id
 from app.forms.lifecycle import build_lifecycle_update_filter, resolve_form_lifecycle
 from app.forms.progress import calculate_form_progress
+from app.forms.sanitization import (
+    preserve_historical_referral_section,
+    strip_deprecated_referral_section,
+)
 from app.forms.titles import build_form_title
 from app.observability.logging import log as _log
 from app.observability.privacy import error_type, pseudonymous_id
@@ -157,6 +161,9 @@ def save_customer_info(
         form_data_copy, removed_prompt_values = scrub_internal_transcription_prompts(
             copy.deepcopy(form_data)
         )
+        # Never write the retired customer-discovery section, including an
+        # empty shell, even when a stale client, form, or LLM supplies it.
+        form_data_copy = strip_deprecated_referral_section(form_data_copy)
         if removed_prompt_values:
             _log.warning(
                 "internal_prompt_content_removed_before_persistence",
@@ -217,6 +224,15 @@ def save_customer_info(
                 existing = mongo.customer_info_collection.find_one(_existing_query)
                 if existing:
                     break
+
+        # Preserve retired discovery data only when this exact document already
+        # has it. Reuse the lookup above: updates require no additional read.
+        if existing:
+            form_data_copy = preserve_historical_referral_section(
+                form_data_copy,
+                existing.get("form_data"),
+            )
+            customer_doc["form_data"] = form_data_copy
 
         lifecycle = resolve_form_lifecycle(
             form_data_copy,

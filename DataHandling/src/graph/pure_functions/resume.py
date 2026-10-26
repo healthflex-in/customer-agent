@@ -70,7 +70,6 @@ def build_resume_plan(form: dict, persisted_section: str = "Present Complaint") 
         "Pain Assessment": 1,
         "History & Diagnostics": 1,
         "Treatment Goals": 2,
-        "Referral": 2,
     }
     question_round = canonical_round.get(first_section, 2)
     definition = load_form("FRM-01")

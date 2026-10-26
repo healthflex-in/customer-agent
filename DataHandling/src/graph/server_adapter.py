@@ -83,6 +83,11 @@ def build_graph_state(
         form = _copy.deepcopy(_prom_template)
     else:
         form = _graph_form or fresh["form"]
+    # A pre-fix in-memory session may still contain the retired section. Make
+    # an outer copy before removing it so no caller-owned/Mongo-derived value is
+    # mutated, and so it cannot reappear in interview state or summaries.
+    form = dict(form) if isinstance(form, dict) else dict(fresh["form"])
+    form.pop("Referral", None)
     question_round = client_state.get("graph_question_round")
     if question_round is None:
         question_round = fresh["question_round"]
@@ -130,7 +135,6 @@ def build_graph_state(
         reports_uploaded=_reports_uploaded,
         awaiting_report_upload=client_state.get("graph_awaiting_report_upload", False),
         attempts_on_current_section=client_state.get("graph_attempts_on_current_section", 0),
-        referral_asked=client_state.get("graph_referral_asked", False),
         visit_context=client_state.get("graph_visit_context", "unknown"),
         # History
         history=history,
@@ -142,6 +146,7 @@ def build_graph_state(
         correction_applied=False,
         direct_response_handled=False,
         question_field_ids=[],
+        question_ask_counts=dict(client_state.get("graph_question_ask_counts") or {}),
         # Orchestrator
         orchestrator_question_id=client_state.get("current_question_id"),
         orchestrator_question_text=None,
@@ -195,7 +200,9 @@ def sync_client_state_from_graph(
     client_state["graph_attempts_on_current_section"] = result_state.get(
         "attempts_on_current_section", 0
     )
-    client_state["graph_referral_asked"] = result_state.get("referral_asked", False)
+    client_state["graph_question_ask_counts"] = dict(
+        result_state.get("question_ask_counts") or {}
+    )
     visit_context = result_state.get("visit_context", "unknown")
     if visit_context and visit_context != "unknown":
         client_state["graph_visit_context"] = visit_context
@@ -405,7 +412,7 @@ def init_graph_state_in_client(
     client_state["graph_reports_uploaded"] = False
     client_state["graph_awaiting_report_upload"] = False
     client_state["graph_attempts_on_current_section"] = 0
-    client_state["graph_referral_asked"] = False
+    client_state["graph_question_ask_counts"] = {}
     client_state["graph_visit_context"] = "unknown"
     # Tagged turns — set by server.py after fetching from MongoDB; preserve if already set
     if "tagged_turns" not in client_state:

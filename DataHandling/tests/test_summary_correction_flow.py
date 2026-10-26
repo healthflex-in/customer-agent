@@ -142,7 +142,7 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
         )
 
     def test_generated_summary_cannot_omit_added_pain(self):
-        from src.graph.pure_functions.summary import generate_interview_summary
+        from src.graph.pure_functions.summary import SUMMARY_QUESTION, generate_interview_summary
         text = "I have pain in my hand as well"
         form = {
             "Present Complaint": {"Primary Complaint": "Head pain"},
@@ -153,12 +153,12 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
         )
         self.assertIn("hand pain", response.lower())
         self.assertNotIn("i have pain in my hand as well", response.lower())
-        self.assertEqual(response.count("Is this information correct"), 1)
+        self.assertEqual(response.count(SUMMARY_QUESTION), 1)
 
     def test_additional_pain_is_saved_acknowledged_and_requires_followup(self):
         from src.graph.state import get_fresh_interview_state
         from src.graph.nodes.summary import make_classify_summary_intent_node
-        from src.graph.nodes.generate import required_response_before_summary
+        from src.graph.nodes.generate import next_intake_step
         from src.graph.server_adapter import sync_client_state_from_graph, build_graph_state
         for text in (
             "I want to can you add some info for me like I have pain in my hand as well. I forgot to tell you can you please add that.",
@@ -193,8 +193,7 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
                 sync_client_state_from_graph(client, updated)
                 restored = build_graph_state(client, "ok done", lambda **_: None)
                 self.assertIn("Additional Complaint 1", restored["form_sections"])
-                gate = required_response_before_summary(restored, restored["history"])
-                self.assertIsNotNone(gate)
+                gate = next_intake_step(restored, restored["history"])
                 self.assertEqual(gate["phase"], "interviewing")
                 self.assertIn("Duration of the Issue", gate["missing_fields"])
 
@@ -230,7 +229,7 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
         state["correction_data"] = detect_form_correction(state["user_input"], state["form"], True, lambda _: "unused")
         update = make_apply_correction_node(lambda _: "unused")(state)
         self.assertTrue(update["correction_applied"])
-        self.assertIn("update anything else", update["response_text"])
+        self.assertIn("anything else you'd like to change", update["response_text"])
         self.assertNotIn("Key points", update["response_text"])
         self.assertEqual(self.edges.after_apply_correction({**state, **update}), "__end__")
         corrected = {**state, **update, "summary_intent": {"intent": "confirm"}, "user_input": "ok done"}
@@ -359,7 +358,7 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
             "arm",
             updated["Treatment Goals"]["Specific Expectations from Treatment"].lower(),
         )
-        self.assertIn("update anything else", message)
+        self.assertIn("anything else you'd like to change", message)
 
     def test_pain_location_replacement_routes_as_correction_without_llm(self):
         def unexpected_llm_call(_prompt):
@@ -464,69 +463,47 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
                 replay = make_handle_summary_response_node(unexpected)(state)
                 self.assertEqual(replay["response_text"], initial)
 
-    def test_exact_alcohol_correction_updates_combined_lifestyle_field(self):
-        from src.graph.nodes.summary import make_classify_summary_intent_node
-
-        state = {
-            "phase": "summary",
-            "current_section": "History & Diagnostics",
-            "user_input": "thanks but I do drink pls update",
-            "form": {
-                "History & Diagnostics": {
-                    "Current Lifestyle": (
-                        "Work: I work in a company; Alcohol: Does not drink alcohol"
-                    )
-                }
-            },
-            "history": [{"role": "agent", "message": "Is this correct?"}],
-        }
-
-        def correction_llm(_prompt):
-            return json.dumps({
-                "is_correction": True,
-                "confidence": "high",
-                "updates": [{
-                    "operation": "update",
-                    "section_name": "Current Lifestyle",
-                    "field_name": "Alcohol",
-                    "new_value": "does drink",
-                }],
-                "needs_clarification": False,
-                "clarification_question": "",
-            })
-
-        state.update(make_classify_summary_intent_node(correction_llm)(state))
-        self.assertEqual(state["summary_intent"]["intent"], "request_change")
-        state.update(make_handle_summary_response_node(correction_llm)(state))
-        state.update(make_detect_correction_node(correction_llm)(state))
-        result = make_apply_correction_node(correction_llm)(state)
-
-        lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
-        self.assertIn("Alcohol: does drink", lifestyle)
-        self.assertNotIn("Does not drink alcohol", lifestyle)
-        self.assertIn("Work: I work in a company", lifestyle)
-        self.assertTrue(result["correction_applied"])
-
-    def test_lifestyle_alias_from_correction_model_maps_to_real_schema_field(self):
+    def test_retired_lifestyle_correction_is_not_applied(self):
         form = {
             "History & Diagnostics": {
-                "Current Lifestyle": "Work: Company; Alcohol: Does not drink alcohol"
+                "Current Lifestyle": (
+                    "Work: I work in a company; Historical detail: unchanged"
+                )
             }
         }
         correction = {
             "section_name": "Current Lifestyle",
             "field_name": "Alcohol",
-            "new_value": "Drinks alcohol",
-            "source_text": "thanks but I do drink pls update",
+            "new_value": "changed",
+            "source_text": "please update the historical detail",
+            "needs_clarification": False,
+        }
+
+        updated, success, _ = apply_form_correction(correction, form, lambda _: "")
+
+        self.assertFalse(success)
+        self.assertEqual(updated, form)
+
+    def test_work_correction_preserves_unrelated_lifestyle_text(self):
+        form = {
+            "History & Diagnostics": {
+                "Current Lifestyle": "Work: Company; Historical detail: unchanged"
+            }
+        }
+        correction = {
+            "section_name": "Current Lifestyle",
+            "field_name": "Work",
+            "new_value": "Teacher",
+            "source_text": "please update my work to teacher",
             "needs_clarification": False,
         }
 
         updated, success, _ = apply_form_correction(correction, form, lambda _: "")
 
         self.assertTrue(success)
-        self.assertIn(
-            "Alcohol: Drinks alcohol",
+        self.assertEqual(
             updated["History & Diagnostics"]["Current Lifestyle"],
+            "Historical detail: unchanged; Work: Teacher",
         )
 
     def test_additional_complaint_instruction_stores_only_symptom(self):

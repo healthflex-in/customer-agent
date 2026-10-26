@@ -2,7 +2,7 @@ import unittest
 
 from src.graph.state import get_fresh_interview_state
 from src.graph.nodes.summary import make_handle_summary_response_node
-from src.graph.pure_functions.summary import classify_summary_response, generate_interview_summary, reports_with_verified_upload
+from src.graph.pure_functions.summary import SUMMARY_QUESTION, classify_summary_response, generate_interview_summary, reports_with_verified_upload
 
 
 class AdditionalReportTests(unittest.TestCase):
@@ -44,7 +44,7 @@ class AdditionalReportTests(unittest.TestCase):
         form = {"History & Diagnostics": {"Reports": "X-ray uploaded and attached"}}
         result = generate_interview_summary(form, [], lambda _: "Back pain. Is this information correct, or would you like to make any changes?")
         self.assertIn("X-ray uploaded and attached", result)
-        self.assertEqual(result.count("Is this information correct"), 1)
+        self.assertEqual(result.count(SUMMARY_QUESTION), 1)
 
     def test_no_reports_response_is_not_empty(self):
         state = get_fresh_interview_state("u", "FRM-01", "s")

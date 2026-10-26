@@ -38,15 +38,15 @@ def update_loop_counters(
     *,
     missing_ids: list[str],
     question_ids: list[str],
-) -> tuple[int, int, bool]:
-    """Update per-socket loop counters and signal bounded state recovery."""
+) -> tuple[int, int]:
+    """Update per-socket repeat counters reported in turn telemetry."""
 
     missing_signature = tuple(sorted(missing_ids))
     question_signature = tuple(question_ids)
 
     if not question_signature:
         client_state["same_question_count"] = 0
-        return int(client_state.get("same_missing_field_count", 0)), 0, False
+        return int(client_state.get("same_missing_field_count", 0)), 0
 
     same_missing = (
         int(client_state.get("same_missing_field_count", 0)) + 1
@@ -63,7 +63,7 @@ def update_loop_counters(
     client_state["last_question_field_ids"] = question_signature
     client_state["same_missing_field_count"] = same_missing
     client_state["same_question_count"] = same_question
-    return same_missing, same_question, same_missing >= 3 or same_question >= 3
+    return same_missing, same_question
 
 
 def current_complaint_index(section: str) -> int:

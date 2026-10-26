@@ -34,7 +34,6 @@ class InterviewState(TypedDict):
     reports_uploaded: bool
     awaiting_report_upload: bool
     attempts_on_current_section: int
-    referral_asked: bool           # True once the referral/Source question has been asked
     visit_context: str             # "specific_complaint" | "general_assessment" | "unknown"
 
     # ── Conversation history ────────────────────────────────────
@@ -55,6 +54,7 @@ class InterviewState(TypedDict):
     # ── Pre-computed next question (set by extract, consumed by generate) ──
     pending_question: Optional[str]
     question_field_ids: list[str]
+    question_ask_counts: dict      # "Section.Field" -> times the question was shown
 
     # ── MCP question recommendations (dev only, set on first turn) ──────────
     mcp_questions: Optional[list]
@@ -90,7 +90,6 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         reports_uploaded=False,
         awaiting_report_upload=False,
         attempts_on_current_section=0,
-        referral_asked=False,
         visit_context="unknown",
         history=[{"role": "agent", "message": INITIAL_INTAKE_PROMPT}],
         missing_fields=[],
@@ -103,6 +102,7 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         orchestrator_question_text=None,
         pending_question=None,
         question_field_ids=[],
+        question_ask_counts={},
         mcp_questions=None,
         tagged_turns=None,
         tagged_turn_metas=None,

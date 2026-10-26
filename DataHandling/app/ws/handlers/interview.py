@@ -533,10 +533,12 @@ async def handle_start_interview(
             # Derive the correct question_round from section completion so the
             # graph asks questions at the right depth (not restarting from round 0).
             client_state["graph_question_round"] = _resume_idx
-            client_state["graph_referral_asked"] = not any(
-                section == "Referral" and field == "Source"
-                for section, field in _required_missing
-            )
+
+            # The persisted document may predate removal of customer discovery
+            # data. Keep the resumed graph form free of that retired section.
+            form_data = dict(form_data) if isinstance(form_data, dict) else {}
+            form_data.pop("Referral", None)
+            client_state["graph_form"] = form_data
 
             # Derive the ordered form_sections list
             client_state["graph_form_sections"] = list(form_data.keys())
@@ -912,11 +914,15 @@ async def handle_load_form(
         health_agent.history = []
         health_agent.history.append({"role": "agent", "message": health_agent.welcome_prompt})
 
-    # Load form data from database and DEEP COPY it to prevent shared references
+    # Load a deep-copied active interview form. Historical discovery data stays
+    # on the fetched persistence document and must not re-enter question flow.
     import copy
     form_data = form.get("form_data", {})
-    form_data_copy = copy.deepcopy(form_data)  # CRITICAL: Deep copy to prevent sharing
+    form_data_copy = copy.deepcopy(form_data)
+    form_data_copy.pop("Referral", None)
     current_section = form.get("current_section", "")
+    if current_section == "Referral":
+        current_section = ""
 
     # Update health agent with the deep copied form data
     health_agent.form = form_data_copy
@@ -935,13 +941,12 @@ async def handle_load_form(
     # Determine the correct idx AND set current_section to first incomplete section
     # idx=0: Present Complaint and Pain Assessment
     # idx=1: Previous Consultations and History & Diagnostics
-    # idx=2: Treatment Goals and Referral
+    # idx=2: Treatment Goals
     present_complaint_complete = health_agent.validator("Present Complaint")
     pain_assessment_complete = health_agent.validator("Pain Assessment")
     prev_consultations_complete = health_agent.validator("Previous Consultations")
     history_diag_complete = health_agent.validator("History & Diagnostics")
     treatment_goals_complete = health_agent.validator("Treatment Goals")
-    referral_complete = health_agent.validator("Referral")
 
     # Helper to set current_section to the first incomplete section in order
     def set_first_incomplete_section():
@@ -955,18 +960,16 @@ async def handle_load_form(
             return "History & Diagnostics"
         if not treatment_goals_complete:
             return "Treatment Goals"
-        if not referral_complete:
-            return "Referral"
         return health_agent.current_section  # all complete, keep as-is
 
     # Determine idx based on completion status
     if present_complaint_complete and pain_assessment_complete:
         if prev_consultations_complete and history_diag_complete:
-            if treatment_goals_complete and referral_complete:
+            if treatment_goals_complete:
                 # All sections complete - interview is done
                 health_agent.idx = 3  # Beyond last predefined question
             else:
-                # On idx=2 (Treatment Goals and Referral)
+                # On idx=2 (Treatment Goals)
                 health_agent.idx = 2
         else:
             # On idx=1 (Previous Consultations and History & Diagnostics)
@@ -992,9 +995,9 @@ async def handle_load_form(
 
     # Generate the next question or summary that should be shown
     next_message = None
-    is_complete = (present_complaint_complete and pain_assessment_complete and 
-                  prev_consultations_complete and history_diag_complete and 
-                  treatment_goals_complete and referral_complete)
+    is_complete = (present_complaint_complete and pain_assessment_complete and
+                  prev_consultations_complete and history_diag_complete and
+                  treatment_goals_complete)
 
     if has_form_data:
         if is_complete:

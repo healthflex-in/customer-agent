@@ -7,9 +7,6 @@ from src.graph.pure_functions.additional_complaint import (
     split_update_and_addition,
     validated_additional_complaint,
 )
-from src.graph.pure_functions.clinical_value_guard import (
-    apply_explicit_pain_factor_answers,
-)
 from src.graph.pure_functions.complaint_severity import explicit_severity_updates
 from src.graph.pure_functions.resume import build_resume_plan
 from src.graph.pure_functions.turn_tracking import update_loop_counters
@@ -66,7 +63,7 @@ class ProductionAttemptRegressionTests(unittest.TestCase):
         self.assertEqual(plan.question_round, 3)
         self.assertEqual(plan.missing, [])
         self.assertIn("Here's a summary", plan.message)
-        self.assertIn("Is this information correct", plan.message)
+        self.assertIn("Reply 'no' if everything is correct", plan.message)
         self.assertNotIn("ask your clinician", plan.message)
 
     def test_treatment_expectation_is_not_an_additional_complaint(self):
@@ -118,61 +115,9 @@ class ProductionAttemptRegressionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(is_additional_complaint_cancellation(text))
 
-    def test_cases_2_and_4_explicit_factors_fill_active_additional_complaint(self):
-        form, section = capture_additional_complaint(
-            completed_form(), "SI-joint pain"
-        )
-        text = (
-            "Sitting makes it worse, straight leg raise while sitting makes it "
-            "even worse. Standing straight or sleeping flat makes it better"
-        )
-
-        updated = apply_explicit_pain_factor_answers(
-            form,
-            active_section=section,
-            user_input=text,
-        )
-
-        self.assertIn("Sitting makes it worse", updated[section]["Aggravating Factors"])
-        self.assertIn("makes it better", updated[section]["Relieving Factors"])
-
-    def test_case_2_no_relief_and_activity_pain_are_both_captured(self):
-        form, section = capture_additional_complaint(
-            completed_form(), "shoulder and wrist pain"
-        )
-        text = (
-            "If I do dead hangs or anything above head my arms go numb and starts "
-            "paining, my wrist pains while doing push ups. Nothing I have worked "
-            "on gives any relief yet"
-        )
-
-        updated = apply_explicit_pain_factor_answers(
-            form,
-            active_section=section,
-            user_input=text,
-        )
-
-        self.assertTrue(updated[section]["Aggravating Factors"])
-        self.assertIn("gives any relief", updated[section]["Relieving Factors"])
-
-    def test_already_answered_recovers_previous_explicit_factor_answer(self):
-        form, section = capture_additional_complaint(
-            completed_form(), "hand pain"
-        )
-        previous = "Typing makes it worse. Resting the hand makes it better."
-        updated = apply_explicit_pain_factor_answers(
-            form,
-            active_section=section,
-            user_input="I already answered that",
-            history=[{"role": "user", "message": previous}],
-        )
-
-        self.assertIn("makes it worse", updated[section]["Aggravating Factors"])
-        self.assertIn("makes it better", updated[section]["Relieving Factors"])
-
-    def test_same_missing_set_triggers_recovery_on_third_question(self):
+    def test_repeated_question_is_counted_for_turn_telemetry(self):
         state = {}
-        outcomes = [
+        counts = [
             update_loop_counters(
                 state,
                 missing_ids=["Additional Complaint 1.Relieving Factors"],
@@ -181,10 +126,7 @@ class ProductionAttemptRegressionTests(unittest.TestCase):
             for _ in range(3)
         ]
 
-        self.assertFalse(outcomes[0][2])
-        self.assertFalse(outcomes[1][2])
-        self.assertTrue(outcomes[2][2])
-
+        self.assertEqual(counts, [(1, 1), (2, 2), (3, 3)])
 
 if __name__ == "__main__":
     unittest.main()

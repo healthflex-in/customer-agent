@@ -1,19 +1,15 @@
 """
-Reasoning-based form extractor.
+PROM (FRM-02+) form extractor.
 
-Uses gemini model to reason through the full conversation and fill the
-medical intake form with genuine understanding — not keyword matching or
-multi-pass heuristics.
-
-Called once per turn with the full conversation history, replacing the
-FORMAT_PROMPT + gap_fill + sweep_fill + comprehensive_fill stack.
+Reads the full conversation and fills the outcome-measure form. FRM-01 intake
+answers are mapped by ``answer_mapping`` instead.
 """
 import copy
 import json
 from typing import Callable, Optional
 
 from app.observability.privacy import error_type
-from src.prompts import REASONING_EXTRACTOR_PROMPT, PROM_EXTRACTOR_PROMPT
+from src.prompts import PROM_EXTRACTOR_PROMPT
 
 
 _NON_CLINICAL_AGENT_PREFIXES = (
@@ -63,10 +59,9 @@ def reasoning_extract(
     history: list,
     form: dict,
     reasoning_llm: Callable[[str], str],
-    is_prom: bool = False,
 ) -> Optional[dict]:
     """
-    Use the reasoning LLM to read the full conversation and fill the form.
+    Use the reasoning LLM to read the full conversation and fill the PROM form.
 
     Returns an updated form dict, or None if extraction failed (caller should
     fall back to the existing extraction pipeline).
@@ -76,20 +71,11 @@ def reasoning_extract(
         current_form = copy.deepcopy(form)
         form_structure = json.dumps(current_form, indent=2)
 
-        template = PROM_EXTRACTOR_PROMPT if is_prom else REASONING_EXTRACTOR_PROMPT
-        prompt = template.format(
+        prompt = PROM_EXTRACTOR_PROMPT.format(
             conversation=conversation,
             current_form=form_structure,
             form_structure=form_structure,
         )
-        if any(section.startswith("Additional Complaint ") for section in current_form):
-            prompt += (
-                "\nAdditional Complaint sections describe separate symptoms. Retain their exact Primary Complaint text. "
-                "Fill their details ONLY from patient statements about that particular additional symptom. "
-                "Never copy duration, severity, cause, or triggers from the original complaint. "
-                "Leave unprovided details empty."
-            )
-
         import time as _time
         _t0 = _time.perf_counter()
         raw = reasoning_llm(prompt).strip()
@@ -112,8 +98,6 @@ def reasoning_extract(
             if section in result and isinstance(fields, dict):
                 for field, value in fields.items():
                     if field in result[section]:
-                        if section.startswith("Additional Complaint ") and field == "Primary Complaint":
-                            continue
                         # Accept any non-null value including explicit "None" strings
                         if value is not None:
                             result[section][field] = str(value).strip() if value != "" else ""

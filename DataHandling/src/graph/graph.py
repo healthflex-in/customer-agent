@@ -38,6 +38,7 @@ from src.graph.nodes.upload import make_handle_upload_response_node
 # Edge routing functions
 from src.graph.edges import (
     route_by_phase,
+    after_first_turn,
     after_extract,
     after_validate_section,
     after_advance_section,
@@ -67,8 +68,8 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
     graph = StateGraph(InterviewState)
 
     # ── Register nodes ────────────────────────────────────────────────────────
-    graph.add_node("handle_first_turn", make_handle_first_turn_node(llm_complete, INITIAL_INTAKE_PROMPT, reasoning_llm=reasoning_llm))
-    # Combined node: extraction + gap-fill + intent classification (concurrent)
+    graph.add_node("handle_first_turn", make_handle_first_turn_node(INITIAL_INTAKE_PROMPT))
+    # Maps each reply onto every form field it answers
     graph.add_node("extract_form_data", make_extract_form_data_node(llm_complete, reasoning_llm=reasoning_llm))
     graph.add_node("validate_section", make_validate_section_node())
     graph.add_node("advance_section", make_advance_section_node())
@@ -93,8 +94,6 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
     )
 
     # ── Linear edges ──────────────────────────────────────────────────────────
-    graph.add_edge("handle_first_turn", END)
-
     graph.add_edge("detect_correction", "apply_correction")
 
     graph.add_edge("generate_question", END)
@@ -103,6 +102,15 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
     graph.add_edge("classify_summary_intent", "handle_summary_response")
 
     # ── Conditional edges ─────────────────────────────────────────────────────
+    graph.add_conditional_edges(
+        "handle_first_turn",
+        after_first_turn,
+        {
+            END: END,
+            "extract_form_data": "extract_form_data",
+        },
+    )
+
     graph.add_conditional_edges(
         "extract_form_data",
         after_extract,
