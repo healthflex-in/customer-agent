@@ -142,6 +142,43 @@ class AnswerMappingTests(unittest.TestCase):
         )
         self.assertEqual(result.form["Present Complaint"]["Onset (Gradual or Sudden)"], "Gradual")
 
+    def test_fixed_value_drops_a_detail_that_only_repeats_the_choice(self):
+        onset = "Present Complaint.Onset (Gradual or Sudden)"
+        repeated = mapped(empty_form(), [answer(onset, "Sudden", detail="suddenly")])
+        explained = mapped(empty_form(), [answer(
+            onset, "Gradual",
+            detail="It came on gradually after I increased my running mileage",
+        )])
+
+        self.assertEqual(repeated.form["Present Complaint"]["Onset (Gradual or Sudden)"], "Sudden")
+        self.assertEqual(explained.form["Present Complaint"]["Onset (Gradual or Sudden)"], "Gradual")
+
+    def test_complaint_name_does_not_fill_diagnosis_or_location(self):
+        result = mapped(empty_form(), [
+            answer("Present Complaint.Primary Complaint", "Right plantar fasciopathy"),
+            answer(CONSULTED, "Right plantar fasciopathy"),
+            answer("Pain Assessment.Primary Location of Pain", "Right plantar fascia"),
+        ])
+        advised = mapped(result.form, [
+            answer(CONSULTED, "A physiotherapist advised rest and calf stretches"),
+            answer("Pain Assessment.Primary Location of Pain", "Right heel"),
+        ])
+
+        self.assertEqual(
+            result.form["Previous Consultations"][
+                "Previous Diagnosis or Advice and Prescribed Treatment Taken"
+            ],
+            "",
+        )
+        self.assertEqual(result.form["Pain Assessment"]["Primary Location of Pain"], "")
+        self.assertEqual(
+            advised.form["Previous Consultations"][
+                "Previous Diagnosis or Advice and Prescribed Treatment Taken"
+            ],
+            "A physiotherapist advised rest and calf stretches",
+        )
+        self.assertEqual(advised.form["Pain Assessment"]["Primary Location of Pain"], "Right heel")
+
     def test_unsure_and_denied_keep_the_model_statement(self):
         result = mapped(empty_form(), [
             answer("Present Complaint.Mechanism of Injury or Cause", "Does not remember", status="unsure"),

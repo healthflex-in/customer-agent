@@ -41,14 +41,64 @@ LIFESTYLE_COMPONENT_QUESTIONS = {
     )
 }
 
+# Asked once, after the patient declines the original question. Never the same wording.
+REFRAME_QUESTIONS = {
+    "Primary Complaint": "In a few words, what is the one problem you most want help with?",
+    "Duration of the Issue": "Roughly how long has this been going on — days, weeks, or months?",
+    "Onset (Gradual or Sudden)": "Did it come on suddenly or gradually?",
+    "Mechanism of Injury or Cause": "What set it off, or how did it start?",
+    "Previous Diagnosis or Advice and Prescribed Treatment Taken": (
+        "Have you seen anyone about this before? Yes or no."
+    ),
+    "Current Status of Issue (Improved, Same, Worse)": (
+        "Since that visit, is it better, the same, or worse?"
+    ),
+    "Primary Location of Pain": "Where do you feel it most? A general area is enough.",
+    "Severity (1-10)": (
+        "Would you describe it as mild, moderate, or severe? "
+        "If numbers are easier, 0 means no pain and 10 means the worst pain imaginable."
+    ),
+    "Aggravating Factors": "What tends to make it worse?",
+    "Relieving Factors": "What eases it, even for a short time?",
+    "Systemic Illness and Surgical History": (
+        "Are there any conditions or recent surgeries that could affect exercising?"
+    ),
+    "Current Lifestyle — Work": "Do you mostly sit, stand, or move around for work? A short answer is fine.",
+    "Current Lifestyle — Activity or Exercise": (
+        "Are you active most days, sometimes, or rarely? A short answer is fine."
+    ),
+    "Reports": "Do you have any scans or reports for this? ",
+    "Short-Term Goals (within 3 months)": "In the next few months, what would feel like progress?",
+    "Long-Term Goals (after 3 months)": "Looking further ahead, what would you like to get back to after 3 months?",
+    "Specific Expectations from Treatment": "What are you hoping we help with? ",
+}
+
+REFRAME_LEAD = "Of course — share only what you're comfortable with."
+CLINICIAN_LATER = (
+    "That's completely okay. You can cover what you skipped with your clinician later."
+)
+NOTED_COMPLAINT = "I've noted {labels}. We'll come to that after this."
+
 
 def question_for_missing_fields(
-    missing: list[tuple[str, str]], field_labels: dict[str, str], *, max_fields: int = 4
+    missing: list[tuple[str, str]],
+    field_labels: dict[str, str],
+    *,
+    max_fields: int = 4,
+    reframe_fields: set[str] | None = None,
 ) -> str:
-    """Return an explicit question for each missing field in one small batch."""
+    """Return an explicit question for each missing field in one small batch.
 
+    ``reframe_fields`` uses the shorter second wording, after the patient
+    declined the original question.
+    """
+
+    softer = reframe_fields or set()
     prompts = []
     for _, field in missing[:max_fields]:
+        if field in softer and field in REFRAME_QUESTIONS:
+            prompts.append(REFRAME_QUESTIONS[field])
+            continue
         prompts.append(
             REQUIRED_FIELD_QUESTIONS.get(
                 field,

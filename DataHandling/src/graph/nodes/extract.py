@@ -237,8 +237,16 @@ import copy
 from src.graph.pure_functions.additional_complaint import add_complaint_section
 from src.graph.pure_functions.answer_mapping import (
     COMPLAINT_SECTIONS,
+    apply_declines,
     choose_focus,
+    choose_skipped,
+    field_still_open,
     map_reply,
+)
+from src.graph.pure_functions.question_plan import (
+    LIFESTYLE_COMPONENT_QUESTIONS,
+    NOTED_COMPLAINT,
+    REQUIRED_FIELD_QUESTIONS,
 )
 from src.graph.pure_functions.form_extraction import extract_form_data_from_text
 from src.graph.pure_functions.clarification import (
@@ -303,6 +311,77 @@ def _ask_focus(state: InterviewState, form: dict, history: list, complaints: lis
         "reports_intent": {},
         "pending_question": None,
         "direct_response_handled": True,
+    }
+
+
+def _last_agent(history: list) -> dict:
+    for entry in reversed(history):
+        if entry.get("role") == "agent":
+            return entry
+    return {}
+
+
+def _question_text(field_id: str) -> str:
+    name = field_id.split(".", 1)[1]
+    return (
+        REQUIRED_FIELD_QUESTIONS.get(name)
+        or LIFESTYLE_COMPONENT_QUESTIONS.get(name)
+        or name
+    )
+
+
+def _fresh_complaints(form: dict, reported: list[str]) -> list[str]:
+    """Complaint labels that are not already the main complaint or an added one."""
+
+    known = set()
+    primary = _primary_complaint(form).casefold()
+    if primary:
+        known.add(primary)
+    for name, fields in form.items():
+        if name.startswith("Additional Complaint ") and isinstance(fields, dict):
+            label = str(fields.get("Primary Complaint") or "").strip().casefold()
+            if label:
+                known.add(label)
+    fresh: list[str] = []
+    for label in reported:
+        if label.casefold() in known or label.casefold() in {item.casefold() for item in fresh}:
+            continue
+        fresh.append(label)
+    return fresh
+
+
+def _keep_open(form: dict, field_ids: list[str]) -> list[str]:
+    return [field_id for field_id in field_ids if field_still_open(form, field_id)]
+
+
+def _ask_which_skip(
+    form: dict,
+    history: list,
+    field_ids: list[str],
+    form_sections: list[str],
+    noted: list[str],
+) -> dict:
+    lines = [_question_text(field_id) for field_id in field_ids]
+    question = (
+        "That's completely okay, we can skip that. Which of these would you like to skip?\n"
+        + "\n".join(f"- {line}" for line in lines)
+    )
+    if noted:
+        question = f"{NOTED_COMPLAINT.format(labels=', '.join(noted))}\n\n{question}"
+    return {
+        "form": form,
+        "form_sections": form_sections,
+        "history": history + [{
+            "role": "agent",
+            "message": question,
+            "skip_question_ids": field_ids,
+        }],
+        "response_text": question,
+        "phase": "interviewing",
+        "reports_intent": {},
+        "pending_question": None,
+        "direct_response_handled": True,
+        "noted_complaints": [],
     }
 
 
@@ -497,6 +576,10 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         reports_intent: dict = {}
         visit_context = current_visit_context
         focused_sections = None
+        noted: list[str] = []
+        reframe_ids = list(state.get("skip_reframe_ids") or [])
+        reframed_ids = list(state.get("skip_reframed_ids") or [])
+        decline_notice = False
         if state.get("tagged_turns"):
             updated_form = _extract_prom_answers(
                 user_input=user_input,
@@ -535,6 +618,9 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                         reply=offered_reply, last_question="", form=form,
                         form_sections=form_sections, visit_context="specific_complaint", llm=mapper,
                     ).form
+            complaint_snapshot = {
+                section: copy.deepcopy(form.get(section)) for section in COMPLAINT_SECTIONS
+            }
             mapping = map_reply(
                 reply=user_input,
                 last_question=last_agent_q,
@@ -543,6 +629,23 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 visit_context="specific_complaint" if offered else current_visit_context,
                 llm=mapper,
             )
+            noted = (
+                []
+                if offered or not _primary_complaint(form)
+                else _fresh_complaints(form, mapping.complaints)
+            )
+            if noted:
+                mapped_form = mapping.form
+                for section, fields in complaint_snapshot.items():
+                    if isinstance(fields, dict):
+                        mapped_form[section] = fields
+                for label in noted:
+                    mapped_form, _ = add_complaint_section(mapped_form, label)
+                mapping.form = mapped_form
+                form_sections = list(form_sections) + [
+                    name for name in mapped_form if name not in form_sections
+                ]
+                focused_sections = form_sections
             if not offered and not _primary_complaint(form) and len(mapping.complaints) > 1:
                 # Keep the general facts, but hold the complaint details until
                 # the patient says which complaint they belong to first.
@@ -559,6 +662,34 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             reports_intent = mapping.reports_intent
             visit_context = mapping.visit_context
             detail = f"{len(mapping.updated_field_ids)} fields"
+            last = _last_agent(history)
+            pending_skip = list(last.get("skip_question_ids") or [])
+            asked_ids = list(last.get("question_field_ids") or [])
+            decline_ids = list(mapping.declined_field_ids)
+            if pending_skip:
+                chosen = choose_skipped(
+                    user_input, [_question_text(field_id) for field_id in pending_skip], mapper
+                )
+                decline_ids = (
+                    pending_skip if chosen is None
+                    else [pending_skip[index] for index in chosen if index < len(pending_skip)]
+                )
+            elif mapping.decline_unspecified and len(asked_ids) == 1:
+                decline_ids = asked_ids
+            elif mapping.decline_unspecified and len(asked_ids) > 1:
+                return _ask_which_skip(
+                    updated_form,
+                    history + [{"role": "user", "message": user_input}],
+                    asked_ids,
+                    form_sections,
+                    noted,
+                )
+            updated_form, reframe_ids, reframed_ids, closed = apply_declines(
+                updated_form, decline_ids, reframe_ids, reframed_ids
+            )
+            reframe_ids = _keep_open(updated_form, reframe_ids)
+            reframed_ids = _keep_open(updated_form, reframed_ids)
+            decline_notice = bool(closed)
         updated_form.pop("Referral", None)
         writer({"stage": "Extracting medical details", "detail": detail, "status": "done"})
 
@@ -582,6 +713,10 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             "history": new_history,
             "reports_intent": reports_intent,
             "pending_question": None,
+            "skip_reframe_ids": reframe_ids,
+            "skip_reframed_ids": reframed_ids,
+            "noted_complaints": noted,
+            "decline_notice": decline_notice,
         }
 
         if mixed_boundary_response:
@@ -595,6 +730,10 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     **result_extra,
                     "form": updated_form,
                     "form_sections": list(updated_form),
+                    "skip_reframe_ids": reframe_ids,
+                    "skip_reframed_ids": reframed_ids,
+                    "noted_complaints": noted,
+                    "decline_notice": decline_notice,
                 },
                 new_history,
             )

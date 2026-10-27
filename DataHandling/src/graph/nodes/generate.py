@@ -4,7 +4,12 @@ from src.graph.state import InterviewState
 from src.graph.pure_functions.additional_complaint import normalize_additional_complaints
 from src.graph.pure_functions.answer_mapping import record_not_provided
 from src.graph.pure_functions.form_validation import get_all_missing_fields
-from src.graph.pure_functions.question_plan import question_for_missing_fields
+from src.graph.pure_functions.question_plan import (
+    CLINICIAN_LATER,
+    NOTED_COMPLAINT,
+    REFRAME_LEAD,
+    question_for_missing_fields,
+)
 from src.graph.pure_functions.summary import _fallback_summary
 from src.forms.loader import load_form as _load_form
 
@@ -49,6 +54,8 @@ def next_intake_step(state: InterviewState, history: list) -> dict:
 
     form = state["form"]
     ask_counts = dict(state.get("question_ask_counts") or {})
+    reframe_ids = list(state.get("skip_reframe_ids") or [])
+    reframed_ids = list(state.get("skip_reframed_ids") or [])
     missing = []
     if not state.get("tagged_form_template"):
         missing = _get_relevant_missing(
@@ -57,6 +64,7 @@ def next_intake_step(state: InterviewState, history: list) -> dict:
     exhausted = [
         f"{section}.{field}" for section, field in missing
         if ask_counts.get(f"{section}.{field}", 0) >= MAX_TIMES_ASKED
+        and f"{section}.{field}" not in reframe_ids
     ]
     if exhausted:
         print(f"[generate] Saved {len(exhausted)} unanswered fields as Not provided")
@@ -75,26 +83,52 @@ def next_intake_step(state: InterviewState, history: list) -> dict:
         question_ids = [f"{section}.{field}" for section, field in batch]
         for question_id in question_ids:
             ask_counts[question_id] = ask_counts.get(question_id, 0) + 1
+        shown_reframe = [field_id for field_id in question_ids if field_id in reframe_ids]
+        reframe_ids = [field_id for field_id in reframe_ids if field_id not in shown_reframe]
+        reframed_ids = list(dict.fromkeys([*reframed_ids, *shown_reframe]))
         response = question_for_missing_fields(
-            batch, _FIELD_LABELS, max_fields=QUESTIONS_PER_TURN
+            batch,
+            _FIELD_LABELS,
+            max_fields=QUESTIONS_PER_TURN,
+            reframe_fields={field_id.split(".", 1)[1] for field_id in shown_reframe},
         )
         additional = _complaint_section(batch[0][0])
         if additional:
             label = str(form[additional].get("Primary Complaint") or "").strip()
             response = f"Now about your other concern, {label}.\n\n{response}"
+        if shown_reframe:
+            response = f"{REFRAME_LEAD}\n\n{response}"
+        if state.get("decline_notice"):
+            response = f"{CLINICIAN_LATER}\n\n{response}"
+        noted = [label for label in (state.get("noted_complaints") or []) if str(label).strip()]
+        if noted:
+            response = f"{NOTED_COMPLAINT.format(labels=', '.join(noted))}\n\n{response}"
         return {
             "form": form,
             "response_text": response,
-            "history": history + [{"role": "agent", "message": response}],
+            "history": history + [{
+                "role": "agent",
+                "message": response,
+                "question_field_ids": question_ids,
+            }],
             "phase": "interviewing",
             "current_section": batch[0][0],
             "missing_fields": [field for _, field in missing],
             "question_field_ids": question_ids,
             "question_ask_counts": ask_counts,
+            "skip_reframe_ids": reframe_ids,
+            "skip_reframed_ids": reframed_ids,
+            "noted_complaints": [],
+            "decline_notice": False,
         }
 
     summary_form = normalize_additional_complaints(form)
     summary = _fallback_summary(summary_form)
+    if state.get("decline_notice"):
+        summary = f"{CLINICIAN_LATER}\n\n{summary}"
+    noted = [label for label in (state.get("noted_complaints") or []) if str(label).strip()]
+    if noted:
+        summary = f"{NOTED_COMPLAINT.format(labels=', '.join(noted))}\n\n{summary}"
     return {
         "form": summary_form,
         "response_text": summary,
@@ -104,6 +138,10 @@ def next_intake_step(state: InterviewState, history: list) -> dict:
         "missing_fields": [],
         "question_field_ids": [],
         "question_ask_counts": {},
+        "skip_reframe_ids": reframe_ids,#before sage repharses the questions
+        "skip_reframed_ids": reframed_ids,
+        "noted_complaints": [],
+        "decline_notice": False,
     }
 
 

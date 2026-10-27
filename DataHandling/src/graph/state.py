@@ -55,6 +55,10 @@ class InterviewState(TypedDict):
     pending_question: Optional[str]
     question_field_ids: list[str]
     question_ask_counts: dict      # "Section.Field" -> times the question was shown
+    skip_reframe_ids: list[str]    # declined once; the next ask uses the shorter wording
+    skip_reframed_ids: list[str]   # shorter wording already shown; a second decline closes the field
+    noted_complaints: list[str]    # new problems mentioned this turn; cleared after the reply
+    decline_notice: bool           # this turn closed at least one field as Declined
 
     # ── MCP question recommendations (dev only, set on first turn) ──────────
     mcp_questions: Optional[list]
@@ -103,6 +107,10 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         pending_question=None,
         question_field_ids=[],
         question_ask_counts={},
+        skip_reframe_ids=[],
+        skip_reframed_ids=[],
+        noted_complaints=[],
+        decline_notice=False,
         mcp_questions=None,
         tagged_turns=None,
         tagged_turn_metas=None,

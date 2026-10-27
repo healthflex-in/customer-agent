@@ -18,6 +18,8 @@ except ModuleNotFoundError as exc:
     from src.graph.nodes.extract import make_extract_node
 
 from src.graph.nodes.generate import MAX_TIMES_ASKED, next_intake_step
+from src.graph.pure_functions.answer_mapping import DECLINED
+from src.graph.pure_functions.question_plan import CLINICIAN_LATER, NOTED_COMPLAINT, REFRAME_QUESTIONS
 
 
 FIRST_REPLY = (
@@ -160,6 +162,124 @@ class ComplaintFocusTests(unittest.TestCase):
         self.assertEqual(
             result["form"]["Additional Complaint 1"]["Primary Complaint"], "Left plantar fasciopathy"
         )
+
+
+def filled_except(field_id):
+    state = get_fresh_interview_state("u", "FRM-01", "s")
+    for fields in state["form"].values():
+        for name in fields:
+            fields[name] = "Provided"
+    state["form"]["History & Diagnostics"]["Current Lifestyle"] = (
+        "Work: Accountant; Activity/exercise: Walking"
+    )
+    section, name = field_id.split(".", 1)
+    state["form"][section][name] = ""
+    state["visit_context"] = "specific_complaint"
+    state["phase"] = "interviewing"
+    return state
+
+
+class SkipQuestionTests(unittest.TestCase):
+    def test_first_skip_asks_a_shorter_question_instead_of_the_same_one(self):
+        field_id = "Pain Assessment.Severity (1-10)"
+        state = filled_except(field_id)
+        state["user_input"] = "skip this"
+        state["history"] = [{
+            "role": "agent",
+            "message": "On a scale of 0 to 10, how severe is it right now?",
+            "question_field_ids": [field_id],
+        }]
+        result = run(state, FakeModel(mappings={"skip this": mapping(answers=[{
+            "field_id": field_id, "status": "declined", "value": "", "detail": "", "correction": False,
+        }])}))
+
+        self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], "")
+        self.assertEqual(result["skip_reframe_ids"], [field_id])
+        step = next_intake_step({**state, **result}, result["history"])
+        self.assertIn(REFRAME_QUESTIONS["Severity (1-10)"], step["response_text"])
+        self.assertNotIn("how severe is it right now", step["response_text"])
+
+    def test_second_skip_is_saved_as_declined_and_the_interview_moves_on(self):
+        field_id = "Pain Assessment.Severity (1-10)"
+        state = filled_except(field_id)
+        state["skip_reframed_ids"] = [field_id]
+        state["user_input"] = "skip"
+        state["history"] = [{
+            "role": "agent",
+            "message": REFRAME_QUESTIONS["Severity (1-10)"],
+            "question_field_ids": [field_id],
+        }]
+        result = run(state, FakeModel(mappings={"skip": mapping(answers=[{
+            "field_id": field_id, "status": "declined", "value": "", "detail": "", "correction": False,
+        }])}))
+
+        self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], DECLINED)
+        self.assertTrue(result["decline_notice"])
+        step = next_intake_step({**state, **result}, result["history"])
+        self.assertEqual(step["phase"], "summary")
+        self.assertIn(CLINICIAN_LATER, step["response_text"])
+        self.assertNotIn(REFRAME_QUESTIONS["Severity (1-10)"], step["response_text"])
+
+    def test_vague_skip_of_several_questions_asks_which_one(self):
+        asked = [
+            "Pain Assessment.Severity (1-10)",
+            "Pain Assessment.Aggravating Factors",
+            "Pain Assessment.Relieving Factors",
+            "History & Diagnostics.Reports",
+        ]
+        state = filled_except(asked[0])
+        state["user_input"] = "skip"
+        state["history"] = [{"role": "agent", "message": "Could you also tell me:", "question_field_ids": asked}]
+        result = run(state, FakeModel(mappings={"skip": {
+            **mapping(),
+            "decline_scope": "unspecified",
+        }}))
+
+        self.assertTrue(result["direct_response_handled"])
+        self.assertIn("Which of these would you like to skip?", result["response_text"])
+        self.assertEqual(result["history"][-1]["skip_question_ids"], asked)
+
+
+class LaterComplaintTests(unittest.TestCase):
+    def test_a_new_problem_mid_interview_is_kept_without_changing_the_main_one(self):
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="interviewing",
+            visit_context="specific_complaint",
+            user_input="My knee hurts as well, about 8 out of 10",
+            history=[{"role": "agent", "message": "How severe is the back pain?"}],
+        )
+        state["form"]["Present Complaint"]["Primary Complaint"] = "Lumbar facet joint pain"
+        result = run(state, FakeModel(mappings={state["user_input"]: mapping(
+            answers=[answer("Pain Assessment.Severity (1-10)", "8")],
+            complaints=["Knee pain"],
+        )}))
+
+        self.assertEqual(result["form"]["Present Complaint"]["Primary Complaint"], "Lumbar facet joint pain")
+        self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], "")
+        self.assertEqual(result["form"]["Additional Complaint 1"]["Primary Complaint"], "Knee pain")
+        self.assertEqual(result["noted_complaints"], ["Knee pain"])
+        step = next_intake_step({**state, **result}, result["history"])
+        self.assertIn(NOTED_COMPLAINT.format(labels="Knee pain"), step["response_text"])
+        self.assertNotIn("Now about your other concern", step["response_text"])
+
+    def test_pain_spreading_from_one_problem_does_not_add_a_complaint(self):
+        state = get_fresh_interview_state("u", "FRM-01", "s")
+        state.update(
+            phase="interviewing",
+            visit_context="specific_complaint",
+            user_input="The pain goes down my right leg and it is 6 out of 10",
+            history=[{"role": "agent", "message": "How severe is it?"}],
+        )
+        state["form"]["Present Complaint"]["Primary Complaint"] = "Lumbar radiculopathy"
+        result = run(state, FakeModel(mappings={state["user_input"]: mapping(
+            answers=[answer("Pain Assessment.Severity (1-10)", "6")],
+            complaints=["Lumbar radiculopathy"],
+        )}))
+
+        self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], "6/10")
+        self.assertNotIn("Additional Complaint 1", result["form"])
+        self.assertEqual(result["noted_complaints"], [])
 
 
 class AdditionalComplaintQuestionTests(unittest.TestCase):

@@ -29,12 +29,19 @@ from src.graph.pure_functions.question_plan import (
 
 NOT_PROVIDED = "Not provided"
 NOT_APPLICABLE = "Not applicable"
+DECLINED = "Declined"
 VISIT_CONTEXTS = ("specific_complaint", "general_assessment", "unknown")
 
 _FORM = load_form("FRM-01")
 _LIFESTYLE_FIELD = "Current Lifestyle"
-_STATUSES = {"answered", "denied", "unsure"}
+_STATUSES = {"answered", "denied", "unsure", "declined"}
 _COMPONENT_OF = {name: component for component, name in LIFESTYLE_COMPONENT_FIELDS.items()}
+# These are not answered by naming today's problem. A value made only of those
+# words is left empty so Sage still asks the question.
+_NOT_FROM_COMPLAINT = {
+    "Previous Diagnosis or Advice and Prescribed Treatment Taken",
+    "Primary Location of Pain",
+}
 # Sections a general visit skips are the ones that describe a single complaint.
 COMPLAINT_SECTIONS = _FORM.visit_types["general_assessment"].skip_sections
 
@@ -62,10 +69,15 @@ Field rules:
 How to map:
 - Read the reply by meaning, the way an experienced clinician would. Patients answer in any order, in one sentence or several, with typos and voice-to-text errors.
 - Map every fact in the reply to the field it answers, including fields Sage has not asked about yet.
+- Naming today's problem fills Primary Complaint only. Do not copy that problem, or a shortened form of its name, into any other field.
+- Previous Diagnosis or Advice and Prescribed Treatment Taken is filled only when the patient says they were seen, diagnosed, or treated before. The value is that visit, diagnosis, or advice. The name of today's problem is not a previous diagnosis, and it must not be saved there.
+- Primary Location of Pain is filled only when the patient says where they feel it. Leave it empty when they have only named the problem, so Sage asks where it is.
 - "answered": the patient gave the information. value is a short, clear restatement of what the patient said. Never add facts, guesses, or commentary.
-- For a field with fixed values, value is exactly one of those values, chosen by what the field means, and detail is a short restatement of what the patient said about it (empty when they said nothing more). Other fields leave detail empty.
+- For a field with fixed values, value is exactly one of those values, chosen by what the field means. Onset is exactly Gradual or Sudden, and its detail is always empty. For any other fixed field, detail is empty when the patient only named that value. Put a detail only when they gave an explanation the value does not already say. Other fields leave detail empty.
 - "denied": the patient said there is none. value is a short negative statement in the patient's terms.
 - "unsure": the patient does not know or does not remember. value is a short statement saying so.
+- "declined": the patient refuses to answer a question Sage just asked ("skip", "I don't want to answer", "I'd rather not say"). This is not "unsure" and not "denied". Name only the questions they refuse. If they refuse the whole batch, decline each question Sage just asked. If they only say skip and Sage asked more than one question, without saying which, set decline_scope to "unspecified" and do not decline individual fields. Otherwise decline_scope is "specified".
+- A newly mentioned separate problem is listed under complaints. Do not put its facts into the fields of a different problem.
 - A short reply such as "no", "none" or "nothing" answers each field Sage just asked about that it sensibly answers.
 - "correction": true only for an already answered field, and only when the patient clearly changes that earlier answer; otherwise false.
 - A question the patient asks Sage is not an answer. Leave out fields the reply does not address.
@@ -74,7 +86,7 @@ How to map:
 - visit_context: "specific_complaint" when the patient has a pain, injury or condition, "general_assessment" for a check-up or wellness visit without a complaint, otherwise "unknown".
 
 Return only JSON in this shape:
-{{"visit_context": "unknown", "answers": [{{"field_id": "F1", "status": "answered", "value": "...", "detail": "", "correction": false}}], "reports": {{"has_reports": null, "wants_upload": null}}, "complaints": []}}"""
+{{"visit_context": "unknown", "answers": [{{"field_id": "F1", "status": "answered", "value": "...", "detail": "", "correction": false}}], "reports": {{"has_reports": null, "wants_upload": null}}, "complaints": [], "decline_scope": "specified"}}"""
 
 _FOCUS_PROMPT = """A patient in a physiotherapy intake interview reported these separate problems:
 {options}
@@ -83,6 +95,14 @@ Sage asked which one they would like to focus on today. The patient replied:
 {reply}
 
 Return only JSON: {{"choice": <number of the chosen problem, or null when the reply does not clearly choose one>}}"""
+
+_SKIP_PROMPT = """Sage asked the patient which of these questions they want to skip:
+{options}
+
+The patient replied:
+{reply}
+
+Return only JSON: {{"choice": "all"}} when they skip every question, {{"choice": [1, 2]}} for the questions they name, or {{"choice": null}} when the reply does not say."""
 
 
 @dataclass(frozen=True)
@@ -100,6 +120,8 @@ class ReplyMapping:
     updated_field_ids: list[str] = field(default_factory=list)
     reports_intent: dict = field(default_factory=dict)
     complaints: list[str] = field(default_factory=list)
+    declined_field_ids: list[str] = field(default_factory=list)
+    decline_unspecified: bool = False
 
 
 def _slots(form: dict, form_sections: list[str]) -> list[_Slot]:
@@ -184,15 +206,50 @@ def _settle_dependents(form: dict, section: str, field_name: str, answered: bool
             fields[dependent] = ""
 
 
-def record_not_provided(form: dict, field_ids: list[str]) -> dict:
-    """Return a copy of ``form`` with each field id saved as Not provided."""
+def record_not_provided(form: dict, field_ids: list[str], marker: str = NOT_PROVIDED) -> dict:
+    """Return a copy of ``form`` with each field id saved as ``marker``."""
 
     updated = copy.deepcopy(form)
     for field_id in field_ids:
         section, name = field_id.split(".", 1)
-        _write(updated, _Slot(field_id, section, name, ""), NOT_PROVIDED)
+        _write(updated, _Slot(field_id, section, name, ""), marker)
         _settle_dependents(updated, section, name, answered=False)
     return updated
+
+
+def field_still_open(form: dict, field_id: str) -> bool:
+    """True when ``field_id`` has no saved answer yet."""
+
+    section, name = field_id.split(".", 1)
+    return not _is_answered(form, _Slot(field_id, section, name, ""))
+
+
+def apply_declines(
+    form: dict,
+    field_ids: list[str],
+    reframe_ids: list[str],
+    reframed_ids: list[str],
+) -> tuple[dict, list[str], list[str], list[str]]:
+    """First refusal queues a shorter question. A refusal of that question closes the field.
+
+    Returns the form, the ids still waiting for a shorter question, the ids whose
+    shorter question has been shown, and the ids closed as Declined on this turn.
+    """
+
+    reframe = list(reframe_ids)
+    reframed = list(reframed_ids)
+    closed: list[str] = []
+    for field_id in dict.fromkeys(field_ids):
+        if not field_still_open(form, field_id):
+            continue
+        if field_id in reframed:
+            form = record_not_provided(form, [field_id], DECLINED)
+            reframed = [item for item in reframed if item != field_id]
+            reframe = [item for item in reframe if item != field_id]
+            closed.append(field_id)
+        elif field_id not in reframe:
+            reframe.append(field_id)
+    return form, reframe, reframed, closed
 
 
 def apply_visit_type(form: dict, previous: str, current: str) -> dict:
@@ -232,6 +289,74 @@ def _next_visit_context(current: str, proposed: str) -> str:
     return current
 
 
+def _words(text: str) -> list[str]:
+    words = [
+        "".join(character for character in word.casefold() if character.isalnum())
+        for word in text.split()
+    ]
+    return [word for word in words if word]
+
+
+def _same_stem(left: str, right: str) -> bool:
+    """True when two words are the same word or a short form of it.
+
+    "fascia" and "fasciopathy" share this. A one-letter word does not match a
+    longer unrelated word.
+    """
+
+    if left == right:
+        return True
+    shared = 0
+    for left_character, right_character in zip(left, right):
+        if left_character != right_character:
+            break
+        shared += 1
+    if shared < 5:
+        return False
+    return len(left) - shared <= 2 or len(right) - shared <= 2
+
+
+def _complaint_text(form: dict, section: str) -> str:
+    source = section if section.startswith("Additional Complaint ") else "Present Complaint"
+    fields = form.get(source) or {}
+    return str(fields.get("Primary Complaint") or "")
+
+
+def _only_restates_complaint(complaint: str, value: str) -> bool:
+    """True when every word in ``value`` is already in the complaint name."""
+
+    complaint_words = _words(complaint)
+    value_words = _words(value)
+    if not complaint_words or not value_words:
+        return False
+    return all(
+        any(_same_stem(word, complaint_word) for complaint_word in complaint_words)
+        for word in value_words
+    )
+
+
+def _explanation(choice: str, detail: str) -> str:
+    """Return detail only when it adds an explanation beyond the chosen value.
+
+    "suddenly" adds nothing to Sudden. A sentence that also says what happened does.
+    """
+
+    text = " ".join(detail.split())
+    choice_word = "".join(character for character in choice.casefold() if character.isalnum())
+    words = [
+        "".join(character for character in word.casefold() if character.isalnum())
+        for word in text.split()
+    ]
+    words = [word for word in words if word]
+    if not text or not choice_word or not words:
+        return ""
+    repeats_choice = all(
+        word == choice_word or word.startswith(choice_word) or choice_word.startswith(word)
+        for word in words
+    )
+    return "" if repeats_choice else text
+
+
 def _accepted_value(status: str, value: str, detail: str, slot: _Slot) -> str | None:
     """Return the value to save, or None when it breaks the field's rule."""
 
@@ -250,7 +375,10 @@ def _accepted_value(status: str, value: str, detail: str, slot: _Slot) -> str | 
         choice = next((v for v in rule.values if v.casefold() == value.casefold()), None)
         if choice is None:
             return None
-        return f"{choice} — {detail}" if detail else choice
+        if slot.field.startswith("Onset"):
+            return choice
+        extra = _explanation(choice, detail)
+        return f"{choice} — {extra}" if extra else choice
     return value
 
 
@@ -334,11 +462,18 @@ def map_reply(
     if len(answers) < len(returned):
         print(f"[answer_mapping] Discarded {len(returned) - len(answers)} answers with an unknown field or status")
     # A dependent field is settled by its parent, which may arrive in the same reply.
-    answers.sort(key=lambda pair: bool(_FORM.rule(pair[0].field).applies_when_answered))
+    answers.sort(key=lambda pair: (
+        bool(_FORM.rule(pair[0].field).applies_when_answered),
+        pair[0].field != "Primary Complaint",
+    ))
 
     updated_ids: list[str] = []
+    declined_ids: list[str] = []
     for slot, item in answers:
         status = item["status"]
+        if status == "declined":
+            declined_ids.append(slot.field_id)
+            continue
         if _is_answered(updated, slot) and item.get("correction") is not True:
             continue
         value = _accepted_value(
@@ -348,6 +483,11 @@ def map_reply(
             slot,
         )
         if value is None:
+            continue
+        if (
+            slot.field in _NOT_FROM_COMPLAINT
+            and _only_restates_complaint(_complaint_text(updated, slot.section), value)
+        ):
             continue
         _write(updated, slot, value)
         _settle_dependents(updated, slot.section, slot.field, status == "answered")
@@ -363,6 +503,8 @@ def map_reply(
             str(item).strip() for item in payload.get("complaints") or []
             if isinstance(item, str) and str(item).strip()
         )),
+        declined_field_ids=list(dict.fromkeys(declined_ids)),
+        decline_unspecified=payload.get("decline_scope") == "unspecified",
     )
 
 
@@ -377,4 +519,27 @@ def choose_focus(reply: str, complaints: list[str], llm: Callable[[str], str]) -
         return None
     if isinstance(choice, int) and not isinstance(choice, bool) and 1 <= choice <= len(complaints):
         return choice - 1
+    return None
+
+
+def choose_skipped(reply: str, questions: list[str], llm: Callable[[str], str]) -> list[int] | None:
+    """Return indexes of the questions the patient chose to skip, or None if unclear.
+
+    Every index means they skipped the whole list.
+    """
+
+    options = "\n".join(f"{number}. {label}" for number, label in enumerate(questions, 1))
+    try:
+        choice = _parse(llm(_SKIP_PROMPT.format(options=options, reply=reply.strip()))).get("choice")
+    except Exception as exc:
+        print(f"[answer_mapping] Skip choice failed: {error_type(exc)}")
+        return None
+    if choice == "all":
+        return list(range(len(questions)))
+    if isinstance(choice, list):
+        indexes = [
+            item - 1 for item in choice
+            if isinstance(item, int) and not isinstance(item, bool) and 1 <= item <= len(questions)
+        ]
+        return indexes or None
     return None

@@ -147,6 +147,10 @@ def build_graph_state(
         direct_response_handled=False,
         question_field_ids=[],
         question_ask_counts=dict(client_state.get("graph_question_ask_counts") or {}),
+        skip_reframe_ids=list(client_state.get("graph_skip_reframe_ids") or []),
+        skip_reframed_ids=list(client_state.get("graph_skip_reframed_ids") or []),
+        noted_complaints=[],
+        decline_notice=False,
         # Orchestrator
         orchestrator_question_id=client_state.get("current_question_id"),
         orchestrator_question_text=None,
@@ -203,6 +207,8 @@ def sync_client_state_from_graph(
     client_state["graph_question_ask_counts"] = dict(
         result_state.get("question_ask_counts") or {}
     )
+    client_state["graph_skip_reframe_ids"] = list(result_state.get("skip_reframe_ids") or [])
+    client_state["graph_skip_reframed_ids"] = list(result_state.get("skip_reframed_ids") or [])
     visit_context = result_state.get("visit_context", "unknown")
     if visit_context and visit_context != "unknown":
         client_state["graph_visit_context"] = visit_context
@@ -413,6 +419,8 @@ def init_graph_state_in_client(
     client_state["graph_awaiting_report_upload"] = False
     client_state["graph_attempts_on_current_section"] = 0
     client_state["graph_question_ask_counts"] = {}
+    client_state["graph_skip_reframe_ids"] = []
+    client_state["graph_skip_reframed_ids"] = []
     client_state["graph_visit_context"] = "unknown"
     # Tagged turns — set by server.py after fetching from MongoDB; preserve if already set
     if "tagged_turns" not in client_state:
