@@ -197,8 +197,15 @@ def is_additional_complaint_cancellation(text):
         normalized,
     ):
         return True
+    return is_section_decline(text, allow_removal=True)
+
+
+def is_section_decline(text, allow_removal=False):
+    """A short "skip this" / "no need" / "that's all" aimed at the questions being asked."""
+    normalized = " ".join(str(text).lower().replace("\u2019", "'").split())
     return bool(
-        re.fullmatch(
+        (allow_removal or not re.search(r"\b(?:mistake|remove|delete|additional|compl\w*|compa\w*|enough|bye)\b", normalized))
+        and re.fullmatch(
             r"(?:let'?s\s+)?skip (?:this|it)|"
             r"no need(?:\s+of|\s+for)?(?:\s+(?:this|that|the))?"
             r"(?:\s+additional)?(?:\s+(?:compl\w*|compa\w*|concern|pain))?"
@@ -209,6 +216,116 @@ def is_additional_complaint_cancellation(text):
             normalized.strip(" .,!"),
         )
     )
+
+
+# Words that name a complaint's kind, not where it is. "Back pain" and "lower
+# back pain" differ only by a qualifier, so they are the same complaint.
+_COMPLAINT_FILLER = frozenset({
+    "pain", "ache", "aches", "aching", "issue", "issues", "problem", "problems",
+    "injury", "discomfort", "soreness", "sore", "stiffness", "trouble",
+    "complaint", "concern", "a", "an", "the", "my", "in", "of", "on", "at",
+    "and", "with", "i", "have", "got", "is", "are",
+})
+
+
+def _complaint_words(text):
+    return frozenset(
+        word for word in re.findall(r"[a-z]+", str(text or "").lower())
+        if word not in _COMPLAINT_FILLER
+    )
+
+
+def same_complaint(first, second):
+    """True when two complaint labels describe one problem.
+
+    One is the same problem as the other when its distinguishing words are
+    all in the other: "back pain" and "lower back pain" match, "left knee pain"
+    and "right knee pain" do not, and "knee pain" and "back pain" do not.
+    """
+    left, right = _complaint_words(first), _complaint_words(second)
+    if not left or not right:
+        return str(first or "").strip().lower() == str(second or "").strip().lower()
+    return left <= right or right <= left
+
+
+_SAME_ISSUE = re.compile(
+    r"\bnot\b.{0,15}\b(?:different|another|new|separate|other|additional|second)\b"
+    r".{0,12}\b(?:issue|concern|problem|complaint|pain)\b"
+    r"|\b(?:it|that|this)(?:\s+is|'s)\s+the\s+same\b"
+    r"|\bsame\s+(?:issue|concern|problem|complaint)\b"
+)
+
+
+def is_same_complaint_statement(text):
+    """True when the patient says the extra complaint is the one they already gave."""
+    normalized = " ".join(str(text or "").lower().replace("\u2019", "'").split())
+    return bool(_SAME_ISSUE.search(normalized))
+
+
+def same_complaint_section(text, form):
+    """The additional complaint the patient says is really their main complaint, if any.
+
+    Only a complaint that restates the main one is returned, so a genuine second
+    problem is never removed by "it's the same".
+    """
+    if not is_same_complaint_statement(text):
+        return None
+    primary = (form.get("Present Complaint") or {}).get("Primary Complaint", "")
+    matches = [
+        name for name, fields in form.items()
+        if name.startswith("Additional Complaint ") and isinstance(fields, dict)
+        and same_complaint(fields.get("Primary Complaint", ""), primary)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+_SKIP_VERB = re.compile(r"\b(?:skip|leave out|drop|forget|ignore)\b")
+_SECTION_WORDS = re.compile(r"\b(?:section|complaint|issue|concern|problem|questions?)s?\b")
+_SAYS_ADDITIONAL = re.compile(r"\b(?:additional|other|second|extra|another)\b")
+
+
+def skip_section_target(text, form, asked_ids):
+    """The added complaint whose questions the patient wants to skip altogether, or None.
+
+    It is only returned when the target is clear: the patient said "skip all" (or "skip
+    this complaint") while an added complaint's questions are being asked, said "skip the
+    other complaint" when there is exactly one, or named the complaint ("skip the knee").
+    A bare "skip" is never this; it asks which question is meant.
+    """
+
+    from src.graph.pure_functions.intent_detection import is_skip_all
+
+    normalized = " ".join(str(text or "").lower().replace("\u2019", "'").split())
+    asked_section = next((i.split(".", 1)[0] for i in asked_ids if i.startswith("Additional Complaint ")), None)
+    if asked_section and is_section_decline(text) and str((form.get(asked_section) or {}).get("Primary Complaint") or "").strip():
+        return asked_section
+    if not _SKIP_VERB.search(normalized) and not is_skip_all(normalized):
+        return None
+    sections = {
+        name: str(fields.get("Primary Complaint") or "")
+        for name, fields in form.items()
+        if name.startswith("Additional Complaint ") and isinstance(fields, dict)
+        and str(fields.get("Primary Complaint") or "").strip()
+    }
+    if not sections:
+        return None
+
+    spoken = set(re.findall(r"[a-z]+", normalized)) - _COMPLAINT_FILLER
+    main = _complaint_words((form.get("Present Complaint") or {}).get("Primary Complaint"))
+    named = [
+        name for name, label in sections.items()
+        if _complaint_words(label) & spoken and not (_complaint_words(label) & spoken) <= main
+    ]
+    if len(named) == 1:
+        return named[0]
+
+    asked = next((i.split(".", 1)[0] for i in asked_ids if i.startswith("Additional Complaint ")), None)
+    wants_section = bool(_SECTION_WORDS.search(normalized)) or is_skip_all(normalized)
+    if asked in sections and wants_section:
+        return asked
+    if _SAYS_ADDITIONAL.search(normalized) and _SECTION_WORDS.search(normalized) and len(sections) == 1:
+        return next(iter(sections))
+    return None
 
 
 def additional_complaint_removal_target(text, form, active_section=None):

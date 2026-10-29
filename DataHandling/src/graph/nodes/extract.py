@@ -234,22 +234,47 @@ def _extract_prom_answers(
 
 import copy
 
-from src.graph.pure_functions.additional_complaint import add_complaint_section
+from src.graph.pure_functions.additional_complaint import (
+    add_complaint_section,
+    same_complaint,
+    same_complaint_section,
+    skip_section_target,
+)
 from src.graph.pure_functions.answer_mapping import (
     COMPLAINT_SECTIONS,
+    apply_declines,
     choose_focus,
+    SkipDecision,
+    choose_skipped,
+    complaint_labels,
+    decide_skip,
+    field_still_open,
     map_reply,
+    read_open_message,
+)
+from src.graph.pure_functions.intent_detection import bare_yes_no, is_skip_all
+from src.graph.pure_functions.phrasing import pick, your
+from src.graph.pure_functions.question_plan import (
+    question_lines,
+    LIFESTYLE_COMPONENT_QUESTIONS,
+    NOTED_COMPLAINT,
+    REQUIRED_FIELD_QUESTIONS,
+    SKIP_WHICH,
+    SKIP_WHICH_KEEP_REQUIRED,
 )
 from src.graph.pure_functions.form_extraction import extract_form_data_from_text
+from src.graph.pure_functions.intent_detection import end_confirmation_reply, is_end_request
 from src.graph.pure_functions.clarification import (
     boundary_response_with_pending_question,
     build_activity_clearance_response,
     build_intake_clarification,
-    build_out_of_flow_response,
+    OUT_OF_FLOW_RESPONSE,
     has_actionable_intake_fact,
+    out_of_flow_kind,
 )
 from src.graph.pure_functions.reasoning_extractor import reasoning_extract
-from src.prompts import FORMAT_PROMPT
+from src.forms.loader import load_form
+from src.prompts import FORMAT_PROMPT, OPENING_PURPOSE
 
 
 _FOCUS_FIELD_ID = "Present Complaint.Primary Complaint"
@@ -285,6 +310,7 @@ def _ask_focus(state: InterviewState, form: dict, history: list, complaints: lis
     question = (
         "You mentioned more than one concern:\n"
         + "\n".join(f"- {complaint}" for complaint in complaints)
+        + "\n\nFor this assessment we'll focus on one issue, but you can still share details about the others."
         + "\n\nWhich one would you like to focus on first? We'll go through the others after that."
     )
     counts = dict(state.get("question_ask_counts") or {})
@@ -303,6 +329,170 @@ def _ask_focus(state: InterviewState, form: dict, history: list, complaints: lis
         "reports_intent": {},
         "pending_question": None,
         "direct_response_handled": True,
+    }
+
+
+_NOT_A_VALUE = {"", "Not provided", "Declined", "Not applicable", "Skipped by patient"}
+
+
+def _revised_answers(before: dict, after: dict, updated_ids: list[str]) -> list[dict]:
+    """The answers this turn changed from a value the patient had already given."""
+
+    changed = []
+    for field_id in dict.fromkeys(updated_ids):
+        section, field = field_id.split(".", 1)
+        old = str((before.get(section) or {}).get(field) or "").strip()
+        new = str((after.get(section) or {}).get(field) or "").strip()
+        if old not in _NOT_A_VALUE and new and old != new:
+            changed.append({"field": field, "value": new})
+    return changed
+
+
+def _open_message_reply(
+    form: dict, history: list, user_input: str, question: str, llm: Callable[[str], str]
+) -> tuple[str, dict | None]:
+    """Read a message the keyword check took for an unrelated question.
+
+    Returns ("answer", None) when it is an ordinary answer that merely starts like
+    a question ("may be a few days"), so the intake carries on; ("form_question",
+    reply) when the patient asks what the pending question is about, with a reply
+    that says which problem and repeats the question; otherwise ("other", None),
+    which keeps the boundary reply. A form-question reply does not count as an ask,
+    and the pending question ids are kept for the next reply.
+    """
+
+    # The question being asked: the last batch of intake questions, or, at the very
+    # start, the opening question (which has no question ids yet).
+    pending = next(
+        (entry for entry in reversed(history)
+         if entry.get("role") == "agent" and (entry.get("question_field_ids") or entry.get("question_text"))),
+        None,
+    )
+    labels = complaint_labels(form)
+    reading = read_open_message(user_input, question, list(dict.fromkeys(labels.values())), llm)
+    if reading != "form_question" or pending is None:
+        return ("answer" if reading == "answer" else "other"), None
+    ids = list(pending.get("question_field_ids") or [])
+    pending_question = str(pending.get("question_text") or pending.get("message") or "").strip()
+    main = str((form.get("Present Complaint") or {}).get("Primary Complaint") or "").strip()
+    complaint = (labels.get(ids[0].split(".", 1)[0]) if ids else "") or main
+    # With a complaint known, say which one the questions are about. At the start there is
+    # none yet, so say what the form is for.
+    note = (
+        pick("form_question", len(history)).format(complaint=your(complaint))
+        if complaint else OPENING_PURPOSE
+    )
+    reply = f"{note}\n\n{pending_question}"
+    return "form_question", {
+        "history": history + [
+            {"role": "user", "message": user_input, "clinical_extraction": False},
+            {
+                "role": "agent", "message": reply, "clinical_extraction": False,
+                "question_text": pending_question, **({"question_field_ids": ids} if ids else {}),
+            },
+        ],
+        "response_text": reply,
+        "reports_intent": {},
+        "pending_question": None,
+        "direct_response_handled": True,
+    }
+
+
+def _yes_no_clarification(form, history, user_input, yes_no, asked_ids, form_sections) -> dict:
+    """Ask which question a bare "no" or "yes" is for. Repeats the open questions to choose from."""
+
+    missing = [tuple(f.split(".", 1)) for f in asked_ids]
+    lines = "\n".join(
+        f"- {line}" for line in question_lines(missing, load_form("FRM-01").field_labels)
+    )
+    question = f"Which question is that {yes_no.lower()} for? Here are the ones I just asked:\n{lines}"
+    return {
+        "form": form,
+        "form_sections": form_sections,
+        "history": history + [
+            {"role": "user", "message": user_input},
+            {"role": "agent", "message": question, "yes_no_clarify": True, "question_field_ids": asked_ids},
+        ],
+        "response_text": question,
+        "phase": "interviewing",
+        "reports_intent": {},
+        "pending_question": None,
+        "direct_response_handled": True,
+        "noted_complaints": [],
+    }
+
+
+def _last_agent(history: list) -> dict:
+    for entry in reversed(history):
+        if entry.get("role") == "agent":
+            return entry
+    return {}
+
+
+def _question_text(field_id: str) -> str:
+    name = field_id.split(".", 1)[1]
+    return (
+        REQUIRED_FIELD_QUESTIONS.get(name)
+        or LIFESTYLE_COMPONENT_QUESTIONS.get(name)
+        or name
+    )
+
+
+def _fresh_complaints(form: dict, reported: list[str]) -> list[str]:
+    """Complaint labels that are a new problem, not a restatement of one already known.
+
+    A reported label is known when it restates the main complaint, an added
+    complaint, or the body area the patient gave as the location, so "lower
+    back pain" is not new when the main complaint is "back pain".
+    """
+
+    known = []
+    primary = _primary_complaint(form)
+    if primary:
+        known.append(primary)
+    for name, fields in form.items():
+        if name.startswith("Additional Complaint ") and isinstance(fields, dict):
+            label = str(fields.get("Primary Complaint") or "").strip()
+            if label:
+                known.append(label)
+    location = str((form.get("Pain Assessment") or {}).get("Primary Location of Pain") or "").strip()
+    if location:
+        known.append(location)
+    fresh: list[str] = []
+    for label in reported:
+        if any(same_complaint(label, other) for other in [*known, *fresh]):
+            continue
+        fresh.append(label)
+    return fresh
+
+
+def _ask_which_skip(
+    form: dict,
+    history: list,
+    field_ids: list[str],
+    form_sections: list[str],
+    noted: list[str],
+    keep_required_note: bool,
+) -> dict:
+    lines = [_question_text(field_id) for field_id in field_ids]
+    lead = SKIP_WHICH_KEEP_REQUIRED if keep_required_note else SKIP_WHICH
+    question = lead + "\n" + "\n".join(f"- {line}" for line in lines)
+    if noted:
+        question = f"{NOTED_COMPLAINT.format(labels=', '.join(noted))}\n\n{question}"
+    return {
+        "form": form,
+        "form_sections": form_sections,
+        "history": history + [{
+            "role": "agent",
+            "message": question,
+            "skip_question_ids": field_ids,
+        }],
+        "response_text": question,
+        "phase": "interviewing",
+        "reports_intent": {},
+        "pending_question": None,
+        "direct_response_handled": True,
+        "noted_complaints": [],
     }
 
 
@@ -338,20 +528,42 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         current_section: str = state.get("current_section", "")
         awaiting_upload: bool = state.get("awaiting_report_upload", False)
 
+        # The patient is answering "are you sure you want to end?". A clear yes or
+        # no is settled here without mapping the reply onto any field; anything
+        # else is read as an ordinary answer below.
+        if _last_agent(history).get("end_confirm") and not state.get("tagged_turns"):
+            confirmation = end_confirmation_reply(user_input)
+            if confirmation:
+                return {
+                    "history": history + [{"role": "user", "message": user_input}],
+                    "reports_intent": {},
+                    "pending_question": None,
+                    "end_requested": confirmation == "yes",
+                    "end_reply": "confirmed" if confirmation == "yes" else "declined",
+                }
+
         # An accidentally-created additional complaint must have a deterministic
         # exit. Without this branch, "skip this" and "there is no additional
         # complaint" are treated as missing clinical answers and the same batch
         # is repeated forever.
-        if current_section.startswith("Additional Complaint "):
+        # A patient who says an added complaint is really their main one gets it
+        # removed whichever section is being asked, not only that section.
+        same_issue_target = same_complaint_section(user_input, form)
+        if current_section.startswith("Additional Complaint ") or same_issue_target:
             from src.graph.pure_functions.additional_complaint import (
                 additional_complaint_removal_target,
                 additional_complaint_replacement,
                 is_additional_complaint_cancellation,
             )
-            removal_target = additional_complaint_removal_target(
+            removal_target = same_issue_target or additional_complaint_removal_target(
                 user_input, form, current_section
             )
-            if removal_target or is_additional_complaint_cancellation(user_input):
+            # "skip this" / "that's all" on an added complaint skips its questions and
+            # keeps its name for the clinician; only an explicit removal deletes it.
+            keeps_name = not same_issue_target and skip_section_target(
+                user_input, form, [f"{current_section}.-"]
+            )
+            if not keeps_name and (removal_target or is_additional_complaint_cancellation(user_input)):
                 import copy as _copy
                 updated_form = _copy.deepcopy(form)
                 section_to_remove = removal_target or current_section
@@ -370,12 +582,12 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     },
                     base_history,
                 )
-                lead_in = (
-                    "I've removed that additional complaint. Let's continue with "
-                    "the remaining intake.\n\n"
-                    if step["phase"] == "interviewing"
-                    else "I've removed that additional complaint. Here is the updated information:\n\n"
-                )
+                if same_issue_target:
+                    lead_in = "Understood, that's the same issue, so I've taken out the extra complaint.\n\n"
+                elif step["phase"] == "interviewing":
+                    lead_in = "I've removed that additional complaint. Let's continue with the remaining intake.\n\n"
+                else:
+                    lead_in = "I've removed that additional complaint. Here is the updated information:\n\n"
                 response = lead_in + step["response_text"]
                 return {
                     **step,
@@ -404,21 +616,32 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
 
         last_agent_for_boundary = next(
             (
-                entry.get("message", "")
+                entry.get("question_text") or entry.get("message", "")
                 for entry in reversed(history)
                 if entry.get("role") == "agent"
             ),
             "",
         )
-        out_of_flow_response = build_out_of_flow_response(
-            user_input, last_agent_for_boundary
-        )
+        boundary_kind = out_of_flow_kind(user_input, last_agent_for_boundary)
+        out_of_flow_response = OUT_OF_FLOW_RESPONSE if boundary_kind else None
         mixed_boundary_response = None
         if out_of_flow_response:
-            if has_actionable_intake_fact(user_input):
+            # An open message may be an ordinary answer that merely starts like a
+            # question ("may be a few days"). The model reads it first; only an
+            # "answer" reading changes anything, and every other case behaves as before.
+            reading, form_question_reply = "other", None
+            if boundary_kind == "open":
+                reading, form_question_reply = _open_message_reply(
+                    form, history, user_input, last_agent_for_boundary, reasoning_llm or llm_complete
+                )
+            if reading == "answer":
+                out_of_flow_response = None  # carry on and map it as an answer
+            elif has_actionable_intake_fact(user_input):
                 # Preserve explicit patient facts in a mixed message, but keep
                 # the medical-advice boundary as the response for this turn.
                 mixed_boundary_response = out_of_flow_response
+            elif form_question_reply:
+                return form_question_reply
             else:
                 out_of_flow_response = boundary_response_with_pending_question(
                     out_of_flow_response, last_agent_for_boundary
@@ -497,6 +720,15 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         reports_intent: dict = {}
         visit_context = current_visit_context
         focused_sections = None
+        noted: list[str] = []
+        decline_notice = False
+        mandatory_notice = False
+        skipped_section = None
+        revised_answers: list[dict] = []
+        saved_answers: list[str] = []
+        saved_field_ids: list[str] = []
+        patient_tone = "neutral"
+        end_requested = False
         if state.get("tagged_turns"):
             updated_form = _extract_prom_answers(
                 user_input=user_input,
@@ -535,6 +767,15 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                         reply=offered_reply, last_question="", form=form,
                         form_sections=form_sections, visit_context="specific_complaint", llm=mapper,
                     ).form
+            last = _last_agent(history)
+            asked_ids = list(last.get("question_field_ids") or [])
+            complaint_snapshot = {
+                section: copy.deepcopy(form.get(section)) for section in COMPLAINT_SECTIONS
+            }
+            patient_text = " ".join(
+                [entry.get("message", "") for entry in history if entry.get("role") == "user"]
+                + [user_input]
+            )
             mapping = map_reply(
                 reply=user_input,
                 last_question=last_agent_q,
@@ -542,7 +783,26 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 form_sections=form_sections,
                 visit_context="specific_complaint" if offered else current_visit_context,
                 llm=mapper,
+                asked_ids=asked_ids,
+                patient_text=patient_text,
             )
+            noted = (
+                []
+                if offered or not _primary_complaint(form)
+                else _fresh_complaints(mapping.form, mapping.complaints)
+            )
+            if noted:
+                mapped_form = mapping.form
+                for section, fields in complaint_snapshot.items():
+                    if isinstance(fields, dict):
+                        mapped_form[section] = fields
+                for label in noted:
+                    mapped_form, _ = add_complaint_section(mapped_form, label)
+                mapping.form = mapped_form
+                form_sections = list(form_sections) + [
+                    name for name in mapped_form if name not in form_sections
+                ]
+                focused_sections = form_sections
             if not offered and not _primary_complaint(form) and len(mapping.complaints) > 1:
                 # Keep the general facts, but hold the complaint details until
                 # the patient says which complaint they belong to first.
@@ -556,9 +816,99 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     mapping.complaints,
                 )
             updated_form = mapping.form
+            # A bare "no" or "yes" that fits none of several open questions: ask which
+            # one it is for, once per batch. Nothing is saved or counted meanwhile.
+            yes_no = bare_yes_no(user_input)
+            if yes_no and not mapping.updated_field_ids and not _last_agent(history).get("yes_no_clarify"):
+                open_asked = [f for f in _last_agent(history).get("question_field_ids") or [] if field_still_open(updated_form, f)]
+                if len(open_asked) > 1:
+                    return _yes_no_clarification(updated_form, history, user_input, yes_no, open_asked, form_sections)
+            # A saved answer the patient changed this turn is acknowledged, so
+            # they know the earlier answer was updated and not ignored.
+            revised_answers = _revised_answers(form, mapping.form, mapping.updated_field_ids)
+            revised_fields = {item["field"] for item in revised_answers}
+            saved_field_ids = [
+                field_id for field_id in mapping.updated_field_ids
+                if field_id.split(".", 1)[1] not in revised_fields
+            ]
+            saved_answers = [field_id.split(".", 1)[1] for field_id in saved_field_ids]
+            patient_tone = mapping.tone
             reports_intent = mapping.reports_intent
             visit_context = mapping.visit_context
             detail = f"{len(mapping.updated_field_ids)} fields"
+            pending_skip = list(last.get("skip_question_ids") or [])
+            # Asking to end is not a request to skip: it never opens the "which
+            # one?" prompt and never counts as refusing a question.
+            nothing_saved = not mapping.updated_field_ids
+            end_requested = is_end_request(user_input) or (mapping.intent == "end" and nothing_saved)
+            skip_all = is_skip_all(user_input) and not end_requested
+            skipped_section = (
+                None if end_requested
+                else skip_section_target(user_input, updated_form, pending_skip or asked_ids)
+            )
+            if pending_skip and end_requested:
+                decision = SkipDecision([], [], False, False)
+            elif skipped_section:
+                # An entire added complaint is skipped: every open question in it is
+                # closed, and the complaint's name stays on the form for the clinician.
+                section_fields = [
+                    f"{skipped_section}.{name}" for name in updated_form[skipped_section]
+                    if name != "Primary Complaint"
+                ]
+                decision = SkipDecision(
+                    [field_id for field_id in section_fields if field_still_open(updated_form, field_id)],
+                    [], False, False,
+                )
+            elif skip_all:
+                # "Skip all" is the only words that exit every remaining question at once.
+                from src.graph.nodes.generate import MAX_TIMES_ASKED
+                decision = decide_skip(
+                    form=updated_form,
+                    asked_ids=pending_skip or asked_ids,
+                    declined_ids=[],
+                    unspecified=True,
+                    ask_counts=state.get("question_ask_counts") or {},
+                    max_asks=MAX_TIMES_ASKED,
+                    skip_all=True,
+                )
+            elif pending_skip:
+                chosen = choose_skipped(
+                    user_input, [_question_text(field_id) for field_id in pending_skip], mapper
+                )
+                # An unclear reply is not a refusal. Only named questions are declined.
+                decision = SkipDecision(
+                    decline_ids=[] if chosen is None else [
+                        pending_skip[index] for index in chosen if index < len(pending_skip)
+                    ],
+                    ask_which=[],
+                    mandatory_refused=False,
+                    keep_required_note=False,
+                )
+            else:
+                from src.graph.nodes.generate import MAX_TIMES_ASKED
+                decision = decide_skip(
+                    form=updated_form,
+                    asked_ids=asked_ids,
+                    declined_ids=list(mapping.declined_field_ids),
+                    unspecified=(
+                        mapping.decline_unspecified
+                        or (mapping.intent == "skip" and nothing_saved and not mapping.declined_field_ids)
+                    ) and not end_requested,
+                    ask_counts=state.get("question_ask_counts") or {},
+                    max_asks=MAX_TIMES_ASKED,
+                )
+                if decision.ask_which:
+                    return _ask_which_skip(
+                        updated_form,
+                        history + [{"role": "user", "message": user_input}],
+                        decision.ask_which,
+                        form_sections,
+                        noted,
+                        decision.keep_required_note,
+                    )
+            updated_form, closed = apply_declines(updated_form, decision.decline_ids)
+            decline_notice = bool(closed)
+            mandatory_notice = decision.mandatory_refused
         updated_form.pop("Referral", None)
         writer({"stage": "Extracting medical details", "detail": detail, "status": "done"})
 
@@ -582,6 +932,15 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             "history": new_history,
             "reports_intent": reports_intent,
             "pending_question": None,
+            "noted_complaints": noted,
+            "decline_notice": decline_notice,
+            "mandatory_notice": mandatory_notice,
+            "section_skipped": bool(skipped_section),
+            "revised_answers": revised_answers,
+            "saved_answers": saved_answers,
+            "saved_field_ids": saved_field_ids,
+            "patient_tone": patient_tone,
+            "end_requested": end_requested,
         }
 
         if mixed_boundary_response:
@@ -595,6 +954,15 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     **result_extra,
                     "form": updated_form,
                     "form_sections": list(updated_form),
+                    "noted_complaints": noted,
+                    "decline_notice": decline_notice,
+                    "mandatory_notice": mandatory_notice,
+                    "section_skipped": bool(skipped_section),
+                    "revised_answers": revised_answers,
+                    "saved_answers": saved_answers,
+                    "saved_field_ids": saved_field_ids,
+                    "patient_tone": patient_tone,
+                    "end_requested": end_requested,
                 },
                 new_history,
             )

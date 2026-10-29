@@ -31,3 +31,8 @@ def audio_limit_error(
     ):
         return "Audio recording is too long. Please record a shorter response."
     return None
+
+
+def webm_header_offset(raw_bytes: bytes) -> int:
+    """Where the webm header starts in a recording, or -1 if it is not there."""
+    return raw_bytes.find(b"\x1a\x45\xdf\xa3")

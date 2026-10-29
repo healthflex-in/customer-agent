@@ -30,7 +30,9 @@ def pending_intake_question(history: list[dict] | None) -> str:
     for entry in reversed(history or []):
         if entry.get("role") != "agent":
             continue
-        message = str(entry.get("message") or "").strip()
+        # Prefer the question on its own, so a repeat never quotes the notes
+        # (an acknowledgement, a section introduction) said in front of it.
+        message = str(entry.get("question_text") or entry.get("message") or "").strip()
         if message and not message.startswith(OUT_OF_FLOW_RESPONSE):
             return message
     return ""
@@ -150,14 +152,17 @@ def build_activity_clearance_response(user_input: str | None) -> str | None:
     return OUT_OF_FLOW_RESPONSE
 
 
-def build_out_of_flow_response(
+def out_of_flow_kind(
     user_input: str | None,
     last_agent_question: str | None = None,
 ) -> str | None:
-    """Return the global boundary message for questions outside intake collection.
+    """Why a message is outside intake collection, or None when it belongs to the intake.
 
-    Plain clinical answers and requests to clarify the intake question are allowed
-    through. Urgent-risk detection remains the caller's higher-priority concern.
+    "hard": medical advice, medication, activity clearance, the clinic or brand, or an
+    unrelated topic. These always get the boundary reply, with no model involved.
+    "open": any other genuine question, including general education such as "what is a
+    slipped disc?". These get the boundary reply too, unless the model reads the message
+    as an ordinary answer or as a question about the intake question itself.
     """
     text = " ".join(str(user_input or "").split())
     lowered = text.lower()
@@ -178,7 +183,7 @@ def build_out_of_flow_response(
         return None
 
     if _ACTIVITY_CLEARANCE.search(text) or _MEDICATION_ADVICE.search(text):
-        return OUT_OF_FLOW_RESPONSE
+        return "hard"
     if _looks_like_detailed_intake_answer(text):
         return None
 
@@ -196,19 +201,28 @@ def build_out_of_flow_response(
     if not is_question:
         return None
     if any(phrase in lowered for phrase in _MEDICAL_ADVICE_PHRASES):
-        return OUT_OF_FLOW_RESPONSE
+        return "hard"
     if any(term in lowered for term in _BRAND_OR_UNRELATED_TERMS):
-        return OUT_OF_FLOW_RESPONSE
+        return "hard"
 
-    # General requests for medical education or treatment guidance.
-    if any(phrase in lowered for phrase in (
-        "tell me about", "can you tell me", "can u tell me", "explain", "what is",
-        "what are", "what can", "what happens", "how does", "how do i", "info on",
-        "information on", "more about", "difference between",
-    )):
-        return OUT_OF_FLOW_RESPONSE
-    # Remaining genuine questions are outside the data-collection contract.
-    return OUT_OF_FLOW_RESPONSE if is_question else None
+    # What remains is a question that is not clearly advice, medication, or the clinic.
+    # It includes "what is ..." and "explain ...": a real education question such as
+    # "what is a slipped disc?", but also "what is the information you want from me?".
+    # A keyword cannot tell them apart, so the model reads it. If it cannot say the
+    # message is about the form or an answer, the boundary reply is given as before.
+    return "open"
+
+
+def build_out_of_flow_response(
+    user_input: str | None,
+    last_agent_question: str | None = None,
+) -> str | None:
+    """Return the global boundary message for questions outside intake collection.
+
+    Plain clinical answers and requests to clarify the intake question are allowed
+    through. Urgent-risk detection remains the caller's higher-priority concern.
+    """
+    return OUT_OF_FLOW_RESPONSE if out_of_flow_kind(user_input, last_agent_question) else None
 
 
 def build_intake_clarification(

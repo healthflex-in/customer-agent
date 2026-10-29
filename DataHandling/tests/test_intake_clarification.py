@@ -199,7 +199,6 @@ class IntakeClarificationTests(unittest.TestCase):
         for text in (
             "there is no additional complaint",
             "I don't have any additional complaint",
-            "lets skip this",
             "no need enough bye",
             "no need of additional complaint",
             "no need of additional compamnt",

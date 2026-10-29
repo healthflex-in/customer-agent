@@ -5,12 +5,14 @@ then handle the result (confirm, change, reports, etc.).
 from typing import Callable
 
 from src.graph.state import InterviewState
+from src.graph.pure_functions.complaint_severity import describe_severity_updates
 from src.graph.pure_functions.summary import (
     SUMMARY_FOLLOW_UP,
     SUMMARY_QUESTION,
     classify_summary_response,
     _fallback_summary,
     reports_with_verified_upload,
+    with_updated_summary,
 )
 from src.graph.nodes.generate import next_intake_step
 
@@ -137,13 +139,10 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             from src.graph.pure_functions.question_plan import question_for_missing_fields
             import copy
             base_form = copy.deepcopy(state["form"])
-            applied_changes = []
-            for (section, field), value in summary_intent.get("severity_updates", {}).items():
+            severity_updates = summary_intent.get("severity_updates", {})
+            for (section, field), value in severity_updates.items():
                 base_form[section][field] = value
-                label = (base_form.get("Pain Assessment", {}).get("Primary Location of Pain")
-                         or base_form.get("Present Complaint", {}).get("Primary Complaint")
-                         or "existing complaint")
-                applied_changes.append(f"{label} pain to {value}")
+            applied_changes = describe_severity_updates(base_form, severity_updates)
             correction_text = summary_intent.get("correction_text")
             if correction_text and not applied_changes:
                 from src.graph.pure_functions.form_extraction import detect_form_correction, apply_form_correction
@@ -208,6 +207,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                 response_text = (
                     f"I've corrected the additional concern to {replacement}. {SUMMARY_FOLLOW_UP}"
                 )
+                response_text = with_updated_summary(response_text, updated_form)
                 return {
                     "form": updated_form,
                     "correction_applied": True,
@@ -261,6 +261,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                     "The documents you just uploaded are already attached to this assessment. "
                     f"I've updated your report information to reflect the upload. {SUMMARY_FOLLOW_UP}"
                 )
+                response_text = with_updated_summary(response_text, patch["form"])
                 patch["awaiting_report_upload"] = False
                 patch["request_attachment"] = False
                 patch["response_text"] = response_text
@@ -314,7 +315,9 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                     "No relevant diagnostic reports available for this issue"
                 )
             patch["form"] = updated_form
-            response_text = f"I've noted your report information. {SUMMARY_FOLLOW_UP}"
+            response_text = with_updated_summary(
+                f"I've noted your report information. {SUMMARY_FOLLOW_UP}", patch["form"]
+            )
             patch.update(response_text=response_text, awaiting_report_upload=False,
                          request_attachment=False,
                          history=state["history"] + [{"role": "agent", "message": response_text}])

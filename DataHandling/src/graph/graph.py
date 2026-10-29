@@ -10,7 +10,7 @@ Optimised graph (vs original):
 from langgraph.graph import StateGraph, END
 
 from src.graph.state import InterviewState
-from src.prompts import INITIAL_INTAKE_PROMPT
+from src.prompts import INITIAL_INTAKE_PROMPT, OPENING_QUESTION
 
 # Node factories
 from src.graph.nodes.first_turn import make_handle_first_turn_node
@@ -68,7 +68,7 @@ def build_interview_graph(llm_complete, system_prompt, save_customer_info_fn=Non
     graph = StateGraph(InterviewState)
 
     # ── Register nodes ────────────────────────────────────────────────────────
-    graph.add_node("handle_first_turn", make_handle_first_turn_node(INITIAL_INTAKE_PROMPT))
+    graph.add_node("handle_first_turn", make_handle_first_turn_node(INITIAL_INTAKE_PROMPT, OPENING_QUESTION))
     # Maps each reply onto every form field it answers
     graph.add_node("extract_form_data", make_extract_form_data_node(llm_complete, reasoning_llm=reasoning_llm))
     graph.add_node("validate_section", make_validate_section_node())

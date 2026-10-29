@@ -15,7 +15,7 @@ _CONFIRMATIONS = {
 }
 
 
-def make_handle_first_turn_node(welcome_prompt: str):
+def make_handle_first_turn_node(welcome_prompt: str, question_text: str = ""):
     def handle_first_turn_node(state: InterviewState) -> dict:
         user_input = state["user_input"]
 
@@ -27,7 +27,10 @@ def make_handle_first_turn_node(welcome_prompt: str):
                 "response_text": welcome_prompt,
                 "phase": "interviewing",
                 "visit_context": "unknown",
-                "history": list(state["history"]) + [{"role": "agent", "message": welcome_prompt}],
+                "history": list(state["history"]) + [
+                    {"role": "agent", "message": welcome_prompt,
+                     **({"question_text": question_text} if question_text else {})}
+                ],
             }
         return {"phase": "interviewing"}
 

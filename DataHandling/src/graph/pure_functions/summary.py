@@ -14,12 +14,12 @@ from src.graph.pure_functions.form_validation import extract_json_from_response
 # Both questions take the same answers: "no" approves the summary, anything
 # else names what to change.
 SUMMARY_QUESTION = (
-    "Is there anything you'd like to change? Reply 'no' if everything is "
-    "correct, or tell me what to change."
+    "Please review the summary above. If it is accurate, reply looks good. "
+    "If anything needs updating, tell me what to change."
 )
 SUMMARY_FOLLOW_UP = (
-    "Is there anything else you'd like to change? Reply 'no' if everything is "
-    "correct, or tell me what to change."
+    "Please review the updated summary. If it is accurate, reply looks good. "
+    "If anything else needs updating, tell me what to change."
 )
 _APPROVALS = {
     "no", "nope", "nah", "no changes", "no change", "nothing", "nothing to change",
@@ -85,13 +85,16 @@ def generate_interview_summary(
     return _fallback_summary(form)
 
 
-def _fallback_summary(form: dict) -> str:
+def _fallback_summary(
+    form: dict, *, ask_to_confirm: bool = True,
+    heading: str = "Here's a summary of the information you've provided:",
+) -> str:
     from src.graph.pure_functions.additional_complaint import (
         normalize_additional_complaints,
     )
 
     form = normalize_additional_complaints(form)
-    parts = ["Here's a summary of the information you've provided:\n"]
+    parts = [f"{heading}\n"]
     for section, fields in form.items():
         if isinstance(fields, dict):
             non_empty = {k: v for k, v in fields.items() if v and str(v).strip()}
@@ -99,8 +102,22 @@ def _fallback_summary(form: dict) -> str:
                 parts.append(f"\n{section}:")
                 for k, v in non_empty.items():
                     parts.append(f"- {k}: {v}")
-    parts.append(f"\n{SUMMARY_QUESTION}")
+    if ask_to_confirm:
+        parts.append(f"\n{SUMMARY_QUESTION}")
     return "\n".join(parts)
+
+
+def with_updated_summary(message: str, form: dict) -> str:
+    """Show the changed summary before the follow-up question, so the patient sees the result.
+
+    A message that does not end in the follow-up question is returned as it is.
+    """
+
+    if SUMMARY_FOLLOW_UP not in message:
+        return message
+    lead = message.replace(SUMMARY_FOLLOW_UP, "").strip()
+    body = _fallback_summary(form, ask_to_confirm=False, heading="Here's your updated summary:").strip()
+    return f"{lead}\n\n{body}\n\n{SUMMARY_FOLLOW_UP}"
 
 
 def classify_summary_response(

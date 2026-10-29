@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
+from app.config import COMPLETION_PERCENTAGE
 from app.observability.privacy import error_type
 from src.graph.state import InterviewState, get_fresh_interview_state
 
@@ -147,6 +148,17 @@ def build_graph_state(
         direct_response_handled=False,
         question_field_ids=[],
         question_ask_counts=dict(client_state.get("graph_question_ask_counts") or {}),
+        noted_complaints=[],
+        decline_notice=False,
+        mandatory_notice=False,
+        end_requested=False,
+        section_skipped=False,
+        end_reply="",
+        revised_answers=[],
+        saved_answers=[],
+        saved_field_ids=[],
+        patient_tone="neutral",
+        completion_percentage=COMPLETION_PERCENTAGE,
         # Orchestrator
         orchestrator_question_id=client_state.get("current_question_id"),
         orchestrator_question_text=None,
