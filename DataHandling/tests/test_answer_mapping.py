@@ -37,14 +37,14 @@ def answer(field_id, value, status="answered", correction=False, detail=""):
     }
 
 
-def mapped(form, answers, visit_context="specific_complaint", proposed="specific_complaint"):
+def mapped(form, answers, visit_context="specific_complaint", proposed="specific_complaint", reply="patient reply"):
     payload = json.dumps({
         "visit_context": proposed,
         "answers": answers,
         "reports": {"has_reports": None, "wants_upload": None},
     })
     return map_reply(
-        reply="patient reply",
+        reply=reply,
         last_question="Sage question",
         form=form,
         form_sections=list(form),
@@ -55,6 +55,41 @@ def mapped(form, answers, visit_context="specific_complaint", proposed="specific
 
 def empty_form():
     return load_form("FRM-01").empty_form()
+
+
+class OneOffAndPromptRulesTests(unittest.TestCase):
+    def test_a_one_off_injury_is_an_answer_about_what_happens_not_a_denial(self):
+        result = mapped(empty_form(), [
+            answer("Pain Assessment.Aggravating Factors", "Happened only once, not repeated"),
+        ])
+
+        self.assertEqual(
+            result.form["Pain Assessment"]["Aggravating Factors"], "Happened only once, not repeated"
+        )
+        self.assertIn("Pain Assessment.Aggravating Factors", result.updated_field_ids)
+
+    def test_nothing_gives_relief_is_saved_as_the_patients_statement(self):
+        result = mapped(empty_form(), [
+            answer("Pain Assessment.Relieving Factors", "Nothing gives relief"),
+        ])
+
+        self.assertEqual(result.form["Pain Assessment"]["Relieving Factors"], "Nothing gives relief")
+        self.assertIn("Pain Assessment.Relieving Factors", result.updated_field_ids)
+
+    def test_the_prompt_tells_the_model_about_one_off_injuries_and_locations(self):
+        prompts = []
+        form = empty_form()
+        map_reply(
+            reply="hi", last_question="", form=form, form_sections=list(form),
+            visit_context="unknown", llm=lambda prompt: prompts.append(prompt) or "{}",
+        )
+
+        self.assertIn("can honestly have nothing to report", prompts[0])
+        self.assertIn("not a denial", prompts[0])
+        self.assertIn("Nothing gives relief", prompts[0])
+        self.assertIn("Happened only once, not repeated", prompts[0])
+        self.assertIn('"traps pain" gives the location Traps', prompts[0])
+        self.assertIn('"lower back" replaces "back"', prompts[0])
 
 
 class AnswerMappingTests(unittest.TestCase):
@@ -162,7 +197,7 @@ class AnswerMappingTests(unittest.TestCase):
         advised = mapped(result.form, [
             answer(CONSULTED, "A physiotherapist advised rest and calf stretches"),
             answer("Pain Assessment.Primary Location of Pain", "Right heel"),
-        ])
+        ], reply="A physiotherapist advised rest and calf stretches; the pain is in my right heel")
 
         self.assertEqual(
             result.form["Previous Consultations"][
@@ -194,10 +229,11 @@ class AnswerMappingTests(unittest.TestCase):
         form = empty_form()
         form["Pain Assessment"]["Primary Location of Pain"] = "Left knee"
 
-        kept = mapped(form, [answer("Pain Assessment.Primary Location of Pain", "Right knee")])
+        kept = mapped(form, [answer("Pain Assessment.Primary Location of Pain", "Right knee")],
+                      reply="It is my right knee")
         corrected = mapped(form, [
             answer("Pain Assessment.Primary Location of Pain", "Right knee", correction=True),
-        ])
+        ], reply="No, actually it is my right knee")
 
         self.assertEqual(kept.form["Pain Assessment"]["Primary Location of Pain"], "Left knee")
         self.assertEqual(corrected.form["Pain Assessment"]["Primary Location of Pain"], "Right knee")
@@ -271,7 +307,11 @@ class AnswerMappingTests(unittest.TestCase):
             "compared with before the previous treatment",
             prompts[0],
         )
-        self.assertIn("Severity (1-10): a whole number from 0 to 10", prompts[0])
+        self.assertIn(
+            "Severity (1-10): a whole number from 0 to 10. "
+            "When the patient gives a range such as 8-9, use the highest number in it",
+            prompts[0],
+        )
         self.assertIn(
             "only applies when the patient answered "
             "Previous Diagnosis or Advice and Prescribed Treatment Taken",

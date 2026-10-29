@@ -2,6 +2,7 @@
 Node factory functions for correction detection and application.
 """
 from src.graph.state import InterviewState
+from src.graph.pure_functions.complaint_severity import describe_severity_updates
 from src.graph.pure_functions.form_extraction import detect_form_correction, apply_form_correction
 from src.graph.pure_functions.summary import SUMMARY_FOLLOW_UP
 
@@ -128,14 +129,9 @@ def make_apply_correction_node(llm_complete):
         if "severity_updates" in correction_data:
             import copy
             updated_form = copy.deepcopy(form)
-            changes = []
             for (section, field), score in correction_data["severity_updates"].items():
                 updated_form[section][field] = score
-                description = (updated_form[section].get("Primary Complaint")
-                               if section.startswith("Additional Complaint ") else
-                               updated_form.get("Pain Assessment", {}).get("Primary Location of Pain")
-                               or updated_form.get("Present Complaint", {}).get("Primary Complaint"))
-                changes.append(f"{description}: {score}")
+            changes = describe_severity_updates(updated_form, correction_data["severity_updates"])
             lifestyle_value = correction_data.get("lifestyle_value")
             if lifestyle_value is not None:
                 updated_form.setdefault("History & Diagnostics", {})[

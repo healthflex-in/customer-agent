@@ -85,7 +85,7 @@ def generate_interview_summary(
     return _fallback_summary(form)
 
 
-def _fallback_summary(form: dict) -> str:
+def _fallback_summary(form: dict, *, ask_to_confirm: bool = True) -> str:
     from src.graph.pure_functions.additional_complaint import (
         normalize_additional_complaints,
     )
@@ -99,7 +99,8 @@ def _fallback_summary(form: dict) -> str:
                 parts.append(f"\n{section}:")
                 for k, v in non_empty.items():
                     parts.append(f"- {k}: {v}")
-    parts.append(f"\n{SUMMARY_QUESTION}")
+    if ask_to_confirm:
+        parts.append(f"\n{SUMMARY_QUESTION}")
     return "\n".join(parts)
 
 

@@ -41,73 +41,92 @@ LIFESTYLE_COMPONENT_QUESTIONS = {
     )
 }
 
-# Asked once, after the patient declines the original question. Never the same wording.
-REFRAME_QUESTIONS = {
-    "Primary Complaint": "In a few words, what is the one problem you most want help with?",
-    "Duration of the Issue": "Roughly how long has this been going on — days, weeks, or months?",
-    "Onset (Gradual or Sudden)": "Did it come on suddenly or gradually?",
-    "Mechanism of Injury or Cause": "What set it off, or how did it start?",
-    "Previous Diagnosis or Advice and Prescribed Treatment Taken": (
-        "Have you seen anyone about this before? Yes or no."
-    ),
-    "Current Status of Issue (Improved, Same, Worse)": (
-        "Since that visit, is it better, the same, or worse?"
-    ),
-    "Primary Location of Pain": "Where do you feel it most? A general area is enough.",
-    "Severity (1-10)": (
-        "Would you describe it as mild, moderate, or severe? "
-        "If numbers are easier, 0 means no pain and 10 means the worst pain imaginable."
-    ),
-    "Aggravating Factors": "What tends to make it worse?",
-    "Relieving Factors": "What eases it, even for a short time?",
-    "Systemic Illness and Surgical History": (
-        "Are there any conditions or recent surgeries that could affect exercising?"
-    ),
-    "Current Lifestyle — Work": "Do you mostly sit, stand, or move around for work? A short answer is fine.",
-    "Current Lifestyle — Activity or Exercise": (
-        "Are you active most days, sometimes, or rarely? A short answer is fine."
-    ),
-    "Reports": "Do you have any scans or reports for this? ",
-    "Short-Term Goals (within 3 months)": "In the next few months, what would feel like progress?",
-    "Long-Term Goals (after 3 months)": "Looking further ahead, what would you like to get back to after 3 months?",
-    "Specific Expectations from Treatment": "What are you hoping we help with? ",
-}
+# Questions put to the patient in one turn. A batch never leaves its section.
+QUESTIONS_PER_TURN = 4
 
-REFRAME_LEAD = "Of course — share only what you're comfortable with."
 CLINICIAN_LATER = (
     "That's completely okay. You can cover what you skipped with your clinician later."
 )
 NOTED_COMPLAINT = "I've noted {labels}. We'll come to that after this."
+MANDATORY_NOTICE = (
+    "That one is important for your treatment plan, so I do need your answer. "
+    "A short, approximate one is fine."
+)
+SKIP_WHICH = "That's completely okay. Which of these would you like to skip?"
+SKIP_WHICH_KEEP_REQUIRED = (
+    "Some of these help your clinician plan the right treatment, so I'll keep those. "
+    "Which of the others would you like to skip?"
+)
+# A question asked again because the reply did not answer it.
+RETRY_NOTICE = "Sorry, I didn't catch an answer to that. Could you please answer this one?"
+RETRY_MANDATORY_NOTICE = (
+    "Sorry, I didn't catch that. This one is required to complete your assessment, "
+    "so please answer it."
+)
+# The patient asked to end the interview while a required question can still be asked.
+END_NOT_YET_REQUIRED = (
+    "You haven't answered the required questions yet. Please answer them before we end "
+    "the interview, because they're needed for your treatment plan."
+)
+# Added when a share of the form must also be done before the patient can finish.
+END_PERCENT_NOTE = (
+    "We also need to complete at least {minimum}% of the form before we can finish, "
+    "and you're at {current}% now."
+)
+END_NOT_YET_MORE = (
+    "We're at {current}% and need at least {minimum}% before we can finish. "
+    "Just a few more questions and we're done."
+)
+# Every required question is answered, so ending is allowed, but it is confirmed first.
+END_CONFIRM = (
+    "You've not answered all the questions. Are you sure you want to end the "
+    "interview? Reply 'yes' to end it, or 'no' to carry on."
+)
+END_CONTINUE = "Great, let's carry on."
+# A required question that went unanswered after the last ask. The interview moves on.
+MANDATORY_LATER = (
+    "I wasn't able to capture {labels}, so please tell your clinician about this later. "
+    "Let's move on."
+)
+
+
+def question_lines(missing: list[tuple[str, str]], field_labels: dict[str, str]) -> list[str]:
+    """The patient-facing question for each (section, field), in order."""
+
+    return [
+        REQUIRED_FIELD_QUESTIONS.get(
+            field,
+            LIFESTYLE_COMPONENT_QUESTIONS.get(field, field_labels.get(field, field)),
+        )
+        for _, field in missing
+    ]
 
 
 def question_for_missing_fields(
     missing: list[tuple[str, str]],
     field_labels: dict[str, str],
     *,
-    max_fields: int = 4,
-    reframe_fields: set[str] | None = None,
+    max_fields: int = QUESTIONS_PER_TURN,
+    intro: str = "",
+    about: str = "",
 ) -> str:
     """Return an explicit question for each missing field in one small batch.
 
-    ``reframe_fields`` uses the shorter second wording, after the patient
-    declined the original question.
+    ``intro`` opens a batch that starts a new section. Follow-up questions in the
+    same section have none, and are asked with "Could you also tell me:". ``about``
+    names the complaint the questions are for; it is given only when the patient
+    has more than one, so they always know which problem they are answering for.
     """
 
-    softer = reframe_fields or set()
-    prompts = []
-    for _, field in missing[:max_fields]:
-        if field in softer and field in REFRAME_QUESTIONS:
-            prompts.append(REFRAME_QUESTIONS[field])
-            continue
-        prompts.append(
-            REQUIRED_FIELD_QUESTIONS.get(
-                field,
-                LIFESTYLE_COMPONENT_QUESTIONS.get(field, field_labels.get(field, field)),
-            )
-        )
+    prompts = question_lines(missing[:max_fields], field_labels)
+    if intro:
+        if len(prompts) == 1:
+            return f"{intro}\n\n{prompts[0]}"
+        return f"{intro}\n" + "\n".join(f"- {prompt}" for prompt in prompts)
     if len(prompts) == 1:
-        return prompts[0]
-    return "Could you also tell me:\n" + "\n".join(f"- {prompt}" for prompt in prompts)
+        return f"About {about}: {prompts[0]}" if about else prompts[0]
+    header = f"Could you also tell me about {about}:" if about else "Could you also tell me:"
+    return f"{header}\n" + "\n".join(f"- {prompt}" for prompt in prompts)
 
 
 def contextual_resume_question(form: dict, missing: list[tuple[str, str]], field_labels: dict[str, str]) -> str:

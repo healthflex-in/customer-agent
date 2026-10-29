@@ -86,6 +86,63 @@ def get_all_missing_fields(form: dict, form_sections: list) -> dict:
     }
 
 
+def missing_in_ask_order(
+    form: dict, form_sections: list, visit_context: str = "unknown"
+) -> list[tuple[str, str]]:
+    """Return [(section, field), ...] still to ask, in the order they should be asked.
+
+    The one place that decides what is missing and in what order, shared by live
+    turns and resume. Fields stay grouped by section. Sections that still need a
+    mandatory answer come first, the main intake comes before any additional
+    complaint, and ties keep FRM-01 order. A field closed as Not provided or
+    Declined is not missing.
+    """
+    from src.forms.loader import load_form
+
+    definition = load_form("FRM-01")
+    skipped = (
+        definition.visit_types["general_assessment"].skip_sections
+        if visit_context == "general_assessment"
+        else frozenset()
+    )
+    by_section = {
+        section: list(fields)
+        for section, fields in get_all_missing_fields(form, form_sections).items()
+    }
+
+    def needs_mandatory(section: str) -> bool:
+        return any(definition.is_mandatory(section, field) for field in by_section[section])
+
+    sections = sorted(
+        (section for section in by_section if section not in skipped),
+        key=lambda section: (
+            list(form_sections).index(section) if section in form_sections else len(form_sections)
+        ),
+    )
+    sections.sort(
+        key=lambda section: (section.startswith("Additional Complaint "), not needs_mandatory(section))
+    )
+    return [
+        (section, field)
+        for section in sections
+        for field in sorted(by_section[section], key=lambda name: not definition.is_mandatory(section, name))
+    ]
+
+
+def first_section_batch(
+    missing: list[tuple[str, str]], limit: int
+) -> list[tuple[str, str]]:
+    """The next questions to ask: the open fields of the first section only.
+
+    A batch never mixes sections, so the patient is only asked what is left
+    in the section being discussed.
+    """
+    if not missing:
+        return []
+    first_section = missing[0][0]
+    return [item for item in missing if item[0] == first_section][:limit]
+
+
 def is_form_complete(form: dict, form_sections: list) -> bool:
     """True when every field in every section is filled."""
     return not get_all_missing_fields(form, form_sections)

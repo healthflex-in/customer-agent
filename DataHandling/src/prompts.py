@@ -1,3 +1,4 @@
+#this is not used anywhere in the present code, written only to the legacy agents history list
 WELCOME_PROMPT = """
 Hey,
 Welcome to Stance Health, India's first technology-enabled MSK health platform.
@@ -10,8 +11,8 @@ Please note that this information is critical to proceed with your session.
 # front-load a long batch of clinical questions before they have said why they
 # are visiting.
 INITIAL_INTAKE_PROMPT = (
-    "I'm glad you're here! To help your clinician prepare, could you tell me "
-    "what brings you in today and what you're hoping to address?"
+    "Hey, I'm glad you're here! This is your clinical intake form. Your answers help "
+    "your clinician prepare for your visit. What is the main problem bothering you today?"
 )
 
 READY_TO_START_PROMPT = """

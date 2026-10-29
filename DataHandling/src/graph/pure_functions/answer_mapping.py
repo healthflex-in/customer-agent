@@ -11,11 +11,14 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Sequence
 
 from app.observability.privacy import error_type
 from src.forms.loader import load_form
+from src.graph.pure_functions.additional_complaint import same_complaint
 from src.graph.pure_functions.form_validation import extract_json_from_response
+from src.graph.pure_functions.intent_detection import bare_yes_no
+from src.graph.pure_functions.phrasing import normalise_intent, normalise_tone
 from src.graph.pure_functions.lifestyle import (
     LIFESTYLE_COMPONENT_FIELDS,
     lifestyle_component_value,
@@ -29,7 +32,8 @@ from src.graph.pure_functions.question_plan import (
 
 NOT_PROVIDED = "Not provided"
 NOT_APPLICABLE = "Not applicable"
-DECLINED = "Declined"
+# Saved when the patient skips an optional question; the summary shows it as written.
+DECLINED = "Skipped by patient"
 VISIT_CONTEXTS = ("specific_complaint", "general_assessment", "unknown")
 
 _FORM = load_form("FRM-01")
@@ -40,7 +44,6 @@ _COMPONENT_OF = {name: component for component, name in LIFESTYLE_COMPONENT_FIEL
 # words is left empty so Sage still asks the question.
 _NOT_FROM_COMPLAINT = {
     "Previous Diagnosis or Advice and Prescribed Treatment Taken",
-    "Primary Location of Pain",
 }
 # Sections a general visit skips are the ones that describe a single complaint.
 COMPLAINT_SECTIONS = _FORM.visit_types["general_assessment"].skip_sections
@@ -48,7 +51,7 @@ COMPLAINT_SECTIONS = _FORM.visit_types["general_assessment"].skip_sections
 _PROMPT = """You map a patient's reply in a physiotherapy intake interview onto intake form fields.
 
 Sage (the assistant) last said:
-{last_question}
+{last_question}{complaint_focus}
 
 The patient replied:
 {reply}
@@ -70,23 +73,42 @@ How to map:
 - Read the reply by meaning, the way an experienced clinician would. Patients answer in any order, in one sentence or several, with typos and voice-to-text errors.
 - Map every fact in the reply to the field it answers, including fields Sage has not asked about yet.
 - Naming today's problem fills Primary Complaint only. Do not copy that problem, or a shortened form of its name, into any other field.
-- Previous Diagnosis or Advice and Prescribed Treatment Taken is filled only when the patient says they were seen, diagnosed, or treated before. The value is that visit, diagnosis, or advice. The name of today's problem is not a previous diagnosis, and it must not be saved there.
-- Primary Location of Pain is filled only when the patient says where they feel it. Leave it empty when they have only named the problem, so Sage asks where it is.
+- Previous Diagnosis or Advice and Prescribed Treatment Taken is filled only when the patient says they were seen, diagnosed, or treated before. The value is that visit, diagnosis, or advice. The name of today's problem is not a previous diagnosis, and it must not be saved ther
+- Primary Location of Pain is the body area where the patient feels the problem. Fill it from anything the patient has said in this conversation, including inside the complaint: "traps pain" gives the location Traps. A more specific area replaces a general one: "lower back" replaces "back". Never give an area the patient did not mention.
+- Aggravating Factors and Relieving Factors can honestly have nothing to report. That is an answer about what happens, not a denial. "Nothing helps" or "nothing gives relief" is answered: value says it in the patient's terms, such as "Nothing gives relief". An injury that happened once and did not come back is answered too: value such as "Happened only once, not repeated". Do not copy the activity that caused a one-off injury into Aggravating Factors; that activity is the Mechanism.
 - "answered": the patient gave the information. value is a short, clear restatement of what the patient said. Never add facts, guesses, or commentary.
 - For a field with fixed values, value is exactly one of those values, chosen by what the field means. Onset is exactly Gradual or Sudden, and its detail is always empty. For any other fixed field, detail is empty when the patient only named that value. Put a detail only when they gave an explanation the value does not already say. Other fields leave detail empty.
 - "denied": the patient said there is none. value is a short negative statement in the patient's terms.
 - "unsure": the patient does not know or does not remember. value is a short statement saying so.
+- A short yes or no answers the question it fits. "No", "none" or "nothing" to a yes-or-no question is an answer, with status "answered" and value "No" or "Yes", or a short statement such as "No other health conditions" or "No reports". It is never "declined" and never a skip. "No I don't have reports" is answered "No reports". Only "skip", "I don't want to answer" or "I'd rather not say" is "declined". If a bare yes or no fits none of the questions, leave it out.
 - "declined": the patient refuses to answer a question Sage just asked ("skip", "I don't want to answer", "I'd rather not say"). This is not "unsure" and not "denied". Name only the questions they refuse. If they refuse the whole batch, decline each question Sage just asked. If they only say skip and Sage asked more than one question, without saying which, set decline_scope to "unspecified" and do not decline individual fields. Otherwise decline_scope is "specified".
 - A newly mentioned separate problem is listed under complaints. Do not put its facts into the fields of a different problem.
+- When the patient has more than one problem, each field says which problem it is about. Put the facts in the problem the patient is describing. When it is unclear, use the problem Sage's questions were about.
+- A body area the patient gives as where they feel the problem (for example "my lower back") fills Primary Location of Pain. It is not a separate problem: do not list it under complaints, and do not list the main problem again in other words.
 - A short reply such as "no", "none" or "nothing" answers each field Sage just asked about that it sensibly answers.
 - "correction": true only for an already answered field, and only when the patient clearly changes that earlier answer; otherwise false.
 - A question the patient asks Sage is not an answer. Leave out fields the reply does not address.
 - reports.has_reports: true or false only when the reply says whether the patient has diagnostic reports, otherwise null. reports.wants_upload: false when they will not upload here, true when they want to upload now, otherwise null.
 - complaints: every distinct health problem the patient reports in this reply, each as a short clinical label in the patient's terms. Symptoms that belong to one condition, such as pain spreading from one area into another, are one problem. Empty when the reply reports none.
 - visit_context: "specific_complaint" when the patient has a pain, injury or condition, "general_assessment" for a check-up or wellness visit without a complaint, otherwise "unknown".
+- intent: what the patient is doing in this reply. "answer" when they answer or add information, "skip" when they want to skip a question, "end" when they want to stop or leave the interview, "form_question" when they ask what a question means or which problem it is about, "medical_advice" when they ask for a diagnosis, treatment or medication, "off_topic" for anything unrelated to the intake. When unsure, "answer".
+- tone: how the patient seems in this reply. "frustrated" when they are annoyed or want to stop, "confused" when they do not understand the questions or why they are asked, "distressed" when they describe real distress, "positive" when they are relaxed or pleased, otherwise "neutral".
 
 Return only JSON in this shape:
-{{"visit_context": "unknown", "answers": [{{"field_id": "F1", "status": "answered", "value": "...", "detail": "", "correction": false}}], "reports": {{"has_reports": null, "wants_upload": null}}, "complaints": [], "decline_scope": "specified"}}"""
+{{"visit_context": "unknown", "answers": [{{"field_id": "F1", "status": "answered", "value": "...", "detail": "", "correction": false}}], "reports": {{"has_reports": null, "wants_upload": null}}, "complaints": [], "decline_scope": "specified", "tone": "neutral", "intent": "answer"}}"""
+
+_OPEN_MESSAGE_PROMPT = """A patient in a physiotherapy intake interview was asked:
+{question}
+
+The patient replied:
+{reply}
+
+{problems}What is the reply?
+- "answer": the patient is answering the question or giving information about their problem. This includes hedged or unsure answers such as "may be a few days", "could be two weeks", "I can't remember" or "I don't know", and answers that start with a word like "when", "where", "what" or "how".
+- "form_question": the patient is asking what the question means, which problem it is about, or how to answer it.
+- "other": a request for medical advice, a question about the clinic, or an unrelated topic.
+
+Return only JSON: {{"kind": "answer"}}, {{"kind": "form_question"}} or {{"kind": "other"}}"""
 
 _FOCUS_PROMPT = """A patient in a physiotherapy intake interview reported these separate problems:
 {options}
@@ -122,21 +144,48 @@ class ReplyMapping:
     complaints: list[str] = field(default_factory=list)
     declined_field_ids: list[str] = field(default_factory=list)
     decline_unspecified: bool = False
+    tone: str = "neutral"
+    intent: str = "answer"
+
+
+_NOT_A_COMPLAINT = frozenset({"", NOT_PROVIDED, NOT_APPLICABLE, "Skipped by patient"})
+
+
+def complaint_labels(form: dict) -> dict[str, str]:
+    """Which problem each complaint section is about, once there is more than one.
+
+    Empty when the patient has a single problem, so nothing changes for the common
+    case. With several, every section about the main problem and every added
+    complaint maps to the name of the problem it describes.
+    """
+
+    main = str((form.get("Present Complaint") or {}).get("Primary Complaint") or "").strip()
+    added = {
+        section: str(fields.get("Primary Complaint") or "").strip()
+        for section, fields in form.items()
+        if section.startswith("Additional Complaint ") and isinstance(fields, dict)
+    }
+    added = {section: label for section, label in added.items() if label}
+    if main in _NOT_A_COMPLAINT or not added:
+        return {}
+    return {**{section: main for section in COMPLAINT_SECTIONS}, **added}
 
 
 def _slots(form: dict, form_sections: list[str]) -> list[_Slot]:
     slots: list[_Slot] = []
+    labels = complaint_labels(form)
     for section in form_sections:
         fields = form.get(section)
         if not isinstance(fields, dict):
             continue
         names = list(dict.fromkeys([*_FORM.sections.get(section, []), *fields]))
         complaint = str(fields.get("Primary Complaint") or "").strip()
-        about = (
-            f" (about the additional complaint: {complaint})"
-            if section.startswith("Additional Complaint ") and complaint
-            else ""
-        )
+        if section.startswith("Additional Complaint ") and complaint:
+            about = f" (about the additional complaint: {complaint})"
+        elif section in labels:
+            about = f" (about the main complaint: {labels[section]})"
+        else:
+            about = ""
         for name in names:
             if name == _LIFESTYLE_FIELD:
                 for component_field in LIFESTYLE_COMPONENT_FIELDS.values():
@@ -160,7 +209,10 @@ def _rules_text() -> str:
                 + (f". It means: {meaning}" if meaning else "")
             )
         if rule.scale:
-            lines.append(f"- {name}: a whole number from {rule.scale[0]} to {rule.scale[1]}")
+            lines.append(
+                f"- {name}: a whole number from {rule.scale[0]} to {rule.scale[1]}. "
+                "When the patient gives a range such as 8-9, use the highest number in it"
+            )
         if rule.applies_when_answered:
             lines.append(
                 f"- {name}: only applies when the patient answered "
@@ -224,32 +276,83 @@ def field_still_open(form: dict, field_id: str) -> bool:
     return not _is_answered(form, _Slot(field_id, section, name, ""))
 
 
-def apply_declines(
-    form: dict,
-    field_ids: list[str],
-    reframe_ids: list[str],
-    reframed_ids: list[str],
-) -> tuple[dict, list[str], list[str], list[str]]:
-    """First refusal queues a shorter question. A refusal of that question closes the field.
+def is_required_field(field_id: str) -> bool:
+    """True when the ``Section.Field`` id names a mandatory field."""
 
-    Returns the form, the ids still waiting for a shorter question, the ids whose
-    shorter question has been shown, and the ids closed as Declined on this turn.
+    section, field = field_id.split(".", 1)
+    return _FORM.is_mandatory(section, field)
+
+
+def apply_declines(form: dict, field_ids: list[str]) -> tuple[dict, list[str]]:
+    """Save each refused optional field that is still open as Declined.
+
+    A mandatory field is never declined: it stays open and is asked again,
+    within the ask cap. Returns the form and the ids closed on this turn.
     """
 
-    reframe = list(reframe_ids)
-    reframed = list(reframed_ids)
     closed: list[str] = []
     for field_id in dict.fromkeys(field_ids):
-        if not field_still_open(form, field_id):
+        if is_required_field(field_id) or not field_still_open(form, field_id):
             continue
-        if field_id in reframed:
-            form = record_not_provided(form, [field_id], DECLINED)
-            reframed = [item for item in reframed if item != field_id]
-            reframe = [item for item in reframe if item != field_id]
-            closed.append(field_id)
-        elif field_id not in reframe:
-            reframe.append(field_id)
-    return form, reframe, reframed, closed
+        form = record_not_provided(form, [field_id], DECLINED)
+        closed.append(field_id)
+    return form, closed
+
+
+@dataclass(frozen=True)
+class SkipDecision:
+    """What a refusal means for the questions the patient was just asked."""
+
+    decline_ids: list[str]        # optional fields to close as Declined now
+    ask_which: list[str]          # optional questions to offer; empty when no prompt is needed
+    mandatory_refused: bool       # the patient refused a mandatory question
+    keep_required_note: bool      # the prompt should say mandatory questions stay
+
+
+def decide_skip(
+    *,
+    form: dict,
+    asked_ids: list[str],
+    declined_ids: list[str],
+    unspecified: bool,
+    ask_counts: dict,
+    max_asks: int,
+    skip_all: bool = False,
+) -> SkipDecision:
+    """Turn a refusal into declines, a "which one?" prompt, or a mandatory notice.
+
+    ``declined_ids`` are the fields the patient named; ``unspecified`` means they
+    only said skip; ``skip_all`` means they said to skip everything, which declines
+    every open optional question at once. Mandatory questions are never declined.
+    An optional question already shown ``max_asks`` times is closed elsewhere.
+    """
+
+    open_asked = [field_id for field_id in asked_ids if field_still_open(form, field_id)]
+    mandatory_asked = [field_id for field_id in open_asked if is_required_field(field_id)]
+    skippable = [
+        field_id for field_id in open_asked
+        if not is_required_field(field_id) and ask_counts.get(field_id, 0) < max_asks
+    ]
+    named = [field_id for field_id in declined_ids if field_still_open(form, field_id)]
+    decline = [field_id for field_id in named if not is_required_field(field_id)]
+    mandatory_refused = len(decline) < len(named)
+
+    if skip_all:
+        optional_open = [field_id for field_id in open_asked if not is_required_field(field_id)]
+        return SkipDecision(
+            list(dict.fromkeys([*decline, *optional_open])),
+            [], bool(mandatory_asked), False,
+        )
+    if unspecified:
+        if not skippable:
+            mandatory_refused = mandatory_refused or bool(mandatory_asked)
+        elif len(skippable) + len(mandatory_asked) == 1:
+            # The only question still open is optional: a bare skip is clearly about it.
+            decline = list(dict.fromkeys([*decline, *skippable]))
+        else:
+            # Several questions are open, so "skip" alone must not guess which one.
+            return SkipDecision(decline, skippable, mandatory_refused, bool(mandatory_asked))
+    return SkipDecision(decline, [], mandatory_refused, False)
 
 
 def apply_visit_type(form: dict, previous: str, current: str) -> dict:
@@ -320,6 +423,48 @@ def _complaint_text(form: dict, section: str) -> str:
     source = section if section.startswith("Additional Complaint ") else "Present Complaint"
     fields = form.get(source) or {}
     return str(fields.get("Primary Complaint") or "")
+
+
+_FILLER_WORDS = frozenset({"the", "a", "an", "my", "of", "in", "on", "and", "area", "part", "side"})
+
+
+def _content_words(text: str) -> list[str]:
+    return [word for word in _words(text) if word not in _FILLER_WORDS]
+
+
+def _patient_mentions(value: str, patient_text: str) -> bool:
+    """True when at least one content word of ``value`` appears in what the patient said.
+
+    The location must come from the patient's own words somewhere in the
+    conversation, not from the model's guess.
+    """
+
+    spoken = _words(patient_text)
+    return any(
+        any(_same_stem(word, heard) for heard in spoken)
+        for word in _content_words(value)
+    )
+
+
+def _is_more_specific(current: str, value: str) -> bool:
+    """True when ``value`` names the same area as ``current`` but in more detail."""
+
+    old, new = set(_content_words(current)), set(_content_words(value))
+    return bool(old) and old < new
+
+
+def _is_another_complaints_area(value: str, section: str, labels: dict[str, str]) -> bool:
+    """True when ``value`` is the area of a different complaint, not this section's own.
+
+    With a main complaint and a knee complaint, "left knee" is where the knee hurts.
+    It must not be saved as the location of the main complaint's pain.
+    """
+
+    own = labels.get(section, "")
+    others = [label for name, label in labels.items() if label != own]
+    return bool(own) and not same_complaint(value, own) and any(
+        same_complaint(value, other) for other in others
+    )
 
 
 def _only_restates_complaint(complaint: str, value: str) -> bool:
@@ -411,6 +556,7 @@ def _build_prompt(
     form: dict,
     slots: list[_Slot],
     visit_context: str,
+    complaint_focus: str = "",
 ) -> str:
     unanswered, answered = [], []
     for key, slot in _keyed(slots).items():
@@ -420,6 +566,7 @@ def _build_prompt(
             unanswered.append(f"- {key}: {slot.section} — {slot.field} — {slot.question}")
     return _PROMPT.format(
         last_question=last_question.strip() or "(nothing yet)",
+        complaint_focus=complaint_focus,
         reply=reply.strip(),
         visit_context=visit_context,
         unanswered="\n".join(unanswered) or "(none)",
@@ -436,12 +583,27 @@ def map_reply(
     form_sections: list[str],
     visit_context: str,
     llm: Callable[[str], str],
+    asked_ids: Sequence[str] = (),
+    patient_text: str = "",
 ) -> ReplyMapping:
-    """Map ``reply`` onto every field it answers, in any order."""
+    """Map ``reply`` onto every field it answers, in any order.
+
+    ``patient_text`` is everything the patient has said so far. A location is
+    only saved when the patient mentioned it there, and a more specific location
+    replaces a general one. ``asked_ids`` are the questions the patient was just
+    asked; a location given in answer to them is always taken.
+    """
 
     slots = _slots(form, form_sections)
+    labels = complaint_labels(form)
     try:
-        payload = _parse(llm(_build_prompt(reply, last_question, form, slots, visit_context)))
+        asked_section = next((field_id.split(".", 1)[0] for field_id in asked_ids), "")
+        focus = (
+            f"\n(Sage's questions were about: {labels[asked_section]}.)"
+            if labels and asked_section in labels
+            else ""
+        )
+        payload = _parse(llm(_build_prompt(reply, last_question, form, slots, visit_context, focus)))
     except Exception as exc:
         print(f"[answer_mapping] Mapping failed: {error_type(exc)}")
         return ReplyMapping(form=form, visit_context=visit_context)
@@ -469,12 +631,22 @@ def map_reply(
 
     updated_ids: list[str] = []
     declined_ids: list[str] = []
+    # A bare yes or no is an answer to the question it fits, never a refusal.
+    yes_no = bare_yes_no(reply)
+    if yes_no:
+        answers = [(slot, {**item, "status": "answered", "value": yes_no})
+                   if item["status"] == "declined" else (slot, item)
+                   for slot, item in answers]
     for slot, item in answers:
         status = item["status"]
         if status == "declined":
             declined_ids.append(slot.field_id)
             continue
-        if _is_answered(updated, slot) and item.get("correction") is not True:
+        replaces_location = (
+            slot.field == "Primary Location of Pain"
+            and _is_more_specific(_saved_value(updated, slot), str(item.get("value") or ""))
+        )
+        if _is_answered(updated, slot) and item.get("correction") is not True and not replaces_location:
             continue
         value = _accepted_value(
             status,
@@ -484,14 +656,34 @@ def map_reply(
         )
         if value is None:
             continue
+        if slot.field == "Primary Location of Pain" and not (
+            slot.field_id in asked_ids or _patient_mentions(value, patient_text or reply)
+        ):
+            continue
+        if slot.field == "Primary Location of Pain" and _is_another_complaints_area(
+            value, slot.section, labels
+        ):
+            continue
         if (
             slot.field in _NOT_FROM_COMPLAINT
+            and slot.field_id not in asked_ids
             and _only_restates_complaint(_complaint_text(updated, slot.section), value)
         ):
             continue
         _write(updated, slot, value)
         _settle_dependents(updated, slot.section, slot.field, status == "answered")
         updated_ids.append(slot.field_id)
+
+    if yes_no and not updated_ids:
+        # Nothing was mapped. A bare yes or no answers the one question that was
+        # asked; with several asked, the caller asks which one it is for.
+        open_asked = [field_id for field_id in asked_ids if field_still_open(updated, field_id)]
+        if len(open_asked) == 1:
+            slot = next((s for s in slots if s.field_id == open_asked[0]), None)
+            if slot is not None:
+                _write(updated, slot, yes_no)
+                _settle_dependents(updated, slot.section, slot.field, True)
+                updated_ids.append(slot.field_id)
 
     print(f"[answer_mapping] Mapped {len(updated_ids)} fields, visit_context={next_context}")
     return ReplyMapping(
@@ -504,8 +696,34 @@ def map_reply(
             if isinstance(item, str) and str(item).strip()
         )),
         declined_field_ids=list(dict.fromkeys(declined_ids)),
-        decline_unspecified=payload.get("decline_scope") == "unspecified",
+        decline_unspecified=payload.get("decline_scope") == "unspecified" and not yes_no,
+        tone=normalise_tone(payload.get("tone")),
+        intent=normalise_intent(payload.get("intent")),
     )
+
+
+def read_open_message(
+    reply: str, question: str, problems: list[str], llm: Callable[[str], str]
+) -> str:
+    """Say what an open message is: "answer", "form_question" or "other".
+
+    Used only for a message the keyword check took for an unrelated question. It
+    fails closed: on any doubt or failure the answer is "other", which keeps today's
+    boundary reply, so a model problem can never let advice through.
+    """
+
+    listed = f"The patient has these problems: {'; '.join(problems)}.\n\n" if problems else ""
+    try:
+        payload = _parse(llm(_OPEN_MESSAGE_PROMPT.format(
+            question=question.strip(), reply=reply.strip(), problems=listed
+        )))
+    except Exception as exc:
+        print(f"[answer_mapping] Open-message check failed: {error_type(exc)}")
+        return "other"
+    kind = payload.get("kind")
+    reading = kind if kind in ("answer", "form_question") else "other"
+    print(f"[answer_mapping] Open message read as {reading}")
+    return reading
 
 
 def choose_focus(reply: str, complaints: list[str], llm: Callable[[str], str]) -> int | None:

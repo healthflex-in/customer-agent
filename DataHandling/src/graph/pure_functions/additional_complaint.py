@@ -211,6 +211,67 @@ def is_additional_complaint_cancellation(text):
     )
 
 
+# Words that name a complaint's kind, not where it is. "Back pain" and "lower
+# back pain" differ only by a qualifier, so they are the same complaint.
+_COMPLAINT_FILLER = frozenset({
+    "pain", "ache", "aches", "aching", "issue", "issues", "problem", "problems",
+    "injury", "discomfort", "soreness", "sore", "stiffness", "trouble",
+    "complaint", "concern", "a", "an", "the", "my", "in", "of", "on", "at",
+    "and", "with", "i", "have", "got", "is", "are",
+})
+
+
+def _complaint_words(text):
+    return frozenset(
+        word for word in re.findall(r"[a-z]+", str(text or "").lower())
+        if word not in _COMPLAINT_FILLER
+    )
+
+
+def same_complaint(first, second):
+    """True when two complaint labels describe one problem.
+
+    One is the same problem as the other when its distinguishing words are
+    all in the other: "back pain" and "lower back pain" match, "left knee pain"
+    and "right knee pain" do not, and "knee pain" and "back pain" do not.
+    """
+    left, right = _complaint_words(first), _complaint_words(second)
+    if not left or not right:
+        return str(first or "").strip().lower() == str(second or "").strip().lower()
+    return left <= right or right <= left
+
+
+_SAME_ISSUE = re.compile(
+    r"\bnot\b.{0,15}\b(?:different|another|new|separate|other|additional|second)\b"
+    r".{0,12}\b(?:issue|concern|problem|complaint|pain)\b"
+    r"|\b(?:it|that|this)(?:\s+is|'s)\s+the\s+same\b"
+    r"|\bsame\s+(?:issue|concern|problem|complaint)\b"
+)
+
+
+def is_same_complaint_statement(text):
+    """True when the patient says the extra complaint is the one they already gave."""
+    normalized = " ".join(str(text or "").lower().replace("\u2019", "'").split())
+    return bool(_SAME_ISSUE.search(normalized))
+
+
+def same_complaint_section(text, form):
+    """The additional complaint the patient says is really their main complaint, if any.
+
+    Only a complaint that restates the main one is returned, so a genuine second
+    problem is never removed by "it's the same".
+    """
+    if not is_same_complaint_statement(text):
+        return None
+    primary = (form.get("Present Complaint") or {}).get("Primary Complaint", "")
+    matches = [
+        name for name, fields in form.items()
+        if name.startswith("Additional Complaint ") and isinstance(fields, dict)
+        and same_complaint(fields.get("Primary Complaint", ""), primary)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def additional_complaint_removal_target(text, form, active_section=None):
     """Resolve an explicit removal to one additional-complaint section only."""
     normalized = " ".join(str(text).lower().replace("’", "'").split())

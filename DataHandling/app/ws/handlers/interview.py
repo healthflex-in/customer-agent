@@ -28,6 +28,7 @@ from app.forms.repository import (
     fetch_form_by_id,
     save_customer_info,
 )
+from app.interview.attempt_memory import restore_attempt_counters
 from app.interview.session import reset_health_agent_for_new_interview
 from app.observability.logging import log as _log
 from app.observability.privacy import error_type, pseudonymous_id
@@ -583,9 +584,9 @@ async def handle_start_interview(
 
             # Keep graph history/phase aligned with messages
             # emitted by this resume path outside LangGraph.
-            client_state["graph_history"] = [
-                {"role": "agent", "message": resume_message}
-            ]
+            client_state["graph_history"] = [_resume_plan.agent_entry(resume_message)]
+            # The saved form does not hold the ask counts; a refresh must not reset them.
+            restore_attempt_counters(client_state)
             if not _saved_patient_content and not client_state.get("tagged_turns"):
                 # This reserved-but-empty attempt is clinically
                 # a brand-new FRM-01 interview.  The one opening

@@ -55,10 +55,16 @@ class InterviewState(TypedDict):
     pending_question: Optional[str]
     question_field_ids: list[str]
     question_ask_counts: dict      # "Section.Field" -> times the question was shown
-    skip_reframe_ids: list[str]    # declined once; the next ask uses the shorter wording
-    skip_reframed_ids: list[str]   # shorter wording already shown; a second decline closes the field
     noted_complaints: list[str]    # new problems mentioned this turn; cleared after the reply
     decline_notice: bool           # this turn closed at least one field as Declined
+    mandatory_notice: bool         # the patient refused a mandatory question this turn
+    end_requested: bool            # the patient asked to end the interview this turn
+    patient_tone: str              # the model's read of the patient: neutral, positive, frustrated, confused, distressed
+    saved_field_ids: list          # the same fields as full ids, to tell which complaint they belong to
+    saved_answers: list            # fields this turn saved for the first time: [field name]
+    revised_answers: list          # saved answers this turn changed: [{field, value}]
+    end_reply: str                 # "confirmed" or "declined" when answering "are you sure you want to end?"
+    completion_percentage: float   # set from COMPLETION_PERCENTAGE: form share needed before an early end
 
     # ── MCP question recommendations (dev only, set on first turn) ──────────
     mcp_questions: Optional[list]
@@ -107,10 +113,16 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         pending_question=None,
         question_field_ids=[],
         question_ask_counts={},
-        skip_reframe_ids=[],
-        skip_reframed_ids=[],
         noted_complaints=[],
         decline_notice=False,
+        mandatory_notice=False,
+        end_requested=False,
+        end_reply="",
+        revised_answers=[],
+        saved_answers=[],
+        saved_field_ids=[],
+        patient_tone="neutral",
+        completion_percentage=0.0,
         mcp_questions=None,
         tagged_turns=None,
         tagged_turn_metas=None,

@@ -5,6 +5,7 @@ then handle the result (confirm, change, reports, etc.).
 from typing import Callable
 
 from src.graph.state import InterviewState
+from src.graph.pure_functions.complaint_severity import describe_severity_updates
 from src.graph.pure_functions.summary import (
     SUMMARY_FOLLOW_UP,
     SUMMARY_QUESTION,
@@ -137,13 +138,10 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
             from src.graph.pure_functions.question_plan import question_for_missing_fields
             import copy
             base_form = copy.deepcopy(state["form"])
-            applied_changes = []
-            for (section, field), value in summary_intent.get("severity_updates", {}).items():
+            severity_updates = summary_intent.get("severity_updates", {})
+            for (section, field), value in severity_updates.items():
                 base_form[section][field] = value
-                label = (base_form.get("Pain Assessment", {}).get("Primary Location of Pain")
-                         or base_form.get("Present Complaint", {}).get("Primary Complaint")
-                         or "existing complaint")
-                applied_changes.append(f"{label} pain to {value}")
+            applied_changes = describe_severity_updates(base_form, severity_updates)
             correction_text = summary_intent.get("correction_text")
             if correction_text and not applied_changes:
                 from src.graph.pure_functions.form_extraction import detect_form_correction, apply_form_correction

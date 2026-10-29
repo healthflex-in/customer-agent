@@ -39,6 +39,7 @@ from app.observability.tracing import (
     langfuse_client as _langfuse,
     langfuse_enabled as _langfuse_enabled,
 )
+from app.interview.attempt_memory import remember_attempt_counters
 from app.runtime.blocking import run_blocking
 from app.security.input import sanitize_patient_input
 from app.ws.completion import send_completed_form
@@ -48,6 +49,7 @@ from src.graph.pure_functions.clarification import (
     boundary_response_with_pending_question,
     build_out_of_flow_response,
     has_actionable_intake_fact,
+    out_of_flow_kind,
     pending_intake_question,
 )
 from src.graph.server_adapter import (
@@ -258,6 +260,11 @@ async def handle_text_input(
     # followed by a medication question). Let the graph save
     # only the fact and return the same safety boundary.
     if _boundary_response and has_actionable_intake_fact(text_input):
+        _boundary_response = None
+    # An open question may be an ordinary answer that only starts like one
+    # ("may be a few days"). The graph asks the model to tell which, so it is not
+    # refused here first. Advice, medication and clinic questions stay fixed.
+    if _boundary_response and out_of_flow_kind(text_input, _last_agent_question) == "open":
         _boundary_response = None
     if _boundary_response:
         _boundary_response = boundary_response_with_pending_question(
@@ -1001,6 +1008,7 @@ Answer warmly in 3-5 sentences. Do NOT end with robotic phrases like 'Now let's 
             # the patient receives an error and the previous
             # socket state remains authoritative for a retry.
             sync_client_state_from_graph(client_state, result_state)
+            remember_attempt_counters(client_state)
             if _prom_persisted_tagged_index is not None:
                 client_state["tagged_turn_index"] = _prom_persisted_tagged_index
 
