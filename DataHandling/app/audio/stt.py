@@ -23,6 +23,7 @@ from app.ai.models import MODEL_REGISTRY
 from app.ai.thinking import bounded_thinking
 from app.content_safety import contains_internal_transcription_prompt
 from app.observability.ai_usage import AIUsage, gemini_usage, tracked_ai_call
+from app.observability.logging import log
 from app.observability.privacy import error_type
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,15 @@ _GEMINI_STT_PROMPT = (
     "Return ONLY the transcription text, nothing else."
 )
 
+def _key_shape() -> dict:
+    """Which key variable is used and its shape, without revealing the key."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        value = os.environ.get(name)
+        if value:
+            return {"key_variable": name, "key_length": len(value), "key_starts_aiza": value.startswith("AIza")}
+    return {"key_variable": None}
+
+
 def _detect_mime_type(raw_bytes: bytes) -> str:
     """Detect audio MIME type from magic bytes."""
     if raw_bytes[:4] == b'\x1aE\xdf\xa3':
@@ -103,6 +113,8 @@ def _detect_mime_type(raw_bytes: bytes) -> str:
         return "audio/wav"
     if raw_bytes[:3] == b'ID3' or raw_bytes[:2] == b'\xff\xfb':
         return "audio/mp3"
+    if raw_bytes[4:8] == b'ftyp':  # MP4/M4A, what Safari's MediaRecorder produces
+        return "audio/mp4"
     # Default to webm — most common from browsers
     return "audio/webm"
 
@@ -162,7 +174,7 @@ def _transcribe_with_gcloud(raw_audio_bytes: bytes) -> str:
     from pydub import AudioSegment
 
     segment = None
-    for fmt in ("webm", "ogg", "wav", "mp3"):
+    for fmt in ("webm", "ogg", "wav", "mp3", "mp4"):
         try:
             segment = AudioSegment.from_file(io.BytesIO(raw_audio_bytes), format=fmt)
             break
@@ -263,14 +275,17 @@ def _pad_with_silence(raw_audio_bytes: bytes) -> bytes:
     try:
         from pydub import AudioSegment
         segment = None
-        for fmt in ("webm", "ogg", "wav", "mp3"):
+        for fmt in ("webm", "ogg", "wav", "mp3", "mp4"):
             try:
                 segment = AudioSegment.from_file(io.BytesIO(raw_audio_bytes), format=fmt)
                 break
             except Exception:
                 continue
         if segment is None:
+            import shutil
+            log.warning("audio_pad_undecodable", ffmpeg_on_path=bool(shutil.which("ffmpeg")))
             return raw_audio_bytes
+        log.info("audio_pad_decoded", seconds=round(len(segment) / 1000, 2), frame_rate=segment.frame_rate)
         silence = AudioSegment.silent(duration=_SILENCE_PAD_MS,
                                       frame_rate=segment.frame_rate)
         padded = silence + segment
@@ -288,7 +303,13 @@ def transcribe_audio_bytes(raw_audio_bytes: bytes) -> str:
     """
     import time as _time
     _t0 = _time.perf_counter()
+    log.info(
+        "audio_stt_input", bytes=len(raw_audio_bytes), head=raw_audio_bytes[:12].hex(),
+        mime=_detect_mime_type(raw_audio_bytes), audio_model=MODEL_REGISTRY.audio,
+        env_audio_model=os.environ.get("GEMINI_AUDIO_MODEL"), **_key_shape(),
+    )
     raw_audio_bytes = _pad_with_silence(raw_audio_bytes)
+    log.info("audio_stt_after_pad", bytes=len(raw_audio_bytes), mime=_detect_mime_type(raw_audio_bytes))
 
     try:
         text = _transcribe_with_gemini(raw_audio_bytes)
@@ -303,10 +324,21 @@ def transcribe_audio_bytes(raw_audio_bytes: bytes) -> str:
             sys.stderr.write("[stt] Gemini returned empty — falling back to Google Cloud STT\n")
             sys.stderr.flush()
     except Exception as e:
-        sys.stderr.write(f"[stt] Gemini failed ({error_type(e)}) — falling back to gcloud\n")
-        sys.stderr.flush()
+        log.warning(
+            "stt_gemini_failed", error=error_type(e), code=getattr(e, "code", None),
+            status=getattr(e, "status", None), model=MODEL_REGISTRY.audio,
+            reason=str(getattr(e, "message", "") or "")[:300], bytes=len(raw_audio_bytes),
+            mime=_detect_mime_type(raw_audio_bytes), head=raw_audio_bytes[:12].hex(),
+        )
 
-    text = _transcribe_with_gcloud(raw_audio_bytes)
+    try:
+        text = _transcribe_with_gcloud(raw_audio_bytes)
+    except Exception as e:
+        log.warning(
+            "stt_gcloud_failed", error=error_type(e),
+            reason=str(e) if isinstance(e, ValueError) else None,
+        )
+        raise
     if contains_internal_transcription_prompt(text):
         raise ValueError("Transcription rejected by internal-content guard")
     sys.stderr.write(f"[timing] stt_total={(_time.perf_counter() - _t0) * 1000:.0f}ms source=gcloud\n")

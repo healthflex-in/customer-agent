@@ -31,6 +31,7 @@ def handle_audio_start(client_state: dict) -> None:
     """
     client_state["is_recording"] = True
     client_state["received_audio_buffer"] = bytearray()
+    client_state["audio_chunks_seen"] = 0
     client_state["pending_voice_input"] = None
     client_state["recording_start_time"] = time.monotonic()
     print("Client started sending audio")

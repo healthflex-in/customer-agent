@@ -11,7 +11,7 @@ import uuid
 
 from fastapi import WebSocket
 
-from app.audio.limits import audio_limit_error
+from app.audio.limits import audio_limit_error, webm_header_offset
 from app.audit.chat_history import build_pending_voice_input
 from app.config import (
     AUDIO_RATE as RATE,
@@ -66,6 +66,14 @@ async def handle_audio_end(
         return
     print(
         f"Received complete audio: {len(audio_bytes)} bytes, duration: {audio_duration:.2f}s"
+    )
+    _log.info(
+        "audio_recording",
+        server_elapsed_seconds=round(elapsed_seconds, 2), declared_seconds=round(audio_duration, 2),
+        head=audio_bytes[:12].hex(),
+        chunks=client_state.get("audio_chunks_seen"),
+        ebml_header_at=webm_header_offset(audio_bytes),
+        kbps=round(len(audio_bytes) * 8 / 1000 / audio_duration) if audio_duration else 0,
     )
 
     # Optional QA-only capture of the original browser audio.

@@ -49,6 +49,7 @@ from app.ws.state import bind_form_fallback_agent, build_interview_state_async
 from app.audit.chat_history import record_client_chat as _record_chat_audit
 from app.ws.idempotency import RecentRequestWindow
 from app.observability.privacy import error_type, pseudonymous_id
+from app.audio.chunks import add_chunk
 from app.observability.logging import log as _log
 from app.observability.metrics import WS_CONNECTIONS, install_metrics
 from app.security.rate_limit import RateLimiter
@@ -373,7 +374,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             json.dumps({"type": "error", "text": limit_error})
                         )
                         continue
-                    client_state["received_audio_buffer"].extend(audio_chunk)
+                    chunk_number = client_state.get("audio_chunks_seen", 0) + 1
+                    client_state["audio_chunks_seen"] = chunk_number
+                    if chunk_number <= 3:
+                        _log.info(
+                            "audio_chunk", number=chunk_number, bytes=len(audio_chunk),
+                            head=bytes(audio_chunk[:12]).hex(),
+                            has_ebml_header=bytes(audio_chunk[:4]) == b"\x1a\x45\xdf\xa3",
+                        )
+                    if add_chunk(client_state["received_audio_buffer"], audio_chunk):
+                        _log.info("audio_header_chunk_reordered", bytes=len(audio_chunk), chunk_number=chunk_number)
 
                     # Log progress
                     total_kb = len(client_state["received_audio_buffer"]) / 1024
