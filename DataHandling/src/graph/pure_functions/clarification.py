@@ -158,10 +158,11 @@ def out_of_flow_kind(
 ) -> str | None:
     """Why a message is outside intake collection, or None when it belongs to the intake.
 
-    "hard": medical advice, medication, activity clearance, the clinic or brand,
-    general education, or an unrelated topic. These always get the boundary reply.
-    "open": any other genuine question. These get the boundary reply too, unless the
-    caller can tell the patient is only asking about the intake question itself.
+    "hard": medical advice, medication, activity clearance, the clinic or brand, or an
+    unrelated topic. These always get the boundary reply, with no model involved.
+    "open": any other genuine question, including general education such as "what is a
+    slipped disc?". These get the boundary reply too, unless the model reads the message
+    as an ordinary answer or as a question about the intake question itself.
     """
     text = " ".join(str(user_input or "").split())
     lowered = text.lower()
@@ -204,14 +205,11 @@ def out_of_flow_kind(
     if any(term in lowered for term in _BRAND_OR_UNRELATED_TERMS):
         return "hard"
 
-    # General requests for medical education or treatment guidance.
-    if any(phrase in lowered for phrase in (
-        "tell me about", "can you tell me", "can u tell me", "explain", "what is",
-        "what are", "what can", "what happens", "how does", "how do i", "info on",
-        "information on", "more about", "difference between",
-    )):
-        return "hard"
-    # Remaining genuine questions are outside the data-collection contract.
+    # What remains is a question that is not clearly advice, medication, or the clinic.
+    # It includes "what is ..." and "explain ...": a real education question such as
+    # "what is a slipped disc?", but also "what is the information you want from me?".
+    # A keyword cannot tell them apart, so the model reads it. If it cannot say the
+    # message is about the form or an answer, the boundary reply is given as before.
     return "open"
 
 

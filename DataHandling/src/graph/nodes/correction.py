@@ -4,7 +4,7 @@ Node factory functions for correction detection and application.
 from src.graph.state import InterviewState
 from src.graph.pure_functions.complaint_severity import describe_severity_updates
 from src.graph.pure_functions.form_extraction import detect_form_correction, apply_form_correction
-from src.graph.pure_functions.summary import SUMMARY_FOLLOW_UP
+from src.graph.pure_functions.summary import SUMMARY_FOLLOW_UP, with_updated_summary
 
 
 def make_detect_correction_node(llm_complete):
@@ -44,6 +44,24 @@ def make_detect_correction_node(llm_complete):
         return {"correction_data": result}
 
     return detect_correction_node
+
+
+def _name_changes(applied, form):
+    """Field names for the reply; a name that repeats says which complaint it is for."""
+
+    names = [name for name, _section in applied]
+    result = []
+    for name, section in applied:
+        complaint = None
+        if names.count(name) > 1:
+            fields = form.get(section) if isinstance(form.get(section), dict) else {}
+            complaint = (
+                fields.get("Primary Complaint") if str(section).startswith("Additional Complaint ")
+                else form.get("Pain Assessment", {}).get("Primary Location of Pain")
+                or form.get("Present Complaint", {}).get("Primary Complaint")
+            )
+        result.append(f"{name} for {complaint}" if complaint else name)
+    return result
 
 
 def make_apply_correction_node(llm_complete):
@@ -94,7 +112,7 @@ def make_apply_correction_node(llm_complete):
                     if guarded != working_form:
                         working_form = guarded
                         target = update.get("field_name") or "information"
-                        applied.append(str(target))
+                        applied.append((str(target), update.get("section_name")))
                     else:
                         failures.append(
                             "That value did not pass the clinical data checks."
@@ -104,13 +122,15 @@ def make_apply_correction_node(llm_complete):
 
             correction_applied = working_form != form
             if correction_applied:
-                response_text = "I've updated " + ", ".join(applied) + "."
+                response_text = "I've updated " + ", ".join(_name_changes(applied, working_form)) + "."
                 if failures:
                     response_text += (
                         " I couldn't safely match one other requested change; "
                         "please state that detail separately."
                     )
                 response_text += f" {SUMMARY_FOLLOW_UP}"
+                if state.get("phase") == "summary":
+                    response_text = with_updated_summary(response_text, working_form)
             else:
                 response_text = (
                     failures[0] if failures else
@@ -143,6 +163,8 @@ def make_apply_correction_node(llm_complete):
                     else "lifestyle information"
                 )
             message = "I've updated " + "; ".join(changes) + f". {SUMMARY_FOLLOW_UP}"
+            if state.get("phase") == "summary":
+                message = with_updated_summary(message, updated_form)
             return {"form": updated_form, "correction_applied": True,
                     "response_text": message,
                     "history": history + [{"role": "agent", "message": message}]}
@@ -159,6 +181,8 @@ def make_apply_correction_node(llm_complete):
                     "Please state the exact information you want recorded."
                 )
 
+        if success and state.get("phase") == "summary":
+            message = with_updated_summary(message, updated_form)
         updated_history = history + [{"role": "agent", "message": message}]
 
         return {

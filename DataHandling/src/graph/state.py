@@ -58,6 +58,7 @@ class InterviewState(TypedDict):
     noted_complaints: list[str]    # new problems mentioned this turn; cleared after the reply
     decline_notice: bool           # this turn closed at least one field as Declined
     mandatory_notice: bool         # the patient refused a mandatory question this turn
+    section_skipped: bool          # the patient skipped a whole added complaint this turn
     end_requested: bool            # the patient asked to end the interview this turn
     patient_tone: str              # the model's read of the patient: neutral, positive, frustrated, confused, distressed
     saved_field_ids: list          # the same fields as full ids, to tell which complaint they belong to
@@ -85,7 +86,7 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
     """Return a blank InterviewState for a new interview. Replaces HealthAgent.init_form()."""
     fresh_form = _load_form("FRM-01").empty_form()
     form_sections = list(fresh_form.keys())
-    from src.prompts import INITIAL_INTAKE_PROMPT
+    from src.prompts import INITIAL_INTAKE_PROMPT, OPENING_QUESTION
     return InterviewState(
         user_id=user_id,
         form_id=form_id,
@@ -101,7 +102,7 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         awaiting_report_upload=False,
         attempts_on_current_section=0,
         visit_context="unknown",
-        history=[{"role": "agent", "message": INITIAL_INTAKE_PROMPT}],
+        history=[{"role": "agent", "message": INITIAL_INTAKE_PROMPT, "question_text": OPENING_QUESTION}],
         missing_fields=[],
         summary_intent=None,
         reports_intent=None,
@@ -117,6 +118,7 @@ def get_fresh_interview_state(user_id: str = "", form_id: str = "", session_id: 
         decline_notice=False,
         mandatory_notice=False,
         end_requested=False,
+        section_skipped=False,
         end_reply="",
         revised_answers=[],
         saved_answers=[],

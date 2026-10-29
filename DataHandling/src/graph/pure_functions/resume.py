@@ -12,7 +12,7 @@ from src.graph.pure_functions.question_plan import (
     question_for_missing_fields,
 )
 from src.graph.pure_functions.summary import _fallback_summary
-from src.prompts import INITIAL_INTAKE_PROMPT
+from src.prompts import INITIAL_INTAKE_PROMPT, OPENING_QUESTION
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,8 @@ class ResumePlan:
         """
 
         entry = {"role": "agent", "message": message}
+        if message == INITIAL_INTAKE_PROMPT:
+            entry["question_text"] = OPENING_QUESTION
         asks_questions = (
             self.phase == "interviewing"
             and message == self.message

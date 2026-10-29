@@ -63,7 +63,7 @@ class ProductionAttemptRegressionTests(unittest.TestCase):
         self.assertEqual(plan.question_round, 3)
         self.assertEqual(plan.missing, [])
         self.assertIn("Here's a summary", plan.message)
-        self.assertIn("Reply 'no' if everything is correct", plan.message)
+        self.assertIn("If it is accurate, reply looks good", plan.message)
         self.assertNotIn("ask your clinician", plan.message)
 
     def test_treatment_expectation_is_not_an_additional_complaint(self):

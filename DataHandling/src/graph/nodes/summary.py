@@ -12,6 +12,7 @@ from src.graph.pure_functions.summary import (
     classify_summary_response,
     _fallback_summary,
     reports_with_verified_upload,
+    with_updated_summary,
 )
 from src.graph.nodes.generate import next_intake_step
 
@@ -206,6 +207,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                 response_text = (
                     f"I've corrected the additional concern to {replacement}. {SUMMARY_FOLLOW_UP}"
                 )
+                response_text = with_updated_summary(response_text, updated_form)
                 return {
                     "form": updated_form,
                     "correction_applied": True,
@@ -259,6 +261,7 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                     "The documents you just uploaded are already attached to this assessment. "
                     f"I've updated your report information to reflect the upload. {SUMMARY_FOLLOW_UP}"
                 )
+                response_text = with_updated_summary(response_text, patch["form"])
                 patch["awaiting_report_upload"] = False
                 patch["request_attachment"] = False
                 patch["response_text"] = response_text
@@ -312,7 +315,9 @@ def make_handle_summary_response_node(llm_complete: Callable[[str], str]):
                     "No relevant diagnostic reports available for this issue"
                 )
             patch["form"] = updated_form
-            response_text = f"I've noted your report information. {SUMMARY_FOLLOW_UP}"
+            response_text = with_updated_summary(
+                f"I've noted your report information. {SUMMARY_FOLLOW_UP}", patch["form"]
+            )
             patch.update(response_text=response_text, awaiting_report_upload=False,
                          request_attachment=False,
                          history=state["history"] + [{"role": "agent", "message": response_text}])

@@ -152,6 +152,7 @@ def build_graph_state(
         decline_notice=False,
         mandatory_notice=False,
         end_requested=False,
+        section_skipped=False,
         end_reply="",
         revised_answers=[],
         saved_answers=[],

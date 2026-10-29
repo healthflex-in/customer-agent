@@ -36,6 +36,11 @@ VARIANTS: dict[str, tuple[str, ...]] = {
         "Good question. I'm asking about {complaint}.",
         "Of course. These questions are about {complaint}.",
     ),
+    # The patient skipped an entire added complaint. Its name stays on the form.
+    "section_skipped": (
+        "Alright.",
+        "Sure, we'll leave that one out.",
+    ),
     # The patient gave details about another problem while the main one is being asked about.
     "other_complaint_saved": (
         "Thanks, I've noted {things} for {complaint}. Let's finish {active} first, then we'll come back to it.",

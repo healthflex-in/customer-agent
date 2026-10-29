@@ -229,7 +229,7 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
         state["correction_data"] = detect_form_correction(state["user_input"], state["form"], True, lambda _: "unused")
         update = make_apply_correction_node(lambda _: "unused")(state)
         self.assertTrue(update["correction_applied"])
-        self.assertIn("anything else you'd like to change", update["response_text"])
+        self.assertIn("If anything else needs updating, tell me what to change", update["response_text"])
         self.assertNotIn("Key points", update["response_text"])
         self.assertEqual(self.edges.after_apply_correction({**state, **update}), "__end__")
         corrected = {**state, **update, "summary_intent": {"intent": "confirm"}, "user_input": "ok done"}
@@ -358,7 +358,7 @@ class SummaryCorrectionFlowTests(unittest.TestCase):
             "arm",
             updated["Treatment Goals"]["Specific Expectations from Treatment"].lower(),
         )
-        self.assertIn("anything else you'd like to change", message)
+        self.assertIn("If anything else needs updating, tell me what to change", message)
 
     def test_pain_location_replacement_routes_as_correction_without_llm(self):
         def unexpected_llm_call(_prompt):

@@ -43,6 +43,7 @@ _TURN_SIGNALS_RESET = {
     "decline_notice": False,
     "mandatory_notice": False,
     "end_requested": False,
+    "section_skipped": False,
     "end_reply": "",
     "revised_answers": [],
     "saved_answers": [],
@@ -194,7 +195,8 @@ def _with_turn_notes(
         labels = ", ".join(_plain_label(field) for field in uncaptured)
         response = f"{MANDATORY_LATER.format(labels=labels)}\n\n{response}"
     if state.get("decline_notice"):
-        response = f"{pick('skip_accepted', turn, avoid=response)}\n\n{response}"
+        key = "section_skipped" if state.get("section_skipped") else "skip_accepted"
+        response = f"{pick(key, turn, avoid=response)}\n\n{response}"
     if noted:
         response = f"{pick('noted', turn, avoid=response).format(labels=', '.join(noted))}\n\n{response}"
     return response

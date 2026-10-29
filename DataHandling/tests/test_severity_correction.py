@@ -98,14 +98,21 @@ class SeverityMessageTests(unittest.TestCase):
     def test_the_reply_says_the_severity_was_updated(self):
         result = self._correct("severity is 8.6")
 
-        self.assertEqual(
-            result["response_text"], f"I've updated your severity to 9/10. {SUMMARY_FOLLOW_UP}"
-        )
+        text = result["response_text"]
+        self.assertTrue(text.startswith("I've updated your severity to 9/10."))
+        self.assertTrue(text.endswith(SUMMARY_FOLLOW_UP))
+
+    def test_the_updated_summary_is_shown_with_the_change(self):
+        text = self._correct("severity is 8.6")["response_text"]
+
+        self.assertIn("Here's your updated summary:", text)
+        self.assertIn("- Severity (1-10): 9/10", text)
+        self.assertEqual(text.count(SUMMARY_FOLLOW_UP), 1)
 
     def test_the_reply_does_not_name_the_location_as_if_it_changed(self):
         result = self._correct("severity is 8.6")
 
-        self.assertNotIn(LOCATION, result["response_text"])
+        self.assertNotIn(LOCATION, result["response_text"].split("\n\n")[0])
         self.assertEqual(result["form"]["Pain Assessment"]["Severity (1-10)"], "9/10")
         self.assertEqual(result["form"]["Pain Assessment"]["Primary Location of Pain"], LOCATION)
 

@@ -238,6 +238,7 @@ from src.graph.pure_functions.additional_complaint import (
     add_complaint_section,
     same_complaint,
     same_complaint_section,
+    skip_section_target,
 )
 from src.graph.pure_functions.answer_mapping import (
     COMPLAINT_SECTIONS,
@@ -273,7 +274,7 @@ from src.graph.pure_functions.clarification import (
 )
 from src.graph.pure_functions.reasoning_extractor import reasoning_extract
 from src.forms.loader import load_form
-from src.prompts import FORMAT_PROMPT
+from src.prompts import FORMAT_PROMPT, OPENING_PURPOSE
 
 
 _FOCUS_FIELD_ID = "Present Complaint.Primary Complaint"
@@ -309,6 +310,7 @@ def _ask_focus(state: InterviewState, form: dict, history: list, complaints: lis
     question = (
         "You mentioned more than one concern:\n"
         + "\n".join(f"- {complaint}" for complaint in complaints)
+        + "\n\nFor this assessment we'll focus on one issue, but you can still share details about the others."
         + "\n\nWhich one would you like to focus on first? We'll go through the others after that."
     )
     counts = dict(state.get("question_ask_counts") or {})
@@ -359,27 +361,34 @@ def _open_message_reply(
     and the pending question ids are kept for the next reply.
     """
 
+    # The question being asked: the last batch of intake questions, or, at the very
+    # start, the opening question (which has no question ids yet).
     pending = next(
         (entry for entry in reversed(history)
-         if entry.get("role") == "agent" and entry.get("question_field_ids")),
+         if entry.get("role") == "agent" and (entry.get("question_field_ids") or entry.get("question_text"))),
         None,
     )
     labels = complaint_labels(form)
     reading = read_open_message(user_input, question, list(dict.fromkeys(labels.values())), llm)
     if reading != "form_question" or pending is None:
         return ("answer" if reading == "answer" else "other"), None
-    ids = list(pending["question_field_ids"])
+    ids = list(pending.get("question_field_ids") or [])
     pending_question = str(pending.get("question_text") or pending.get("message") or "").strip()
     main = str((form.get("Present Complaint") or {}).get("Primary Complaint") or "").strip()
-    complaint = labels.get(ids[0].split(".", 1)[0]) or main
-    subject = your(complaint) if complaint else "what brings you in today"
-    reply = f"{pick('form_question', len(history)).format(complaint=subject)}\n\n{pending_question}"
+    complaint = (labels.get(ids[0].split(".", 1)[0]) if ids else "") or main
+    # With a complaint known, say which one the questions are about. At the start there is
+    # none yet, so say what the form is for.
+    note = (
+        pick("form_question", len(history)).format(complaint=your(complaint))
+        if complaint else OPENING_PURPOSE
+    )
+    reply = f"{note}\n\n{pending_question}"
     return "form_question", {
         "history": history + [
             {"role": "user", "message": user_input, "clinical_extraction": False},
             {
                 "role": "agent", "message": reply, "clinical_extraction": False,
-                "question_field_ids": ids, "question_text": pending_question,
+                "question_text": pending_question, **({"question_field_ids": ids} if ids else {}),
             },
         ],
         "response_text": reply,
@@ -549,7 +558,12 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             removal_target = same_issue_target or additional_complaint_removal_target(
                 user_input, form, current_section
             )
-            if removal_target or is_additional_complaint_cancellation(user_input):
+            # "skip this" / "that's all" on an added complaint skips its questions and
+            # keeps its name for the clinician; only an explicit removal deletes it.
+            keeps_name = not same_issue_target and skip_section_target(
+                user_input, form, [f"{current_section}.-"]
+            )
+            if not keeps_name and (removal_target or is_additional_complaint_cancellation(user_input)):
                 import copy as _copy
                 updated_form = _copy.deepcopy(form)
                 section_to_remove = removal_target or current_section
@@ -709,6 +723,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         noted: list[str] = []
         decline_notice = False
         mandatory_notice = False
+        skipped_section = None
         revised_answers: list[dict] = []
         saved_answers: list[str] = []
         saved_field_ids: list[str] = []
@@ -827,8 +842,23 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             nothing_saved = not mapping.updated_field_ids
             end_requested = is_end_request(user_input) or (mapping.intent == "end" and nothing_saved)
             skip_all = is_skip_all(user_input) and not end_requested
+            skipped_section = (
+                None if end_requested
+                else skip_section_target(user_input, updated_form, pending_skip or asked_ids)
+            )
             if pending_skip and end_requested:
                 decision = SkipDecision([], [], False, False)
+            elif skipped_section:
+                # An entire added complaint is skipped: every open question in it is
+                # closed, and the complaint's name stays on the form for the clinician.
+                section_fields = [
+                    f"{skipped_section}.{name}" for name in updated_form[skipped_section]
+                    if name != "Primary Complaint"
+                ]
+                decision = SkipDecision(
+                    [field_id for field_id in section_fields if field_still_open(updated_form, field_id)],
+                    [], False, False,
+                )
             elif skip_all:
                 # "Skip all" is the only words that exit every remaining question at once.
                 from src.graph.nodes.generate import MAX_TIMES_ASKED
@@ -905,6 +935,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
             "noted_complaints": noted,
             "decline_notice": decline_notice,
             "mandatory_notice": mandatory_notice,
+            "section_skipped": bool(skipped_section),
             "revised_answers": revised_answers,
             "saved_answers": saved_answers,
             "saved_field_ids": saved_field_ids,
@@ -926,6 +957,7 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     "noted_complaints": noted,
                     "decline_notice": decline_notice,
                     "mandatory_notice": mandatory_notice,
+                    "section_skipped": bool(skipped_section),
                     "revised_answers": revised_answers,
                     "saved_answers": saved_answers,
                     "saved_field_ids": saved_field_ids,

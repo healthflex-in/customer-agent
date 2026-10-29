@@ -52,6 +52,7 @@ async def handle_start_interview(
     # Client is ready to start the interview (after login or page reload)
     from src.prompts import (
         INITIAL_INTAKE_PROMPT,
+        OPENING_QUESTION,
     )
 
     # Get user_id from the message if provided
@@ -718,7 +719,7 @@ async def handle_start_interview(
     else:
         _welcome_text = INITIAL_INTAKE_PROMPT
         client_state["graph_history"] = [
-            {"role": "agent", "message": _welcome_text}
+            {"role": "agent", "message": _welcome_text, "question_text": OPENING_QUESTION}
         ]
     await send_text_message(
         websocket,
