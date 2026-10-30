@@ -175,64 +175,351 @@ from langgraph.config import get_stream_writer
 from src.graph.state import InterviewState
 
 
-def _classify_visit_context(user_input: str, llm_complete) -> str:
-    """
-    LLM-based classification of visit purpose. Called once on the first
-    substantive user message so question depth can be adapted intelligently.
-    Returns 'specific_complaint', 'general_assessment', or 'unknown'.
-    """
-    prompt = (
-        "A patient arrived at a physiotherapy / MSK health clinic. "
-        "Classify their visit purpose based on their message.\n\n"
-        f'Patient message: "{user_input}"\n\n'
-        "CLASSIFICATION OPTIONS:\n"
-        '- "specific_complaint": They describe a specific pain, injury, or health issue they want treated.\n'
-        '- "general_assessment": They want a general check-up, wellness screening, posture review, '
-        "or to explore the clinic — no specific complaint.\n"
-        '- "unknown": Cannot determine from this message.\n\n'
-        "Reply with ONLY one of: specific_complaint, general_assessment, unknown"
-    )
+def _mcp_question_hints(form: dict, visit_context: str, current_section: str, user_input: str) -> list:
+    """Return clinical-mcp question recommendations (dev only, MCP_URL unset in prod)."""
     try:
-        result = llm_complete(prompt).strip().lower().rstrip(".")
-        if result in ("specific_complaint", "general_assessment", "unknown"):
-            print(f"[visit_context] classified as: {result}")
-            return result
-    except Exception as e:
-        print(f"[visit_context] Classification failed: {error_type(e)}")
-    return "unknown"
+        from app.mcp_client import is_available, recommend_questions
+        if not is_available():
+            return []
+        parts = [f"visit_type={visit_context}"]
+        for label, section, field in (
+            ("complaint", "Present Complaint", "Primary Complaint"),
+            ("location", "Pain Assessment", "Primary Location of Pain"),
+            ("severity", "Pain Assessment", "Severity (1-10)"),
+            ("duration", "Present Complaint", "Duration of the Issue"),
+        ):
+            value = form.get(section, {}).get(field, "")
+            if value:
+                parts.append(f"{label}={value}")
+        if current_section:
+            parts.append(f"section={current_section}")
+        parts.append(f"patient_says={user_input[:200]}")
+        recommendations = recommend_questions(" | ".join(parts), limit=8) or []
+        if recommendations:
+            print(f"[mcp] Loaded {len(recommendations)} question recommendations from clinical-mcp")
+        return recommendations
+    except Exception as exc:
+        print(f"[mcp] Recommendation lookup failed: {error_type(exc)}")
+        return []
 
 
+def _extract_prom_answers(
+    *,
+    user_input: str,
+    history: list,
+    form: dict,
+    current_section: str,
+    last_question: str,
+    llm_complete: Callable[[str], str],
+    reasoning_llm: Callable[[str], str] | None,
+) -> dict:
+    if reasoning_llm is not None:
+        reasoned = reasoning_extract(
+            user_input=user_input,
+            history=history,
+            form=form,
+            reasoning_llm=reasoning_llm,
+        )
+        if reasoned is not None:
+            return reasoned
+    return extract_form_data_from_text(
+        user_input=user_input,
+        form=form,
+        prompt_template=FORMAT_PROMPT,
+        llm_complete=llm_complete,
+        current_section=current_section,
+        last_question=last_question,
+    )
+
+
+import copy
+
+from src.graph.pure_functions.additional_complaint import (
+    add_complaint_section,
+    same_complaint,
+    same_complaint_section,
+    skip_section_target,
+)
+from src.graph.pure_functions.answer_mapping import (
+    COMPLAINT_SECTIONS,
+    apply_declines,
+    choose_focus,
+    SkipDecision,
+    choose_skipped,
+    complaint_labels,
+    decide_skip,
+    field_still_open,
+    map_reply,
+    read_open_message,
+)
+from src.graph.pure_functions.intent_detection import bare_yes_no, is_skip_all
+from src.graph.pure_functions.phrasing import pick, your
+from src.graph.pure_functions.question_plan import (
+    question_lines,
+    LIFESTYLE_COMPONENT_QUESTIONS,
+    NOTED_COMPLAINT,
+    REQUIRED_FIELD_QUESTIONS,
+    SKIP_WHICH,
+    SKIP_WHICH_KEEP_REQUIRED,
+)
 from src.graph.pure_functions.form_extraction import extract_form_data_from_text
-from src.graph.pure_functions.form_validation import validate_section
+from src.graph.pure_functions.intent_detection import end_confirmation_reply, is_end_request
 from src.graph.pure_functions.clarification import (
     boundary_response_with_pending_question,
     build_activity_clearance_response,
     build_intake_clarification,
-    build_out_of_flow_response,
+    OUT_OF_FLOW_RESPONSE,
     has_actionable_intake_fact,
+    out_of_flow_kind,
 )
-from src.graph.pure_functions.question_repetition import asks_about_answered_field
-from src.graph.pure_functions.lifestyle import merge_lifestyle_answer
-from src.graph.pure_functions.referral import (
-    is_referral_question,
-    normalize_referral_source,
-)
-from src.graph.pure_functions.summary import classify_reports_intent
-from src.prompts import FORMAT_PROMPT
+from src.graph.pure_functions.reasoning_extractor import reasoning_extract
+from src.forms.loader import load_form
+from src.prompts import FORMAT_PROMPT, OPENING_PURPOSE
+
+
+_FOCUS_FIELD_ID = "Present Complaint.Primary Complaint"
+
+
+def _primary_complaint(form: dict) -> str:
+    return str((form.get("Present Complaint") or {}).get("Primary Complaint") or "").strip()
+
+
+def _offered_focus(history: list) -> tuple[list[str], str]:
+    """Return the complaints offered by the last focus question and the reply that named them."""
+
+    for index in range(len(history) - 1, -1, -1):
+        entry = history[index]
+        if entry.get("role") != "agent":
+            continue
+        complaints = list(entry.get("focus_complaints") or [])
+        if not complaints:
+            return [], ""
+        reply = next(
+            (
+                earlier.get("message", "")
+                for earlier in reversed(history[:index])
+                if earlier.get("role") == "user" and not earlier.get("focus_reply")
+            ),
+            "",
+        )
+        return complaints, reply
+    return [], ""
+
+
+def _ask_focus(state: InterviewState, form: dict, history: list, complaints: list[str]) -> dict:
+    question = (
+        "You mentioned more than one concern:\n"
+        + "\n".join(f"- {complaint}" for complaint in complaints)
+        + "\n\nFor this assessment we'll focus on one issue, but you can still share details about the others."
+        + "\n\nWhich one would you like to focus on first? We'll go through the others after that."
+    )
+    counts = dict(state.get("question_ask_counts") or {})
+    counts[_FOCUS_FIELD_ID] = counts.get(_FOCUS_FIELD_ID, 0) + 1
+    return {
+        "form": form,
+        "history": history + [
+            {"role": "agent", "message": question, "focus_complaints": complaints},
+        ],
+        "response_text": question,
+        "phase": "interviewing",
+        "current_section": "Present Complaint",
+        "visit_context": "specific_complaint",
+        "question_field_ids": [_FOCUS_FIELD_ID],
+        "question_ask_counts": counts,
+        "reports_intent": {},
+        "pending_question": None,
+        "direct_response_handled": True,
+    }
+
+
+_NOT_A_VALUE = {"", "Not provided", "Declined", "Not applicable", "Skipped by patient"}
+
+
+def _revised_answers(before: dict, after: dict, updated_ids: list[str]) -> list[dict]:
+    """The answers this turn changed from a value the patient had already given."""
+
+    changed = []
+    for field_id in dict.fromkeys(updated_ids):
+        section, field = field_id.split(".", 1)
+        old = str((before.get(section) or {}).get(field) or "").strip()
+        new = str((after.get(section) or {}).get(field) or "").strip()
+        if old not in _NOT_A_VALUE and new and old != new:
+            changed.append({"field": field, "value": new})
+    return changed
+
+
+def _open_message_reply(
+    form: dict, history: list, user_input: str, question: str, llm: Callable[[str], str]
+) -> tuple[str, dict | None]:
+    """Read a message the keyword check took for an unrelated question.
+
+    Returns ("answer", None) when it is an ordinary answer that merely starts like
+    a question ("may be a few days"), so the intake carries on; ("form_question",
+    reply) when the patient asks what the pending question is about, with a reply
+    that says which problem and repeats the question; otherwise ("other", None),
+    which keeps the boundary reply. A form-question reply does not count as an ask,
+    and the pending question ids are kept for the next reply.
+    """
+
+    # The question being asked: the last batch of intake questions, or, at the very
+    # start, the opening question (which has no question ids yet).
+    pending = next(
+        (entry for entry in reversed(history)
+         if entry.get("role") == "agent" and (entry.get("question_field_ids") or entry.get("question_text"))),
+        None,
+    )
+    labels = complaint_labels(form)
+    reading = read_open_message(user_input, question, list(dict.fromkeys(labels.values())), llm)
+    if reading != "form_question" or pending is None:
+        return ("answer" if reading == "answer" else "other"), None
+    ids = list(pending.get("question_field_ids") or [])
+    pending_question = str(pending.get("question_text") or pending.get("message") or "").strip()
+    main = str((form.get("Present Complaint") or {}).get("Primary Complaint") or "").strip()
+    complaint = (labels.get(ids[0].split(".", 1)[0]) if ids else "") or main
+    # With a complaint known, say which one the questions are about. At the start there is
+    # none yet, so say what the form is for.
+    note = (
+        pick("form_question", len(history)).format(complaint=your(complaint))
+        if complaint else OPENING_PURPOSE
+    )
+    reply = f"{note}\n\n{pending_question}"
+    return "form_question", {
+        "history": history + [
+            {"role": "user", "message": user_input, "clinical_extraction": False},
+            {
+                "role": "agent", "message": reply, "clinical_extraction": False,
+                "question_text": pending_question, **({"question_field_ids": ids} if ids else {}),
+            },
+        ],
+        "response_text": reply,
+        "reports_intent": {},
+        "pending_question": None,
+        "direct_response_handled": True,
+    }
+
+
+def _yes_no_clarification(form, history, user_input, yes_no, asked_ids, form_sections) -> dict:
+    """Ask which question a bare "no" or "yes" is for. Repeats the open questions to choose from."""
+
+    missing = [tuple(f.split(".", 1)) for f in asked_ids]
+    lines = "\n".join(
+        f"- {line}" for line in question_lines(missing, load_form("FRM-01").field_labels)
+    )
+    question = f"Which question is that {yes_no.lower()} for? Here are the ones I just asked:\n{lines}"
+    return {
+        "form": form,
+        "form_sections": form_sections,
+        "history": history + [
+            {"role": "user", "message": user_input},
+            {"role": "agent", "message": question, "yes_no_clarify": True, "question_field_ids": asked_ids},
+        ],
+        "response_text": question,
+        "phase": "interviewing",
+        "reports_intent": {},
+        "pending_question": None,
+        "direct_response_handled": True,
+        "noted_complaints": [],
+    }
+
+
+def _last_agent(history: list) -> dict:
+    for entry in reversed(history):
+        if entry.get("role") == "agent":
+            return entry
+    return {}
+
+
+def _question_text(field_id: str) -> str:
+    name = field_id.split(".", 1)[1]
+    return (
+        REQUIRED_FIELD_QUESTIONS.get(name)
+        or LIFESTYLE_COMPONENT_QUESTIONS.get(name)
+        or name
+    )
+
+
+def _fresh_complaints(form: dict, reported: list[str]) -> list[str]:
+    """Complaint labels that are a new problem, not a restatement of one already known.
+
+    A reported label is known when it restates the main complaint, an added
+    complaint, or the body area the patient gave as the location, so "lower
+    back pain" is not new when the main complaint is "back pain".
+    """
+
+    known = []
+    primary = _primary_complaint(form)
+    if primary:
+        known.append(primary)
+    for name, fields in form.items():
+        if name.startswith("Additional Complaint ") and isinstance(fields, dict):
+            label = str(fields.get("Primary Complaint") or "").strip()
+            if label:
+                known.append(label)
+    location = str((form.get("Pain Assessment") or {}).get("Primary Location of Pain") or "").strip()
+    if location:
+        known.append(location)
+    fresh: list[str] = []
+    for label in reported:
+        if any(same_complaint(label, other) for other in [*known, *fresh]):
+            continue
+        fresh.append(label)
+    return fresh
+
+
+def _ask_which_skip(
+    form: dict,
+    history: list,
+    field_ids: list[str],
+    form_sections: list[str],
+    noted: list[str],
+    keep_required_note: bool,
+) -> dict:
+    lines = [_question_text(field_id) for field_id in field_ids]
+    lead = SKIP_WHICH_KEEP_REQUIRED if keep_required_note else SKIP_WHICH
+    question = lead + "\n" + "\n".join(f"- {line}" for line in lines)
+    if noted:
+        question = f"{NOTED_COMPLAINT.format(labels=', '.join(noted))}\n\n{question}"
+    return {
+        "form": form,
+        "form_sections": form_sections,
+        "history": history + [{
+            "role": "agent",
+            "message": question,
+            "skip_question_ids": field_ids,
+        }],
+        "response_text": question,
+        "phase": "interviewing",
+        "reports_intent": {},
+        "pending_question": None,
+        "direct_response_handled": True,
+        "noted_complaints": [],
+    }
+
+
+def _apply_focus(form: dict, sections: list[str], complaints: list[str], chosen: int) -> tuple[dict, list[str]]:
+    """Make the chosen complaint primary and give every other one its own section."""
+
+    updated = copy.deepcopy(form)
+    updated.setdefault("Present Complaint", {})["Primary Complaint"] = complaints[chosen]
+    for index, complaint in enumerate(complaints):
+        if index != chosen:
+            updated, _ = add_complaint_section(updated, complaint)
+    return updated, list(sections) + [name for name in updated if name not in sections]
 
 
 def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callable[[str], str] = None):
     """
-    Combined node: runs form extraction AND intent classification concurrently,
-    then applies the classify_unanswered_fields gap-fill inline.
+    Map the patient's reply onto the form fields it answers.
 
-    Replaces three sequential extraction/gap-fill/intent stages with one node
-    that performs all three work items in ~max(extract_time, intent_time).
+    FRM-01 replies go through one mapping call over every unanswered field, so
+    answers given in any order, or ahead of the question, are kept. PROM
+    sessions keep their own extractor.
 
     Updates:
-      - form                (extracted + gap-filled)
+      - form                (mapped answers applied)
       - history             (user turn appended)
       - reports_intent
+      - visit_context
     """
     def extract_form_data_node(state: InterviewState) -> dict:
         user_input: str = state["user_input"]
@@ -241,20 +528,42 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
         current_section: str = state.get("current_section", "")
         awaiting_upload: bool = state.get("awaiting_report_upload", False)
 
+        # The patient is answering "are you sure you want to end?". A clear yes or
+        # no is settled here without mapping the reply onto any field; anything
+        # else is read as an ordinary answer below.
+        if _last_agent(history).get("end_confirm") and not state.get("tagged_turns"):
+            confirmation = end_confirmation_reply(user_input)
+            if confirmation:
+                return {
+                    "history": history + [{"role": "user", "message": user_input}],
+                    "reports_intent": {},
+                    "pending_question": None,
+                    "end_requested": confirmation == "yes",
+                    "end_reply": "confirmed" if confirmation == "yes" else "declined",
+                }
+
         # An accidentally-created additional complaint must have a deterministic
         # exit. Without this branch, "skip this" and "there is no additional
         # complaint" are treated as missing clinical answers and the same batch
         # is repeated forever.
-        if current_section.startswith("Additional Complaint "):
+        # A patient who says an added complaint is really their main one gets it
+        # removed whichever section is being asked, not only that section.
+        same_issue_target = same_complaint_section(user_input, form)
+        if current_section.startswith("Additional Complaint ") or same_issue_target:
             from src.graph.pure_functions.additional_complaint import (
                 additional_complaint_removal_target,
                 additional_complaint_replacement,
                 is_additional_complaint_cancellation,
             )
-            removal_target = additional_complaint_removal_target(
+            removal_target = same_issue_target or additional_complaint_removal_target(
                 user_input, form, current_section
             )
-            if removal_target or is_additional_complaint_cancellation(user_input):
+            # "skip this" / "that's all" on an added complaint skips its questions and
+            # keeps its name for the clinician; only an explicit removal deletes it.
+            keeps_name = not same_issue_target and skip_section_target(
+                user_input, form, [f"{current_section}.-"]
+            )
+            if not keeps_name and (removal_target or is_additional_complaint_cancellation(user_input)):
                 import copy as _copy
                 updated_form = _copy.deepcopy(form)
                 section_to_remove = removal_target or current_section
@@ -264,8 +573,8 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     if section != section_to_remove
                 ]
                 base_history = history + [{"role": "user", "message": user_input}]
-                from src.graph.nodes.generate import required_response_before_summary
-                next_required = required_response_before_summary(
+                from src.graph.nodes.generate import next_intake_step
+                step = next_intake_step(
                     {
                         **state,
                         "form": updated_form,
@@ -273,32 +582,16 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                     },
                     base_history,
                 )
-                if next_required is not None:
-                    response = (
-                        "I've removed that additional complaint. Let's continue with "
-                        "the remaining intake.\n\n" + next_required["response_text"]
-                    )
-                    next_patch = {
-                        key: value for key, value in next_required.items()
-                        if key not in {"response_text", "history"}
-                    }
+                if same_issue_target:
+                    lead_in = "Understood, that's the same issue, so I've taken out the extra complaint.\n\n"
+                elif step["phase"] == "interviewing":
+                    lead_in = "I've removed that additional complaint. Let's continue with the remaining intake.\n\n"
                 else:
-                    from src.graph.pure_functions.summary import _fallback_summary
-                    response = (
-                        "I've removed that additional complaint. Here is the updated "
-                        "information:\n\n" + _fallback_summary(updated_form)
-                    )
-                    next_patch = {
-                        "phase": "summary",
-                        "current_section": (
-                            updated_sections[-1] if updated_sections else "Present Complaint"
-                        ),
-                        "missing_fields": [],
-                    }
+                    lead_in = "I've removed that additional complaint. Here is the updated information:\n\n"
+                response = lead_in + step["response_text"]
                 return {
-                    "form": updated_form,
+                    **step,
                     "form_sections": updated_sections,
-                    **next_patch,
                     "history": base_history + [
                         {"role": "agent", "message": response},
                     ],
@@ -323,21 +616,32 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
 
         last_agent_for_boundary = next(
             (
-                entry.get("message", "")
+                entry.get("question_text") or entry.get("message", "")
                 for entry in reversed(history)
                 if entry.get("role") == "agent"
             ),
             "",
         )
-        out_of_flow_response = build_out_of_flow_response(
-            user_input, last_agent_for_boundary
-        )
+        boundary_kind = out_of_flow_kind(user_input, last_agent_for_boundary)
+        out_of_flow_response = OUT_OF_FLOW_RESPONSE if boundary_kind else None
         mixed_boundary_response = None
         if out_of_flow_response:
-            if has_actionable_intake_fact(user_input):
+            # An open message may be an ordinary answer that merely starts like a
+            # question ("may be a few days"). The model reads it first; only an
+            # "answer" reading changes anything, and every other case behaves as before.
+            reading, form_question_reply = "other", None
+            if boundary_kind == "open":
+                reading, form_question_reply = _open_message_reply(
+                    form, history, user_input, last_agent_for_boundary, reasoning_llm or llm_complete
+                )
+            if reading == "answer":
+                out_of_flow_response = None  # carry on and map it as an answer
+            elif has_actionable_intake_fact(user_input):
                 # Preserve explicit patient facts in a mixed message, but keep
                 # the medical-advice boundary as the response for this turn.
                 mixed_boundary_response = out_of_flow_response
+            elif form_question_reply:
+                return form_question_reply
             else:
                 out_of_flow_response = boundary_response_with_pending_question(
                     out_of_flow_response, last_agent_for_boundary
@@ -404,454 +708,219 @@ def make_extract_node(llm_complete: Callable[[str], str], reasoning_llm: Callabl
                 "direct_response_handled": True,
             }
 
-        # ── Visit context classification (fallback only) ──────────────────────
-        _visit_context_update = {}
         current_visit_context = state.get("visit_context", "unknown")
-        if current_visit_context == "unknown" and len(user_input.strip()) > 10:
-            _visit_context_update = {"visit_context": _classify_visit_context(user_input, llm_complete)}
-            # ── MCP: fetch recommended questions for this case (dev only) ────────
-            # Runs only on the first substantive turn when visit context is resolved.
-            # MCP_URL env is set in docker-compose.dev.yml but NOT in production.
-            try:
-                from app.mcp_client import is_available, recommend_questions as mcp_recommend
-                if is_available():
-                    _visit_ctx = _visit_context_update.get("visit_context", "unknown")
-                    _complaint = form.get("Present Complaint", {}).get("Primary Complaint", "")
-                    _pain_loc = form.get("Pain Assessment", {}).get("Primary Location of Pain", "")
-                    _severity = form.get("Pain Assessment", {}).get("Severity (1-10)", "")
-                    _duration = form.get("Present Complaint", {}).get("Duration of the Issue", "")
-                    _parts = [f"visit_type={_visit_ctx}"]
-                    if _complaint: _parts.append(f"complaint={_complaint}")
-                    if _pain_loc: _parts.append(f"location={_pain_loc}")
-                    if _severity: _parts.append(f"severity={_severity}/10")
-                    if _duration: _parts.append(f"duration={_duration}")
-                    if current_section: _parts.append(f"section={current_section}")
-                    _parts.append(f"patient_says={user_input[:200]}")
-                    _case_desc = " | ".join(_parts)
-                    _mcp_recs = mcp_recommend(_case_desc, limit=8)
-                    if _mcp_recs:
-                        _visit_context_update["mcp_questions"] = _mcp_recs
-                        print(f"[mcp] Loaded {len(_mcp_recs)} question recommendations from clinical-mcp")
-            except Exception as _mcp_err:
-                print(f"[mcp] Recommendation lookup failed: {error_type(_mcp_err)}")
-
-        # ── Detect complaint emerging in a general_assessment visit ──────────────
-        # If the patient reveals a specific health complaint mid-general-visit,
-        # flip to specific_complaint mode and clear the "Not applicable" placeholders
-        # so the conductor and extraction treat them as real fields to fill.
-        _effective_context = _visit_context_update.get("visit_context") or current_visit_context
-        _COMPLAINT_KW = [
-            "pain", "hurt", "ache", "injury", "complaint", "discomfort", "sore",
-            "stiff", "swollen", "tight", "weakness", "numb", "numbness",
-            "neck", "back", "knee", "shoulder", "hip", "wrist", "ankle",
-            "elbow", "spine", "head", "headache", "lower back", "upper back",
-        ]
-        if _effective_context == "general_assessment" and any(kw in user_input.lower() for kw in _COMPLAINT_KW):
-            print("[extract] Complaint detected during general assessment")
-            _visit_context_update["visit_context"] = "specific_complaint"
-            _effective_context = "specific_complaint"
-            # Clear "Not applicable" placeholders so these fields can be properly filled
-            _na_values = {
-                "not applicable", "general visit — no specific complaint",
-                "not applicable — no pain reported", "not applicable — general visit",
-                "not applicable — general visit.", "none",
-            }
-            for _sec in ["Present Complaint", "Pain Assessment"]:
-                if _sec in form and isinstance(form.get(_sec), dict):
-                    form = dict(form)
-                    form[_sec] = dict(form[_sec])
-                    for _field in list(form[_sec].keys()):
-                        if str(form[_sec].get(_field, "")).strip().lower() in _na_values:
-                            form[_sec][_field] = ""
-
-        # ── Auto-fill irrelevant sections for general_assessment ──────────────
-        # Fill Present Complaint / Pain Assessment / Previous Consultations with
-        # "Not applicable" so the conductor never asks about them and progress is accurate.
-        if _effective_context == "general_assessment":
-            _na_fills = {
-                "Present Complaint": {
-                    "Primary Complaint": "General visit — no specific complaint",
-                    "Duration of the Issue": "Not applicable",
-                    "Onset (Gradual or Sudden)": "Not applicable",
-                    "Mechanism of Injury or Cause": "Not applicable",
-                },
-                "Previous Consultations": {
-                    "Previous Diagnosis or Advice and Prescribed Treatment Taken":
-                        "Not applicable — general visit",
-                    "Current Status of Issue (Improved, Same, Worse)": "Not applicable",
-                },
-                "Pain Assessment": {
-                    "Primary Location of Pain": "Not applicable — no pain reported",
-                    "Severity (1-10)": "Not applicable",
-                    "Aggravating Factors": "Not applicable",
-                    "Relieving Factors": "Not applicable",
-                },
-            }
-            for _sec, _fields in _na_fills.items():
-                if _sec in form:
-                    form = dict(form)
-                    form[_sec] = dict(form[_sec])
-                    for _field, _val in _fields.items():
-                        existing = str(form[_sec].get(_field, "")).strip().lower()
-                        if not existing or existing in {"none", "not applicable", "n/a", ""}:
-                            form[_sec][_field] = _val
-
-        # Prepare last agent question for intent context
-        last_agent_q = ""
-        for entry in reversed(history):
-            if entry.get("role") == "agent":
-                last_agent_q = entry.get("message", "")
-                break
+        last_agent_q = last_agent_for_boundary
         clarification_response = build_intake_clarification(
             user_input, last_agent_q
         )
 
-        # ── Run extraction + intent concurrently ─────────────────────────────────
-        # IMPORTANT: get_stream_writer() uses LangGraph context variables that are
-        # NOT propagated into ThreadPoolExecutor threads. All writer calls must
-        # happen in the main thread context, not inside submitted callables.
-        from concurrent.futures import ThreadPoolExecutor
-
         writer = get_stream_writer()
         writer({"stage": "Extracting medical details", "detail": current_section or "symptoms", "status": "active"})
 
-        _is_prom = bool(state.get("tagged_turns"))
-
-        def _run_extraction():
-            # No get_stream_writer() calls here — runs in a thread, context not available
-            try:
-                # ── Reasoning extractor (primary path) ───────────────────────────────
-                if reasoning_llm is not None:
-                    from src.graph.pure_functions.reasoning_extractor import reasoning_extract
-                    reasoned = reasoning_extract(
-                        user_input=user_input,
-                        history=history,
-                        form=form,
-                        reasoning_llm=reasoning_llm,
-                        is_prom=_is_prom,
-                    )
-                    if reasoned is not None:
-                        return ("reasoning", reasoned)
-
-                # ── Fallback: FORMAT_PROMPT extraction ────────────────────────────────
-                result = extract_form_data_from_text(
-                    user_input=user_input,
-                    form=form,
-                    prompt_template=FORMAT_PROMPT,
-                    llm_complete=llm_complete,
-                    current_section=current_section,
-                    last_question=last_agent_q,
-                )
-                return ("format_prompt", result)
-            except Exception as _ex:
-                print(f"[extract_node] Extraction failed: {error_type(_ex)}")
-                return ("failed", form)
-
-        def _run_intent():
-            if awaiting_upload:
-                return {}
-            return classify_reports_intent(
+        reports_intent: dict = {}
+        visit_context = current_visit_context
+        focused_sections = None
+        noted: list[str] = []
+        decline_notice = False
+        mandatory_notice = False
+        skipped_section = None
+        revised_answers: list[dict] = []
+        saved_answers: list[str] = []
+        saved_field_ids: list[str] = []
+        patient_tone = "neutral"
+        end_requested = False
+        if state.get("tagged_turns"):
+            updated_form = _extract_prom_answers(
                 user_input=user_input,
+                history=history,
+                form=form,
+                current_section=current_section,
+                last_question=last_agent_q,
                 llm_complete=llm_complete,
-                context_question=last_agent_q,
+                reasoning_llm=reasoning_llm,
             )
+            detail = "PROM answers"
+        else:
+            mapper = reasoning_llm or llm_complete
+            form_sections = state.get("form_sections") or list(form)
+            offered, offered_reply = (
+                ([], "") if _primary_complaint(form) else _offered_focus(history)
+            )
+            if offered:
+                from src.graph.nodes.generate import MAX_TIMES_ASKED
 
-        # The next FRM-01 question is now generated deterministically from the
-        # persisted missing-field contract. Do not spend a second AI request on
-        # a speculative question that could omit a mandatory field.
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fut_extract = pool.submit(_run_extraction)
-            fut_intent = pool.submit(_run_intent)
-            _extract_result = fut_extract.result()
-            reports_intent = fut_intent.result()
-            pending_q = None
-
-        # Unpack the tagged extraction result and log it in the main thread
-        _extract_method, updated_form = _extract_result if isinstance(_extract_result, tuple) else ("failed", form)
-        from src.graph.pure_functions.clinical_value_guard import (
-            guard_new_pain_factor_evidence,
-            sanitize_extracted_form,
-        )
-        updated_form = sanitize_extracted_form(form, updated_form)
-        updated_form = guard_new_pain_factor_evidence(
-            form,
-            updated_form,
-            user_input=user_input,
-            last_question=last_agent_q,
-            current_section=current_section,
-        )
-        from src.graph.pure_functions.clinical_value_guard import (
-            apply_explicit_pain_factor_answers,
-        )
-        updated_form = apply_explicit_pain_factor_answers(
-            updated_form,
-            active_section=current_section,
-            user_input=user_input,
-            history=history,
-        )
-        if not _is_prom:
-            from src.graph.pure_functions.complaint_severity import reconcile_severities
-            updated_form = reconcile_severities(
-                form, updated_form, user_input, current_section, last_agent_q
+                chosen = choose_focus(user_input, offered, mapper)
+                times_asked = (state.get("question_ask_counts") or {}).get(_FOCUS_FIELD_ID, 0)
+                if chosen is None and times_asked < MAX_TIMES_ASKED:
+                    return _ask_focus(
+                        state, form,
+                        history + [{"role": "user", "message": user_input, "focus_reply": True}],
+                        offered,
+                    )
+                form, form_sections = _apply_focus(
+                    form, form_sections, offered, 0 if chosen is None else chosen
+                )
+                focused_sections = form_sections
+                if offered_reply:
+                    # Distribute the facts from the reply that named every complaint.
+                    form = map_reply(
+                        reply=offered_reply, last_question="", form=form,
+                        form_sections=form_sections, visit_context="specific_complaint", llm=mapper,
+                    ).form
+            last = _last_agent(history)
+            asked_ids = list(last.get("question_field_ids") or [])
+            complaint_snapshot = {
+                section: copy.deepcopy(form.get(section)) for section in COMPLAINT_SECTIONS
+            }
+            patient_text = " ".join(
+                [entry.get("message", "") for entry in history if entry.get("role") == "user"]
+                + [user_input]
             )
-
-        previous_lifestyle = form.get("History & Diagnostics", {}).get(
-            "Current Lifestyle", ""
-        )
-        # Lifestyle is persisted only through the deterministic, question-aware
-        # merger.  This prevents a reasoning-model cross-field guess (for
-        # example a pain trigger written as exercise) from replacing trusted
-        # lifestyle data.  The merger also handles bare occupation answers such
-        # as "accountant", so valid answers are not lost or asked twice.
-        updated_lifestyle = merge_lifestyle_answer(
-            previous_lifestyle,
-            user_input,
-            last_agent_q,
-        )
-        if updated_lifestyle or updated_form.get("History & Diagnostics", {}).get(
-            "Current Lifestyle"
-        ):
-            updated_form = dict(updated_form)
-            updated_form["History & Diagnostics"] = dict(
-                updated_form.get("History & Diagnostics", {})
+            mapping = map_reply(
+                reply=user_input,
+                last_question=last_agent_q,
+                form=form,
+                form_sections=form_sections,
+                visit_context="specific_complaint" if offered else current_visit_context,
+                llm=mapper,
+                asked_ids=asked_ids,
+                patient_text=patient_text,
             )
-            updated_form["History & Diagnostics"]["Current Lifestyle"] = (
-                updated_lifestyle
+            noted = (
+                []
+                if offered or not _primary_complaint(form)
+                else _fresh_complaints(mapping.form, mapping.complaints)
             )
-
-        # A patient may have a report but explicitly choose to show it directly
-        # to the clinician. Persist both facts deterministically so the Reports
-        # field is complete and the interview does not ask again or force upload.
-        if (
-            reports_intent.get("has_reports") is True
-            and reports_intent.get("wants_upload") is False
-        ):
-            updated_form = dict(updated_form)
-            updated_form["History & Diagnostics"] = dict(
-                updated_form.get("History & Diagnostics", {})
+            if noted:
+                mapped_form = mapping.form
+                for section, fields in complaint_snapshot.items():
+                    if isinstance(fields, dict):
+                        mapped_form[section] = fields
+                for label in noted:
+                    mapped_form, _ = add_complaint_section(mapped_form, label)
+                mapping.form = mapped_form
+                form_sections = list(form_sections) + [
+                    name for name in mapped_form if name not in form_sections
+                ]
+                focused_sections = form_sections
+            if not offered and not _primary_complaint(form) and len(mapping.complaints) > 1:
+                # Keep the general facts, but hold the complaint details until
+                # the patient says which complaint they belong to first.
+                held = copy.deepcopy(mapping.form)
+                for section in COMPLAINT_SECTIONS:
+                    if section in form:
+                        held[section] = copy.deepcopy(form[section])
+                return _ask_focus(
+                    state, held,
+                    history + [{"role": "user", "message": user_input}],
+                    mapping.complaints,
+                )
+            updated_form = mapping.form
+            # A bare "no" or "yes" that fits none of several open questions: ask which
+            # one it is for, once per batch. Nothing is saved or counted meanwhile.
+            yes_no = bare_yes_no(user_input)
+            if yes_no and not mapping.updated_field_ids and not _last_agent(history).get("yes_no_clarify"):
+                open_asked = [f for f in _last_agent(history).get("question_field_ids") or [] if field_still_open(updated_form, f)]
+                if len(open_asked) > 1:
+                    return _yes_no_clarification(updated_form, history, user_input, yes_no, open_asked, form_sections)
+            # A saved answer the patient changed this turn is acknowledged, so
+            # they know the earlier answer was updated and not ignored.
+            revised_answers = _revised_answers(form, mapping.form, mapping.updated_field_ids)
+            revised_fields = {item["field"] for item in revised_answers}
+            saved_field_ids = [
+                field_id for field_id in mapping.updated_field_ids
+                if field_id.split(".", 1)[1] not in revised_fields
+            ]
+            saved_answers = [field_id.split(".", 1)[1] for field_id in saved_field_ids]
+            patient_tone = mapping.tone
+            reports_intent = mapping.reports_intent
+            visit_context = mapping.visit_context
+            detail = f"{len(mapping.updated_field_ids)} fields"
+            pending_skip = list(last.get("skip_question_ids") or [])
+            # Asking to end is not a request to skip: it never opens the "which
+            # one?" prompt and never counts as refusing a question.
+            nothing_saved = not mapping.updated_field_ids
+            end_requested = is_end_request(user_input) or (mapping.intent == "end" and nothing_saved)
+            skip_all = is_skip_all(user_input) and not end_requested
+            skipped_section = (
+                None if end_requested
+                else skip_section_target(user_input, updated_form, pending_skip or asked_ids)
             )
-            _report_context = f"{user_input} {last_agent_q}".lower()
-            if any(term in _report_context for term in ("x-ray", "x ray", "xray")):
-                _report_label = "X-ray reports"
-            elif "mri" in _report_context:
-                _report_label = "MRI reports"
-            elif "ct scan" in _report_context:
-                _report_label = "CT scan reports"
-            else:
-                _report_label = "Diagnostic reports"
-            if reports_intent.get("deferred_upload"):
-                updated_form["History & Diagnostics"]["Reports"] = (
-                    f"{_report_label} available; patient deferred upload and will "
-                    "share them later."
+            if pending_skip and end_requested:
+                decision = SkipDecision([], [], False, False)
+            elif skipped_section:
+                # An entire added complaint is skipped: every open question in it is
+                # closed, and the complaint's name stays on the form for the clinician.
+                section_fields = [
+                    f"{skipped_section}.{name}" for name in updated_form[skipped_section]
+                    if name != "Primary Complaint"
+                ]
+                decision = SkipDecision(
+                    [field_id for field_id in section_fields if field_still_open(updated_form, field_id)],
+                    [], False, False,
+                )
+            elif skip_all:
+                # "Skip all" is the only words that exit every remaining question at once.
+                from src.graph.nodes.generate import MAX_TIMES_ASKED
+                decision = decide_skip(
+                    form=updated_form,
+                    asked_ids=pending_skip or asked_ids,
+                    declined_ids=[],
+                    unspecified=True,
+                    ask_counts=state.get("question_ask_counts") or {},
+                    max_asks=MAX_TIMES_ASKED,
+                    skip_all=True,
+                )
+            elif pending_skip:
+                chosen = choose_skipped(
+                    user_input, [_question_text(field_id) for field_id in pending_skip], mapper
+                )
+                # An unclear reply is not a refusal. Only named questions are declined.
+                decision = SkipDecision(
+                    decline_ids=[] if chosen is None else [
+                        pending_skip[index] for index in chosen if index < len(pending_skip)
+                    ],
+                    ask_which=[],
+                    mandatory_refused=False,
+                    keep_required_note=False,
                 )
             else:
-                updated_form["History & Diagnostics"]["Reports"] = (
-                    f"{_report_label} available; patient will share them directly with "
-                    "the clinician and declined in-app upload."
+                from src.graph.nodes.generate import MAX_TIMES_ASKED
+                decision = decide_skip(
+                    form=updated_form,
+                    asked_ids=asked_ids,
+                    declined_ids=list(mapping.declined_field_ids),
+                    unspecified=(
+                        mapping.decline_unspecified
+                        or (mapping.intent == "skip" and nothing_saved and not mapping.declined_field_ids)
+                    ) and not end_requested,
+                    ask_counts=state.get("question_ask_counts") or {},
+                    max_asks=MAX_TIMES_ASKED,
                 )
-        _filled_count = sum(1 for sec in updated_form.values() if isinstance(sec, dict)
-                            for v in sec.values() if v and str(v).strip())
-        print(f"[extract_node] {_extract_method}: {_filled_count} fields filled")
-        writer({"stage": "Extracting medical details", "detail": f"{_extract_method}: {_filled_count} fields", "status": "done"})
-
-        # ── Inline gap-fill (replaces classify_unanswered_fields LLM call) ───────
-        # Only triggers when there are still missing fields after extraction,
-        # using a single focused LLM call limited to the current section.
-        # Skipped for reasoning extraction — the reasoning model already does
-        # a comprehensive fill, so running gap_fill on top is redundant.
-        missing = [
-            f for f in validate_section(updated_form, current_section)
-            if "(If Any)" not in f and "(Optional)" not in f
-        ]
-
-        if _extract_method != "reasoning" and missing:
-            last_agent_q = ""
-            for entry in reversed(history):
-                if entry.get("role") == "agent":
-                    last_agent_q = entry.get("message", "")
-                    break
-
-            filled_facts = [
-                f"{field}: {value}"
-                for sec_data in updated_form.values()
-                if isinstance(sec_data, dict)
-                for field, value in sec_data.items()
-                if value and str(value).strip()
-            ]
-            context = "; ".join(filled_facts[:6]) if filled_facts else "Nothing collected yet"
-            missing_str = "\n".join(f'  - "{f}"' for f in missing)
-
-            gap_prompt = f"""Medical intake assistant analysing a patient reply.
-
-Context already collected: {context}
-Assistant asked: "{last_agent_q}"
-Patient replied: "{user_input}"
-
-Still empty in "{current_section}":
-{missing_str}
-
-For EACH field above: did the patient's reply address it — directly OR by negating it?
-- If YES (positive answer) → write the value using their words
-- If they negated it ("no", "nope", "don't", "never", "haven't", "i dont have any") → write a clear negative like "None", "No past surgeries", "Does not smoke or drink", "No exercise"
-- If truly irrelevant to that field → return null
-
-IMPORTANT: negations count as answers. "i dont have any past surgeries" fills Surgical History. "i dont smoke" fills lifestyle.
-
-Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
-
-            try:
-                import json as _json
-                raw = llm_complete(gap_prompt).strip()
-                start, end = raw.find("{"), raw.rfind("}")
-                if start != -1 and end != -1:
-                    classified = _json.loads(raw[start:end + 1])
-                    for field, value in classified.items():
-                        if value is not None and str(value).strip():
-                            if current_section in updated_form and field in updated_form[current_section]:
-                                existing = updated_form[current_section].get(field, "")
-                                if not existing or not str(existing).strip():
-                                    updated_form[current_section][field] = str(value).strip()
-                                    print(f"[gap_fill] Filled {field}")
-            except Exception as _e:
-                print(f"[gap_fill] Failed: {error_type(_e)}")
-
-        # ── Sweep fill for short denial responses ("nothing", "no", "none", etc.) ─────────
-        # When a user gives a sweeping denial to a compound question, deterministically
-        # fill every form field whose topic was covered by the last agent question.
-        # This is a fast keyword pass — no LLM call needed.
-        _SWEEP_INPUTS = {
-            "nothing", "no", "none", "nope", "na", "n/a", "not really",
-            "nothing like that", "nothing much", "no nothing", "nothing like these",
-            "no thank you", "not applicable", "nah", "nil",
-            "just came simply", "just came", "i just came", "came simply",
-            "just visiting", "just here", "no issues", "no problem",
-            "no complaints", "no discomfort", "i have no discomfort",
-            "nothing to share", "nothing to add", "not that i know of",
-        }
-        if user_input.lower().strip().rstrip(".,! ") in _SWEEP_INPUTS and last_agent_q:
-            _q = last_agent_q.lower()
-            # Each entry: (question keywords, section, field, fill_value)
-            _sweep_map = [
-                (["health condition", "illness", "systemic", "diabetes", "hypertension",
-                  "thyroid", "heart", "bp", "blood pressure"],
-                 "History & Diagnostics", "Systemic Illness and Surgical History",
-                 "No known systemic illness or health conditions"),
-                (["surgery", "surgeries", "fracture", "operation", "past surgeries"],
-                 "History & Diagnostics", "Systemic Illness and Surgical History",
-                 "No past surgeries or fractures"),
-                (["report", "mri", "x-ray", "ct scan", "scan", "imaging", "diagnostic",
-                  "blood report", "x ray"],
-                 "History & Diagnostics", "Reports",
-                 "No diagnostic reports available"),
-                (["goal", "achieve", "3 month", "three month", "short-term", "hoping to"],
-                 "Treatment Goals", "Short-Term Goals (within 3 months)",
-                 "No specific short-term goals mentioned"),
-                (["goal", "long-term", "long term", "ultimate goal", "after 3 month"],
-                 "Treatment Goals", "Long-Term Goals (after 3 months)",
-                 "No specific long-term goals mentioned"),
-                (["expect", "specific expectation", "what do you expect"],
-                 "Treatment Goals", "Specific Expectations from Treatment",
-                 "No specific expectations mentioned"),
-                (["previous", "consulted", "physiotherapist", "hospital", "past treatment",
-                  "seen a doctor", "seen any doctor"],
-                 "Previous Consultations",
-                 "Previous Diagnosis or Advice and Prescribed Treatment Taken",
-                 "None — no previous consultations mentioned"),
-                # Pain section (only for specific complaint visits)
-                (["location of pain", "where do you feel", "where exactly"],
-                 "Pain Assessment", "Primary Location of Pain", "Not specified"),
-                (["aggravat", "makes it worse", "worse"],
-                 "Pain Assessment", "Aggravating Factors", "None mentioned"),
-                (["relief", "makes it better", "reliev"],
-                 "Pain Assessment", "Relieving Factors", "None mentioned"),
-            ]
-            for keywords, section, field, fill_value in _sweep_map:
-                if any(kw in _q for kw in keywords):
-                    sec_data = updated_form.get(section)
-                    if isinstance(sec_data, dict) and field in sec_data:
-                        existing = sec_data.get(field, "")
-                        if not existing or not str(existing).strip():
-                            updated_form[section][field] = fill_value
-                            print(f"[sweep_fill] Filled {section}.{field}")
+                if decision.ask_which:
+                    return _ask_which_skip(
+                        updated_form,
+                        history + [{"role": "user", "message": user_input}],
+                        decision.ask_which,
+                        form_sections,
+                        noted,
+                        decision.keep_required_note,
+                    )
+            updated_form, closed = apply_declines(updated_form, decision.decline_ids)
+            decline_notice = bool(closed)
+            mandatory_notice = decision.mandatory_refused
+        updated_form.pop("Referral", None)
+        writer({"stage": "Extracting medical details", "detail": detail, "status": "done"})
 
         result_extra = {}
-
-        # ── Referral field: update only when the answer is actually a referral ──────────
-        # Guard against medical/symptom answers being stored as referral source.
-        # If the user's response looks like a symptom or treatment answer, it means
-        # a previous question went unanswered — don't store as referral, re-ask later.
-        _stored_referral = str(
-            form.get("Referral", {}).get("Source", "")
-        ).strip()
-        _referral_turn = is_referral_question(last_agent_q) or (
-            state.get("referral_asked", False) and not _stored_referral
-        )
-        if _referral_turn:
-            _ref_input = user_input.strip()
-            _is_null = _ref_input.lower() in {"no", "nope", "nah", "none", "n/a", "na", ""}
-
-            # Farewell/closing signals — don't store goodbyes as referral source
-            _farewell_signals = [
-                "bye", "goodbye", "good bye", "bye-bye", "see you", "take care",
-                "thank you bye", "thanks bye", "okay bye", "ok bye", "alright bye",
-                "that's it", "that is it", "that's all", "nothing else", "all done",
-                "have a good", "have a nice", "cheerio",
-            ]
-            _is_farewell = any(s in _ref_input.lower() for s in _farewell_signals)
-
-            # Medical signals: if the answer sounds like symptoms/treatment, it's NOT a referral
-            _medical_signals = [
-                "pain", "relief", "hurt", "ache", "ice", "heat", "medicine", "tablet",
-                "injection", "exercise", "stretch", "rest", "apply", "helps", "worse",
-                "better", "neck", "back", "knee", "shoulder", "hip", "wrist", "ankle",
-                "head", "spine", "swelling", "stiffness", "doctor told", "physio told",
-                "improve", "improving", "same", "getting worse",
-            ]
-            _is_medical = any(s in _ref_input.lower() for s in _medical_signals)
-
-            if _is_farewell:
-                print("[referral_fill] Farewell detected; referral left unchanged")
-                result_extra = {}  # Leave referral as-is; interview is ending anyway
-            elif _is_medical:
-                # This is a medical answer, not a referral — let extraction handle it
-                # and mark referral as not yet asked so it gets re-asked next turn
-                print("[referral_fill] Medical answer detected; referral will be re-asked")
-                result_extra = {"referral_asked": False}
-            elif _ref_input and not _is_null:
-                matched = normalize_referral_source(_ref_input)
-                # A short direct response to the explicit referral question may
-                # contain a valid campaign/source name outside the known list.
-                # Long or medical answers are never stored as referral data.
-                if matched is None and len(_ref_input.split()) <= 8 and not _is_medical:
-                    matched = _ref_input
-                if matched:
-                    updated_form = dict(updated_form)
-                    updated_form["Referral"] = dict(updated_form.get("Referral", {}))
-                    updated_form["Referral"]["Source"] = matched
-                    print("[referral_fill] Referral source recorded")
-                    result_extra = {"referral_asked": True}
-
-                    # This question was prefetched before the current answer was
-                    # merged. Discard it if it asks referral again; generation will
-                    # use the updated history/form instead.
-                    if pending_q and is_referral_question(pending_q):
-                        pending_q = None
-                else:
-                    # Do not overwrite a valid LLM extraction with None. Keep the
-                    # question eligible for one clear retry instead.
-                    result_extra = {"referral_asked": False}
-            else:
-                result_extra = {"referral_asked": True}
-
-        # Run the guard again because fallback gap-fill also uses an LLM.
-        updated_form = sanitize_extracted_form(form, updated_form)
-        updated_form = guard_new_pain_factor_evidence(
-            form,
-            updated_form,
-            user_input=user_input,
-            last_question=last_agent_q,
-            current_section=current_section,
-        )
+        if focused_sections:
+            result_extra["form_sections"] = focused_sections
+        if visit_context != current_visit_context:
+            result_extra["visit_context"] = visit_context
+            if current_visit_context == "unknown":
+                hints = _mcp_question_hints(updated_form, visit_context, current_section, user_input)
+                if hints:
+                    result_extra["mcp_questions"] = hints
 
         new_history = history + [{"role": "user", "message": user_input}]
 
@@ -862,44 +931,49 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
             "form": updated_form,
             "history": new_history,
             "reports_intent": reports_intent,
-            "pending_question": None if clarification_response else pending_q,
+            "pending_question": None,
+            "noted_complaints": noted,
+            "decline_notice": decline_notice,
+            "mandatory_notice": mandatory_notice,
+            "section_skipped": bool(skipped_section),
+            "revised_answers": revised_answers,
+            "saved_answers": saved_answers,
+            "saved_field_ids": saved_field_ids,
+            "patient_tone": patient_tone,
+            "end_requested": end_requested,
         }
 
         if mixed_boundary_response:
             # Do not let a safety refusal discard concrete intake data. Build
             # the next step from the updated form, then combine it with the
             # fixed boundary response. No diagnosis/advice is generated.
-            from src.graph.nodes.generate import required_response_before_summary
-            next_required = required_response_before_summary(
+            from src.graph.nodes.generate import next_intake_step
+            step = next_intake_step(
                 {
                     **state,
+                    **result_extra,
                     "form": updated_form,
                     "form_sections": list(updated_form),
+                    "noted_complaints": noted,
+                    "decline_notice": decline_notice,
+                    "mandatory_notice": mandatory_notice,
+                    "section_skipped": bool(skipped_section),
+                    "revised_answers": revised_answers,
+                    "saved_answers": saved_answers,
+                    "saved_field_ids": saved_field_ids,
+                    "patient_tone": patient_tone,
+                    "end_requested": end_requested,
                 },
                 new_history,
             )
-            if next_required is not None:
-                follow_up = next_required["response_text"]
-                next_patch = {
-                    key: value for key, value in next_required.items()
-                    if key not in {"response_text", "history"}
-                }
-            else:
-                from src.graph.pure_functions.summary import _fallback_summary
-                follow_up = _fallback_summary(updated_form)
-                next_patch = {
-                    "phase": "summary",
-                    "missing_fields": [],
-                    "question_field_ids": [],
-                }
             combined_response = (
                 mixed_boundary_response
                 + "\n\nI've recorded the intake information you shared.\n\n"
-                + follow_up
+                + step["response_text"]
             )
             result.update(
                 {
-                    **next_patch,
+                    **step,
                     "history": new_history + [
                         {
                             "role": "agent",
@@ -913,12 +987,6 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                 }
             )
 
-        if (
-            result["pending_question"]
-            and asks_about_answered_field(result["pending_question"], updated_form)
-        ):
-            print("[question_prefetch] Discarded question about an answered field")
-            result["pending_question"] = None
         if clarification_response:
             result.update(
                 {
@@ -926,10 +994,7 @@ Respond ONLY with JSON: {{"Field Name": "value or null"}}"""
                     "direct_response_handled": True,
                 }
             )
-        if _visit_context_update:
-            result.update(_visit_context_update)
-        if result_extra:
-            result.update(result_extra)
+        result.update(result_extra)
         return result
 
     return extract_form_data_node

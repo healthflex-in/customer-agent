@@ -6,8 +6,15 @@ import unittest
 class AsyncBoundaryTests(unittest.TestCase):
     def test_async_handlers_do_not_call_known_sync_io_directly(self):
         project_root = Path(__file__).resolve().parents[1]
-        server_path = project_root / "server.py"
-        tree = ast.parse(server_path.read_text(encoding="utf-8"))
+        source_paths = [
+            project_root / "server.py",
+            project_root / "app" / "jobs" / "worker.py",
+            *sorted((project_root / "app" / "api").glob("*.py")),
+            *sorted((project_root / "app" / "ws" / "handlers").glob("*.py")),
+        ]
+        trees = [
+            ast.parse(path.read_text(encoding="utf-8")) for path in source_paths
+        ]
 
         blocking_names = {
             "build_graph_state",
@@ -39,24 +46,25 @@ class AsyncBoundaryTests(unittest.TestCase):
         }
         offenders = []
 
-        for async_function in (
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.AsyncFunctionDef)
-        ):
-            for node in ast.walk(async_function):
-                if not isinstance(node, ast.Call):
-                    continue
-                if isinstance(node.func, ast.Name) and node.func.id in blocking_names:
-                    offenders.append(
-                        f"{async_function.name}:{node.lineno}:{node.func.id}"
-                    )
-                elif (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr in blocking_methods
-                ):
-                    offenders.append(
-                        f"{async_function.name}:{node.lineno}:{node.func.attr}"
-                    )
+        for tree in trees:
+            for async_function in (
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.AsyncFunctionDef)
+            ):
+                for node in ast.walk(async_function):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    if isinstance(node.func, ast.Name) and node.func.id in blocking_names:
+                        offenders.append(
+                            f"{async_function.name}:{node.lineno}:{node.func.id}"
+                        )
+                    elif (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr in blocking_methods
+                    ):
+                        offenders.append(
+                            f"{async_function.name}:{node.lineno}:{node.func.attr}"
+                        )
 
         self.assertEqual(offenders, [])
 

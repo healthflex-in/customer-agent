@@ -10,7 +10,7 @@ no Python changes needed.
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -21,6 +21,14 @@ _FORMS_DIR = Path(__file__).parent.parent.parent / "data" / "forms"
 class VisitType:
     description: str
     skip_sections: frozenset  # frozenset[str]
+
+
+@dataclass(frozen=True)
+class FieldRule:
+    values: tuple = ()                 # allowed answers, in display form
+    scale: tuple | None = None         # (low, high) whole-number range
+    applies_when_answered: str | None = None  # field in the same section
+    required: bool = False             # must be answered; can never be skipped
 
 
 @dataclass
@@ -38,7 +46,51 @@ class FormDefinition:
     visit_types: dict         # {visit_type_key: VisitType}
     predefined_questions: tuple  # (PredefinedQuestion, ...)
     general_visit_q1: str
-    referral_question: str
+    field_rules: dict         # {field_name: FieldRule}
+    section_intros: dict = field(default_factory=dict)  # {section_name: sentence}
+    ack_phrases: dict = field(default_factory=dict)     # {field_name: plain-words phrase}
+
+    def rule(self, field: str) -> FieldRule:
+        return self.field_rules.get(field, _NO_RULE)
+
+    def section_intro(self, section: str) -> str:
+        """The sentence that opens ``section``, or "" when the form has none."""
+        return self.section_intros.get(section, "")
+
+    def ack_phrase(self, field: str) -> str:
+        """How the bot names ``field`` when it says it saved it, or "" when it stays unmentioned."""
+        return self.ack_phrases.get(field, "")
+
+    def is_required(self, field: str) -> bool:
+        """True when the form marks ``field`` as required."""
+        return self.rule(field).required
+
+    def is_mandatory(self, section: str, field: str) -> bool:
+        """True when ``field`` must be answered in ``section``.
+
+        Only the main intake has mandatory questions. An additional complaint
+        repeats the field names but its questions are always optional.
+        """
+        return self.is_required(field) and not section.startswith("Additional Complaint ")
+
+    def required_fields(self, visit_context: str = "unknown") -> frozenset:
+        """Mandatory field names this visit type asks, skipped sections excluded."""
+        visit = self.visit_types.get(visit_context)
+        skipped = visit.skip_sections if visit else frozenset()
+        return frozenset(
+            field
+            for section, fields in self.sections.items()
+            if section not in skipped
+            for field in fields
+            if self.is_mandatory(section, field)
+        )
+
+    def dependents_of(self, field: str) -> list:
+        """Fields that only apply when ``field`` was answered."""
+        return [
+            name for name, rule in self.field_rules.items()
+            if rule.applies_when_answered == field
+        ]
 
     def empty_form(self) -> dict:
         """Return a fresh blank form dict. Call this instead of deepcopy(template)."""
@@ -48,6 +100,9 @@ class FormDefinition:
     def predefined_as_tuples(self) -> list:
         """Return [(title, text), ...] for legacy callers expecting the old format."""
         return [(q.title, q.text) for q in self.predefined_questions]
+
+
+_NO_RULE = FieldRule()
 
 
 # ── Parsers ───────────────────────────────────────────────────────────────────
@@ -88,6 +143,30 @@ def _parse_field_labels(block: str) -> dict:
             key, _, val = ln.partition(": ")
             labels[key.strip()] = val.strip()
     return labels
+
+
+def _parse_field_rules(block: str) -> dict:
+    rules = {}
+    for chunk in block.split("\n### ")[1:]:
+        lines = chunk.strip().splitlines()
+        settings = {}
+        for ln in lines[1:]:
+            key, sep, val = ln.partition(":")
+            if sep:
+                settings[key.strip()] = val.strip()
+        scale = None
+        if settings.get("scale"):
+            low, _, high = settings["scale"].partition("-")
+            scale = (int(low), int(high))
+        rules[lines[0].strip()] = FieldRule(
+            values=tuple(
+                v.strip() for v in settings.get("values", "").split(",") if v.strip()
+            ),
+            scale=scale,
+            applies_when_answered=settings.get("applies_when_answered") or None,
+            required=settings.get("required", "").lower() == "true",
+        )
+    return rules
 
 
 def _parse_predefined_questions(block: str) -> tuple:
@@ -139,7 +218,9 @@ def _parse(raw: str, form_id: str) -> FormDefinition:
         visit_types=_parse_visit_types(blocks.get("Visit Types", "")),
         predefined_questions=_parse_predefined_questions(blocks.get("Predefined Questions", "")),
         general_visit_q1=_parse_text_block(blocks.get("General Visit First Question", "")),
-        referral_question=_parse_text_block(blocks.get("Referral Question", "")),
+        field_rules=_parse_field_rules(blocks.get("Field Rules", "")),
+        section_intros=_parse_field_labels(blocks.get("Section Introductions", "")),
+        ack_phrases=_parse_field_labels(blocks.get("Acknowledgement Phrases", "")),
     )
 
 

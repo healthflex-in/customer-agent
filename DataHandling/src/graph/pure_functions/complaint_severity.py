@@ -1,6 +1,7 @@
 """Bind numeric pain ratings to a unique complaint, never a combined score."""
-import copy
+import math
 import re
+from decimal import Decimal
 
 SCORE = re.compile(r"\b(10|[0-9])\s*(?:out\s+of|/)\s*10\b", re.I)
 CORRECTION_SCORE = re.compile(
@@ -14,6 +15,53 @@ RATING_SCORE = re.compile(
 )
 BARE_SCORE = re.compile(r"\b(10|[0-9])\b")
 SITE = re.compile(r"\b(?:(left|right)\s+)?(head(?:ache)?|neck|back|shoulders?|arms?|hands?|wrists?|elbows?|hips?|legs?|knees?|ankles?|feet|foot|eyes?|chest|abdomen|stomach|jaw)\b", re.I)
+
+
+_DECIMAL_SCORE = re.compile(r"\b(\d{1,2})\.(\d+)\b")
+_RANGE_SCORE = re.compile(r"\b(10|[0-9])\s*(?:-|\u2013|\u2014|to)\s*(10|[0-9])\b", re.I)
+
+
+def _round_scores_up(text):
+    """Turn a decimal or a range into the highest whole number it allows.
+
+    "8.6" becomes 9 and "8-9" becomes 9, so the patient's worst case is kept and
+    the scoring patterns below only ever see whole numbers. A scale being quoted
+    ("0 to 10", "1 to 10") is left alone, as is a decimal that is not a score.
+    """
+
+    def round_up(match):
+        value = Decimal(match.group(0))
+        return str(math.ceil(value)) if value <= 10 else match.group(0)
+
+    def highest(match):
+        low, high = int(match[1]), int(match[2])
+        if low in (0, 1) and high == 10:
+            return match.group(0)
+        return str(max(low, high))
+
+    return _RANGE_SCORE.sub(highest, _DECIMAL_SCORE.sub(round_up, str(text)))
+
+
+def describe_severity_updates(form, updates):
+    """Patient-facing phrases for severity changes, such as "your severity to 9/10".
+
+    The complaint is named only when the form has more than one to tell apart.
+    """
+
+    several = len(complaint_targets(form)) > 1
+    phrases = []
+    for (section, _field), score in updates.items():
+        if not several:
+            phrases.append(f"your severity to {score}")
+            continue
+        description = (
+            form[section].get("Primary Complaint")
+            if section.startswith("Additional Complaint ")
+            else form.get("Pain Assessment", {}).get("Primary Location of Pain")
+            or form.get("Present Complaint", {}).get("Primary Complaint")
+        )
+        phrases.append(f"your severity for {description} to {score}")
+    return phrases
 
 
 def _sites(text):
@@ -43,6 +91,7 @@ def _is_severity_question(question):
 
 
 def explicit_severity_updates(form, text, active_section=None, context_question=None):
+    text = _round_scores_up(text)
     targets = complaint_targets(form)
     updates = {}
     score_matches = list(SCORE.finditer(text))
@@ -127,17 +176,3 @@ def explicit_severity_updates(form, text, active_section=None, context_question=
                 updates[matched[0]] = score[1] + "/10"
     return updates
 
-
-def reconcile_severities(original, extracted, text, active_section=None, context_question=None):
-    result = copy.deepcopy(extracted)
-    targets = complaint_targets(original)
-    if len(targets) > 1:
-        # Do not trust a full-conversation model to overwrite other complaints'
-        # ratings. Only this turn's explicitly scoped score can update them.
-        for section, field, _ in targets:
-            result.setdefault(section, {})[field] = original[section][field]
-    for (section, field), value in explicit_severity_updates(
-        original, text, active_section, context_question
-    ).items():
-        result.setdefault(section, {})[field] = value
-    return result

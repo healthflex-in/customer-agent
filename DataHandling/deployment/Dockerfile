@@ -44,6 +44,7 @@ COPY DataHandling/upload ./upload
 COPY DataHandling/server.py ./server.py
 
 RUN mkdir -p \
+    audio_debug \
     audio_files \
     config \
     db/vector \

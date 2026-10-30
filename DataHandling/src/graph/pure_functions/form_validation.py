@@ -56,59 +56,20 @@ def validate_section(form: dict, section: str) -> list:
     section_data = {field: "" for field in expected_fields}
     section_data.update(stored_section)
 
-    # ── Special handling: Previous Consultations ──────────────────────────────
-    if section == "Previous Consultations":
-        prev_field = "Previous Diagnosis or Advice and Prescribed Treatment Taken"
-        status_field = "Current Status of Issue (Improved, Same, Worse)"
-
-        previous_value = str(section_data.get(prev_field) or "").strip()
-        status_value = str(section_data.get(status_field) or "").strip()
-
-        consultation_keywords = [
-            "doctor", "physiotherapist", "hospital", "consulted", "visited",
-            "diagnosis", "diagnosed", "prescribed", "treatment", "medicine",
-            "injection", "exercise", "physio", "clinic",
-        ]
-        has_consultation_mention = bool(previous_value) and any(
-            kw in previous_value.lower() for kw in consultation_keywords
-        )
-
-        # Status filled but no actual consultation mentioned → treat as incomplete
-        if status_value and not previous_value and not has_consultation_mention:
-            return [prev_field, status_field]
-
-        prev_lower = previous_value.lower()
-        no_consult_indicators = [
-            "no previous", "didn't visit", "did not visit", "haven't consulted",
-            "have not consulted", "no consultations", "no doctor", "no hospital",
-            "never consulted", "not consulted", "none", "nothing",
-            "no previous consultations", "not applicable", "not seen",
-            "haven't seen", "have not seen", "nope", "no one",
-        ]
-        has_no_consultations = any(ind in prev_lower for ind in no_consult_indicators)
-
-        if has_no_consultations:
-            if not previous_value:
-                missing.append(prev_field)
-        else:
-            if not previous_value and status_value:
-                return [prev_field, status_field]
-            if not previous_value:
-                missing.append(prev_field)
-            elif not status_value:
-                missing.append(status_field)
-
-        return missing
-
-    # ── All other sections: check every field ─────────────────────────────────
+    rules = load_form("FRM-01")
     for field, value in section_data.items():
         # Fields marked "(If Any)" or "(Optional)" are not required — skip them
         # when deciding section completion so they never block advancement.
         if "(If Any)" in field or "(Optional)" in field:
             continue
-        if field == "Current Lifestyle" and value and str(value).strip():
+        # A dependent field is asked only once the field it depends on has an
+        # answer; a denial of that field saves the dependent as not applicable.
+        parent = rules.rule(field).applies_when_answered
+        if parent and not str(section_data.get(parent) or "").strip():
+            continue
+        if field == "Current Lifestyle":
             from src.graph.pure_functions.lifestyle import missing_lifestyle_components
-            missing.extend(missing_lifestyle_components(str(value)))
+            missing.extend(missing_lifestyle_components(str(value or "")))
         elif value is None or (isinstance(value, str) and not value.strip()):
             missing.append(field)
 
@@ -123,6 +84,63 @@ def get_all_missing_fields(form: dict, form_sections: list) -> dict:
         for fields in [validate_section(form, section)]
         if fields
     }
+
+
+def missing_in_ask_order(
+    form: dict, form_sections: list, visit_context: str = "unknown"
+) -> list[tuple[str, str]]:
+    """Return [(section, field), ...] still to ask, in the order they should be asked.
+
+    The one place that decides what is missing and in what order, shared by live
+    turns and resume. Fields stay grouped by section. Sections that still need a
+    mandatory answer come first, the main intake comes before any additional
+    complaint, and ties keep FRM-01 order. A field closed as Not provided or
+    Declined is not missing.
+    """
+    from src.forms.loader import load_form
+
+    definition = load_form("FRM-01")
+    skipped = (
+        definition.visit_types["general_assessment"].skip_sections
+        if visit_context == "general_assessment"
+        else frozenset()
+    )
+    by_section = {
+        section: list(fields)
+        for section, fields in get_all_missing_fields(form, form_sections).items()
+    }
+
+    def needs_mandatory(section: str) -> bool:
+        return any(definition.is_mandatory(section, field) for field in by_section[section])
+
+    sections = sorted(
+        (section for section in by_section if section not in skipped),
+        key=lambda section: (
+            list(form_sections).index(section) if section in form_sections else len(form_sections)
+        ),
+    )
+    sections.sort(
+        key=lambda section: (section.startswith("Additional Complaint "), not needs_mandatory(section))
+    )
+    return [
+        (section, field)
+        for section in sections
+        for field in sorted(by_section[section], key=lambda name: not definition.is_mandatory(section, name))
+    ]
+
+
+def first_section_batch(
+    missing: list[tuple[str, str]], limit: int
+) -> list[tuple[str, str]]:
+    """The next questions to ask: the open fields of the first section only.
+
+    A batch never mixes sections, so the patient is only asked what is left
+    in the section being discussed.
+    """
+    if not missing:
+        return []
+    first_section = missing[0][0]
+    return [item for item in missing if item[0] == first_section][:limit]
 
 
 def is_form_complete(form: dict, form_sections: list) -> bool:

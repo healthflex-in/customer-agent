@@ -18,11 +18,14 @@ services:
       - LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL:-https://us.cloud.langfuse.com}
       - LANGFUSE_CAPTURE_CONTENT=${LANGFUSE_CAPTURE_CONTENT:-false}
       - OBSERVABILITY_HASH_KEY=${OBSERVABILITY_HASH_KEY:-}
+      # Patient voice recordings (kept 48h, see DEBUG_AUDIO_* in .env)
+      - DEBUG_AUDIO_DIR=/app/audio_debug
     volumes:
       - ../audio_files:/app/audio_files
       - ../transcripts:/app/transcripts
       - ../output:/app/output
       - ../received_audio:/app/received_audio
+      - ../audio_debug:/app/audio_debug
       - ../db:/app/db
       - ../config:/app/config:ro
     healthcheck:

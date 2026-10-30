@@ -502,67 +502,9 @@ class HealthAgent:
                         print("[formatter] Clearing unsubstantiated medical-history placeholder")
                         self.form["History & Diagnostics"][sys_hist_field] = ""
 
-                # POST-PROCESSING: Clean up Referral.Source field if LLM filled it with non-informative or wrong values
-                if "Referral" in self.form:
-                    referral_source = str(self.form["Referral"].get("Source", "") or "").strip()
-                    if referral_source:
-                        lower_ref = referral_source.lower()
-                        # Values like "Yes", "No", "None" are not valid referral sources and
-                        # usually come from mis-extraction. Clear them so we still ask the question.
-                        invalid_referral_values = {"yes", "no", "none", "n/a", "na", "nil", "nothing", "0"}
-                        # Also, clinician/doctor descriptions (e.g. "orthopedic doctor") are NOT referral channels
-                        # and typically belong to Previous Consultations, not Referral.
-                        clinician_keywords = [
-                            "doctor",
-                            "dr ",
-                            "dr.",
-                            "orthopedic",
-                            "orthopaedic",
-                            "ortho",
-                            "physio",
-                            "physiotherapist",
-                            "surgeon",
-                            "consultant",
-                            "specialist",
-                            "hospital",
-                            "clinic",
-                            "center",
-                            "centre",
-                        ]
-                        # Genuine referral channels we want to keep (friend, google, instagram, etc.)
-                        referral_channel_keywords = [
-                            "friend",
-                            "family",
-                            "relative",
-                            "colleague",
-                            "coworker",
-                            "google",
-                            "instagram",
-                            "facebook",
-                            "youtube",
-                            "social media",
-                            "online",
-                            "website",
-                            "ad ",
-                            "advert",
-                            "advertisement",
-                            "referral",
-                        ]
-
-                        should_clear = False
-                        if lower_ref in invalid_referral_values:
-                            should_clear = True
-                        else:
-                            has_clinician = any(kw in lower_ref for kw in clinician_keywords)
-                            has_channel = any(kw in lower_ref for kw in referral_channel_keywords)
-                            # If it clearly looks like a clinician description and DOES NOT look like a referral channel,
-                            # treat it as mis-extraction and clear so we still ask "How did you come to know about us?"
-                            if has_clinician and not has_channel:
-                                should_clear = True
-
-                        if should_clear:
-                            print("[formatter] Clearing incorrectly extracted referral source")
-                            self.form["Referral"]["Source"] = ""
+                # Referral/source is retired from customer intake, even for the
+                # legacy fallback path or a stale model-shaped form.
+                self.form.pop("Referral", None)
 
                 filled_count = sum(
                     1
@@ -862,33 +804,21 @@ Analyze their message to identify:
 EXAMPLES OF CORRECTIONS TO DETECT:
 
 Explicit corrections:
-- "Sorry I had mentioned my referral source as Instagram. I actually had known about you guys via YouTube."
-  → section_name: "Referral", field_name: "Source", old_value: "Instagram", new_value: "YouTube"
-  
 - "I said the duration was 2 weeks, but it's actually 2 months"
   → section_name: "Present Complaint", field_name: "Duration of the Issue", old_value: "2 weeks", new_value: "2 months"
   
 - "Actually, the pain level is 6, not 8"
   → section_name: "Pain Assessment", field_name: "Severity (1-10)", old_value: "8", new_value: "6"
 
-- "I mentioned Instagram but it should be YouTube"
-  → section_name: "Referral", field_name: "Source", old_value: "Instagram", new_value: "YouTube"
-
 Direct statements (also corrections in summary mode):
-- "i got to know you via Instagram" or "I got to know you via Instagram"
-  → section_name: "Referral", field_name: "Source", old_value: (current value from form), new_value: "Instagram"
-  
-- "I was referred by my friend"
-  → section_name: "Referral", field_name: "Source", old_value: (current value from form), new_value: "Friend"
-  
 - "The pain is 7 out of 10"
   → section_name: "Pain Assessment", field_name: "Severity (1-10)", old_value: (current value from form), new_value: "7"
 
 IMPORTANT:
 - In summary mode, ANY direct statement that provides information for a field that already has a value should be treated as a correction
 - Look for phrases like "I had mentioned", "I said", "actually", "sorry", "not X, it's Y" (explicit corrections)
-- ALSO look for direct statements like "i got to know you via X", "I was referred by Y", "the pain is Z" (implicit corrections)
-- Match field names mentioned (like "referral source", "duration", "pain level") to actual field names in the form
+- ALSO look for direct statements like "the pain is Z" (implicit corrections)
+- Match mentioned field names (like "duration" or "pain level") to actual field names in the form
 - If the user provides information that matches a field in the form, it IS a correction - set is_correction to true
 
 Respond with a JSON object:
@@ -975,11 +905,10 @@ everyday language. Follow this style:
 
 2. After the narrative, add a small **Key points** section with 3–7 bullet points
    that highlight the most important facts (problem, duration, severity,
-   key history, goals, and referral source).
+   key history, lifestyle, and goals).
 
 3. Avoid very technical language. Prefer phrases like:
    - "no known health conditions" instead of long lists of negatives
-   - "doesn't drink or smoke" instead of "non-smoker, non-drinker"
 
 4. NEVER leave raw field names or placeholders in square brackets like "[Duration of the Issue]".
    If a value is present in the form, use the actual value in natural language.
@@ -1523,8 +1452,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                 # Goal: Allow multiple questions within current section, but remove questions from other sections
                 pain_assessment_indicators = ["scale of 1 to 10", "rate your pain", "aggravating factors", "relieving factors", "pain worse", "pain better"]
                 treatment_goals_indicators = ["goals with treatment", "next 3 months", "long-term goal", "ultimate goal"]
-                lifestyle_indicators = ["smoke or drink", "alcohol regularly", "exercise", "physically active", "demanding job"]
-                referral_indicators = ["come to know about us", "referral", "Google", "Instagram", "Facebook", "YouTube"]
+                lifestyle_indicators = ["exercise", "physically active", "demanding job", "occupation", "your job"]
                 diagnostic_indicators = ["mri", "x-ray", "ct scan", "blood reports", "diagnostic reports", "reports related", "upload", "document"]
                 
                 # Check if History & Diagnostics is complete - if so, always remove report/upload questions from subsequent sections
@@ -1674,7 +1602,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                         if "Now about your overall health, lifestyle, and any reports:" in response:
                             response = response.split("Now about your overall health, lifestyle, and any reports:")[0].strip()
                         # Also remove any health/lifestyle/reports questions
-                        health_keywords = ["health conditions", "diabetes", "smoke or drink", "exercise", "MRI", "X-ray", "CT scan", "blood reports"]
+                        health_keywords = ["health conditions", "diabetes", "exercise", "occupation", "your job", "MRI", "X-ray", "CT scan", "blood reports"]
                         for keyword in health_keywords:
                             if keyword.lower() in response.lower():
                                 idx = response.lower().find(keyword.lower())
@@ -1683,53 +1611,24 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                                     break
                         print(f"[talk_to_user] Removed History & Diagnostics questions from Previous Consultations response")
                 
-                # Specific handling for multi-section predefined question idx=2
-                if self.idx == 2:  # "Goals & Referral" covers multiple sections
-                    if self.current_section == "Treatment Goals":
-                        # Remove referral questions if present
-                        if "How did you come to know about us?" in response:
-                            response = response.split("How did you come to know about us?")[0].strip()
-                        # Also remove report/upload questions if History & Diagnostics is complete
-                        history_diag_complete = self.validator("History & Diagnostics")
-                        if history_diag_complete:
-                            diagnostic_phrases = ["mri", "x-ray", "ct scan", "blood reports", "diagnostic reports", "reports related", "upload", "document"]
-                            for phrase in diagnostic_phrases:
-                                if phrase in response.lower():
-                                    idx = response.lower().find(phrase)
-                                    if idx > 0:
-                                        before = response[:idx].rstrip()
-                                        if "\n\n" in before:
-                                            response = before.rsplit("\n\n", 1)[0].strip()
-                                        elif "\n" in before:
-                                            response = before.rsplit("\n", 1)[0].strip()
-                                        else:
-                                            response = before.strip()
-                                        break
-                            print(f"[talk_to_user] Filtered out report/upload questions from Treatment Goals response (History & Diagnostics already complete)")
-                        print(f"[talk_to_user] Filtered out Referral questions from Treatment Goals response")
-                    elif self.current_section == "Referral":
-                        # Remove treatment goals questions if present
-                        if "What are your goals with treatment?" in response:
-                            if "How did you come to know about us?" in response:
-                                response = "How did you come to know about us? (Friend/family referral, Google, Instagram, Facebook, YouTube, etc.)"
-                        # Also remove report/upload questions if History & Diagnostics is complete
-                        history_diag_complete = self.validator("History & Diagnostics")
-                        if history_diag_complete:
-                            diagnostic_phrases = ["mri", "x-ray", "ct scan", "blood reports", "diagnostic reports", "reports related", "upload", "document"]
-                            for phrase in diagnostic_phrases:
-                                if phrase in response.lower():
-                                    idx = response.lower().find(phrase)
-                                    if idx > 0:
-                                        before = response[:idx].rstrip()
-                                        if "\n\n" in before:
-                                            response = before.rsplit("\n\n", 1)[0].strip()
-                                        elif "\n" in before:
-                                            response = before.rsplit("\n", 1)[0].strip()
-                                        else:
-                                            response = before.strip()
-                                        break
-                            print(f"[talk_to_user] Filtered out report/upload questions from Referral response (History & Diagnostics already complete)")
-                        print(f"[talk_to_user] Filtered out Treatment Goals questions from Referral response")
+                # Remove report/upload questions once diagnostics are complete.
+                if self.idx == 2 and self.current_section == "Treatment Goals":
+                    history_diag_complete = self.validator("History & Diagnostics")
+                    if history_diag_complete:
+                        diagnostic_phrases = ["mri", "x-ray", "ct scan", "blood reports", "diagnostic reports", "reports related", "upload", "document"]
+                        for phrase in diagnostic_phrases:
+                            if phrase in response.lower():
+                                idx = response.lower().find(phrase)
+                                if idx > 0:
+                                    before = response[:idx].rstrip()
+                                    if "\n\n" in before:
+                                        response = before.rsplit("\n\n", 1)[0].strip()
+                                    elif "\n" in before:
+                                        response = before.rsplit("\n", 1)[0].strip()
+                                    else:
+                                        response = before.strip()
+                                    break
+                        print(f"[talk_to_user] Filtered report/upload questions from Treatment Goals response")
 
             # Store last question
             self.conversation_state["last_question"] = response
@@ -1869,19 +1768,9 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                         question = "Now about your overall health, lifestyle, and any reports:\n" + question
                     print(f"[make_template] Extracted History & Diagnostics-specific question from multi-section predefined question (idx=1 flow)")
             
-            # Special handling: idx=2 covers "Treatment Goals" and "Referral"
-            elif self.idx == 2:
-                if self.current_section == "Treatment Goals":
-                    if "How did you come to know about us?" in question:
-                        question = question.split("How did you come to know about us?")[0].strip()
-                    print(f"[make_template] Extracted Treatment Goals-specific question from multi-section predefined question")
-                elif self.current_section == "Referral":
-                    if "How did you come to know about us?" in question:
-                        referral_start = question.find("How did you come to know about us?")
-                        question = question[referral_start:].strip()
-                    else:
-                        question = "How did you come to know about us? (Friend/family referral, Google, Instagram, Facebook, YouTube, etc.)"
-                    print(f"[make_template] Extracted Referral-specific question from multi-section predefined question")
+            # Treatment Goals is the final predefined clinical-question group.
+            elif self.idx == 2 and self.current_section == "Treatment Goals":
+                print(f"[make_template] Extracted Treatment Goals-specific question from predefined question")
 
             # Check if the section is completely empty
             section_data = self.form.get(self.current_section, {})
@@ -1974,7 +1863,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                             skip_until_health = True
                             for line in lines:
                                 line_lower = line.lower()
-                                if any(phrase in line_lower for phrase in ["overall health", "lifestyle", "reports", "health conditions", "smoke or drink", "exercise", "mri", "x-ray"]):
+                                if any(phrase in line_lower for phrase in ["overall health", "lifestyle", "reports", "health conditions", "exercise", "occupation", "your job", "mri", "x-ray"]):
                                     skip_until_health = False
                                 if not skip_until_health:
                                     filtered_lines.append(line)
@@ -2024,16 +1913,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                 # Check if History & Diagnostics is complete - if so, don't ask about reports
                 history_diag_complete = self.validator("History & Diagnostics")
                 if history_diag_complete:
-                    section_restrictions = "\n\nIMPORTANT: You can ask multiple questions about Treatment Goals. However, do NOT repeat questions about referral source - that will be asked in a separate section. Also, do NOT ask about reports, scans, MRI, X-ray, or document uploads - those were already covered in the 'History & Diagnostics' section."
-                else:
-                    section_restrictions = "\n\nIMPORTANT: You can ask multiple questions about Treatment Goals. However, do NOT repeat questions about referral source - that will be asked in a separate section."
-            elif self.current_section == "Referral":
-                # Check if History & Diagnostics is complete - if so, don't ask about reports
-                history_diag_complete = self.validator("History & Diagnostics")
-                if history_diag_complete:
-                    section_restrictions = "\n\nIMPORTANT: You can ask questions about Referral Source. However, do NOT repeat questions about treatment goals - those were already covered in previous sections. Also, do NOT ask about reports, scans, MRI, X-ray, or document uploads - those were already covered in the 'History & Diagnostics' section."
-                else:
-                    section_restrictions = "\n\nIMPORTANT: You can ask questions about Referral Source. However, do NOT repeat questions about treatment goals - those were already covered in previous sections."
+                    section_restrictions = "\n\nIMPORTANT: You can ask multiple questions about Treatment Goals. Do NOT ask about reports, scans, MRI, X-ray, or document uploads - those were already covered in the 'History & Diagnostics' section."
             elif self.current_section == "Pain Assessment":
                 # Check if pain assessment fields are already filled (from initial comprehensive complaint)
                 pain_section = self.form.get("Pain Assessment", {})
@@ -2080,7 +1960,6 @@ Return ONLY the summary text (narrative + key points + confirmation question).
             3. Previous Consultations (if applicable)
             4. History & Diagnostics (Systemic Illness, Lifestyle, Reports)
             5. Treatment Goals (Short-term, Long-term, Expectations)
-            6. Referral Source
             
             EXAMPLE of a comprehensive question that covers multiple sections:
             "To help me understand your situation better, could you tell me:
@@ -2089,7 +1968,8 @@ Return ONLY the summary text (narrative + key points + confirmation question).
             • On a scale of 1 to 10, how severe is the pain?
             • What makes it worse or better?
             • Have you consulted any doctor or physiotherapist for this before, and if so, what did they say?
-            • Do you have any other health conditions, past surgeries, or do you smoke or drink?
+            • Do you have any other health conditions or past surgeries?
+            • What is your work or usual occupation, and what activity or exercise do you usually do?
             • Do you have any MRI, X-ray, CT scan, or blood reports related to this issue?"
             
             This single question can fill fields from Present Complaint, Pain Assessment, Previous Consultations, AND History & Diagnostics!
@@ -2158,7 +2038,8 @@ Return ONLY the summary text (narrative + key points + confirmation question).
             • On a scale of 1 to 10, how severe is the pain?
             • What makes it worse or better?
             • Have you consulted any doctor or physiotherapist for this before?
-            • Do you have any other health conditions, past surgeries, or do you smoke or drink?
+            • Do you have any other health conditions or past surgeries?
+            • What is your work or usual occupation, and what activity or exercise do you usually do?
             
             WRONG FORMAT (DO NOT USE):
             Thank you for that information. Based on what you've told me, could you tell me more about the main problem you're experiencing, how long it's been bothering you, and whether it came on suddenly or gradually?
@@ -2255,8 +2136,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                - "Previous Consultations": Previous Diagnosis, Current Status of Issue
                - "History & Diagnostics": Systemic Illness and Surgical History, Current Lifestyle, Reports
                - "Treatment Goals": Short-Term Goals, Long-Term Goals, Specific Expectations
-               - "Referral": Source
-            4. If the patient mentions pain location, severity, duration, onset, etc., extract these into the appropriate fields.
+            4. For Current Lifestyle, extract only work/occupation and activity/exercise.
             5. If the patient provides comprehensive information covering multiple sections, extract data for ALL those sections.
             6. Preserve the exact structure of the form template.
             7. Only update fields with actual information from the patient's response - do not fill with placeholders.
@@ -2477,8 +2357,7 @@ Return ONLY the summary text (narrative + key points + confirmation question).
                             # If formatting also failed, ask user what they want to change
                             clarification_msg = (
                                 "Sure, what change would you like to make? "
-                                "You can say something like 'Change the duration to 3 days' or "
-                                "'Update the referral source to Google'."
+                                "You can say something like 'Change the duration to 3 days'."
                             )
                             print("[main_processor] Summary mode (LLM): generic change intent, asking for specific change details")
                             self.history.append({"role": "agent", "message": clarification_msg})
@@ -2644,10 +2523,10 @@ Respond ONLY with a JSON object:
                             # Convert field names to more readable format
                             friendly_name = field.replace("_", " ").title()
                             # Special handling for common fields
-                            if "smoke" in field.lower() or "drink" in field.lower() or "alcohol" in field.lower():
-                                friendly_name = "smoking and alcohol habits"
-                            elif "exercise" in field.lower() or "lifestyle" in field.lower():
-                                friendly_name = "exercise and lifestyle"
+                            if "exercise" in field.lower() or "activity" in field.lower():
+                                friendly_name = "activity and exercise"
+                            elif "work" in field.lower() or "occupation" in field.lower():
+                                friendly_name = "work or occupation"
                             elif "systemic" in field.lower() or "illness" in field.lower():
                                 friendly_name = "health conditions"
                             elif "reports" in field.lower():
@@ -2843,10 +2722,8 @@ Respond ONLY with a JSON object:
                         history_diag_complete = self.validator("History & Diagnostics")
                         all_sections_for_question_complete = pain_assessment_complete and history_diag_complete
                     elif self.idx == 2:
-                        # idx=2 covers "Treatment Goals" and "Referral"
-                        treatment_goals_complete = self.validator("Treatment Goals")
-                        referral_complete = self.validator("Referral")
-                        all_sections_for_question_complete = treatment_goals_complete and referral_complete
+                        # idx=2 covers Treatment Goals only.
+                        all_sections_for_question_complete = self.validator("Treatment Goals")
                     else:
                         # For other predefined questions, one section = one question
                         all_sections_for_question_complete = True
@@ -2881,23 +2758,8 @@ Respond ONLY with a JSON object:
                             self.all_ops()
                             print(f"[main_processor] Pain Assessment and History & Diagnostics complete, moving to next predefined question")
                     elif self.idx == 2:
-                        # idx=2 covers "Treatment Goals" and "Referral"
-                        treatment_goals_complete = self.validator("Treatment Goals")
-                        referral_complete = self.validator("Referral")
-                        if treatment_goals_complete and not referral_complete:
-                            # Treatment Goals is done, but Referral is not
-                            # Set current_section to Referral explicitly (don't call all_ops)
-                            if "Referral" in self.form_sections:
-                                self.current_section = "Referral"
-                                print(f"[main_processor] Treatment Goals complete, explicitly setting current_section to Referral")
-                        elif referral_complete and not treatment_goals_complete:
-                            # Referral is done, but Treatment Goals is not
-                            # Set current_section to Treatment Goals explicitly (don't call all_ops)
-                            if "Treatment Goals" in self.form_sections:
-                                self.current_section = "Treatment Goals"
-                                print(f"[main_processor] Referral complete, explicitly setting current_section to Treatment Goals")
-                        elif all_sections_for_question_complete:
-                            # Both are complete, move to next section
+                        # idx=2 covers Treatment Goals only.
+                        if all_sections_for_question_complete:
                             self.all_ops()
                     else:
                         # Single-section question, just move to next section

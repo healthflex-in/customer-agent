@@ -39,6 +39,7 @@ Thumbs.db
 
 # Audio / media (runtime files)
 received_audio/
+audio_debug/
 tts_cache/
 audio_files/
 *.wav

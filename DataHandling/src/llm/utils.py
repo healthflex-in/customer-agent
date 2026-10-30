@@ -59,9 +59,8 @@ def init_llm(api_key):
 
 def init_reasoning_llm(api_key):
     """
-    Initialize the reasoning-grade LLM (gemini-2.5-flash) used exclusively for
-    form extraction. Flash understands context, intent, and implicit answers far
-    better than flash-lite — critical for accurate form filling from natural speech.
+    Initialize the reasoning-grade Gemini model used exclusively for form extraction.
+    The model is selected through the validated model registry.
     """
     model_name = MODEL_REGISTRY.reasoning
     return GoogleGenAI(model=model_name, api_key=api_key)

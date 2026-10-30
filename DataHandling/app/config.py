@@ -90,6 +90,16 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _percent_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not 0 <= value <= 100:
+        raise ValueError(f"{name} must be between 0 and 100")
+    return value
+
+
 def _boolean_env(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -102,24 +112,35 @@ def _boolean_env(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
-# Disabled by default. QA may retain original audio + paired STT output inside
-# the Docker container to investigate transcription problems.
+# Disabled by default. When enabled, original audio + paired STT output are
+# kept for at least DEBUG_AUDIO_RETENTION_HOURS (48h = 2 days) to investigate
+# transcription problems. Deployments mount DEBUG_AUDIO_DIR as a volume so
+# captures survive container restarts.
 DEBUG_AUDIO_CAPTURE: bool = _boolean_env("DEBUG_AUDIO_CAPTURE", False)
 DEBUG_AUDIO_DIR: str = os.getenv(
     "DEBUG_AUDIO_DIR", "/tmp/customer-agent-audio-debug"
 )
 DEBUG_AUDIO_RETENTION_HOURS: int = _positive_int_env(
-    "DEBUG_AUDIO_RETENTION_HOURS", 24
+    "DEBUG_AUDIO_RETENTION_HOURS", 48
 )
 DEBUG_AUDIO_MAX_TOTAL_MB: int = _positive_int_env(
-    "DEBUG_AUDIO_MAX_TOTAL_MB", 250
+    "DEBUG_AUDIO_MAX_TOTAL_MB", 2048
 )
 DEBUG_AUDIO_MAX_TOTAL_BYTES: int = DEBUG_AUDIO_MAX_TOTAL_MB * 1024 * 1024
 
 
 CHAT_HISTORY_RETENTION_DAYS: int = _positive_int_env(
-    "CHAT_HISTORY_RETENTION_DAYS", 10
+    "CHAT_HISTORY_RETENTION_DAYS", 30
 )
+
+# A patient who asks to end the interview may only do so once every mandatory
+# question is answered and at least this much of the form is done, measured the
+# same way as the progress bar.
+COMPLETION_PERCENTAGE: float = _percent_env("COMPLETION_PERCENTAGE", 50)
+
+# Per-attempt interview counters kept in process memory across a page refresh.
+ATTEMPT_MEMORY_TTL_SECONDS: int = _positive_int_env("ATTEMPT_MEMORY_TTL_SECONDS", 86_400)
+ATTEMPT_MEMORY_MAX_ENTRIES: int = _positive_int_env("ATTEMPT_MEMORY_MAX_ENTRIES", 5_000)
 
 ALLOWED_ATTACHMENT_TYPES: dict[str, str] = {
     "mri": "MRI Scan",

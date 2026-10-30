@@ -11,6 +11,11 @@ def route_by_phase(state: InterviewState) -> str:
     return state["phase"]
 
 
+def after_first_turn(state: InterviewState) -> str:
+    """A start confirmation gets the opening question; a real reply is extracted."""
+    return END if state.get("response_text") else "extract_form_data"
+
+
 def after_extract(state: InterviewState) -> str:
     """Route signals computed by the combined extraction/intent node."""
     # The patient asked what the current intake question means. The extract

@@ -11,6 +11,29 @@ from app.observability.privacy import error_type
 from src.graph.pure_functions.form_validation import extract_json_from_response
 
 
+# Both questions take the same answers: "no" approves the summary, anything
+# else names what to change.
+SUMMARY_QUESTION = (
+    "Please review the summary above. If it is accurate, reply looks good. "
+    "If anything needs updating, tell me what to change."
+)
+SUMMARY_FOLLOW_UP = (
+    "Please review the updated summary. If it is accurate, reply looks good. "
+    "If anything else needs updating, tell me what to change."
+)
+_APPROVALS = {
+    "no", "nope", "nah", "no changes", "no change", "nothing", "nothing to change",
+    "confirm", "confirmed", "correct", "all correct", "everything is correct",
+    "looks good", "all good", "done", "ok", "okay", "ok done", "okay done",
+    "no thanks", "no thank you", "that s all", "thats all",
+}
+_CHANGE_WITHOUT_DETAIL = {
+    "yes", "yeah", "yep", "yes please", "i want to change something",
+    "i want to make changes", "i would like to make changes",
+    "i would like to make any changes", "something is wrong",
+}
+
+
 _REPORT_UPLOAD_DEFERRAL = re.compile(
     r"^(?:i\s+)?(?:will|shall|can)\s+(?:share|upload|attach|send)"
     r"(?:\s+(?:it|them|the\s+reports?))?\s+later\b|"
@@ -62,13 +85,16 @@ def generate_interview_summary(
     return _fallback_summary(form)
 
 
-def _fallback_summary(form: dict) -> str:
+def _fallback_summary(
+    form: dict, *, ask_to_confirm: bool = True,
+    heading: str = "Here's a summary of the information you've provided:",
+) -> str:
     from src.graph.pure_functions.additional_complaint import (
         normalize_additional_complaints,
     )
 
     form = normalize_additional_complaints(form)
-    parts = ["Here's a summary of the information you've provided:\n"]
+    parts = [f"{heading}\n"]
     for section, fields in form.items():
         if isinstance(fields, dict):
             non_empty = {k: v for k, v in fields.items() if v and str(v).strip()}
@@ -76,8 +102,22 @@ def _fallback_summary(form: dict) -> str:
                 parts.append(f"\n{section}:")
                 for k, v in non_empty.items():
                     parts.append(f"- {k}: {v}")
-    parts.append("\nIs this information correct, or would you like to make any changes?")
+    if ask_to_confirm:
+        parts.append(f"\n{SUMMARY_QUESTION}")
     return "\n".join(parts)
+
+
+def with_updated_summary(message: str, form: dict) -> str:
+    """Show the changed summary before the follow-up question, so the patient sees the result.
+
+    A message that does not end in the follow-up question is returned as it is.
+    """
+
+    if SUMMARY_FOLLOW_UP not in message:
+        return message
+    lead = message.replace(SUMMARY_FOLLOW_UP, "").strip()
+    body = _fallback_summary(form, ask_to_confirm=False, heading="Here's your updated summary:").strip()
+    return f"{lead}\n\n{body}\n\n{SUMMARY_FOLLOW_UP}"
 
 
 def classify_summary_response(
@@ -127,11 +167,7 @@ def classify_summary_response(
         return {"intent": "has_reports", "wants_upload": False,
                 "upload_claimed": True, "correction_text": None}
 
-    if normalized in {
-        "yes", "correct", "looks good", "that is right", "thats right",
-        "done", "ok done", "okay done", "all done", "finished",
-        "yes done", "yes correct",
-    }:
+    if normalized in _APPROVALS:
         return {
             "intent": "confirm",
             "correction_text": None,
@@ -151,18 +187,6 @@ def classify_summary_response(
             "wants_upload": None,
         }
 
-    # Explicit habit corrections are schema-aware updates. Alcohol/smoking are
-    # components inside Current Lifestyle, not new complaints or questions.
-    if re.search(r"\b(?:update|change|correct|actually|but)\b", normalized) and re.search(
-        r"\b(?:smoke|smoking|drink|drinks|drinking|alcohol)\b", normalized
-    ):
-        return {
-            "intent": "request_change",
-            "correction_text": user_input.strip(),
-            "has_reports": None,
-            "wants_upload": None,
-        }
-
     from src.graph.pure_functions.additional_complaint import is_explicit_symptom_addition
     if is_explicit_symptom_addition(user_input):
         from src.graph.pure_functions.additional_complaint import (
@@ -172,30 +196,7 @@ def classify_summary_response(
                 "addition_text": concise_additional_complaint(user_input),
                 "has_reports": None, "wants_upload": None}
 
-    # A direct channel answer at summary time commonly follows a referral
-    # question that was displayed just before a reconnect/race. Treat it as a
-    # concrete field update, never as an ambiguous generic correction.
-    from src.graph.pure_functions.referral import normalize_referral_source
-
-    if normalize_referral_source(user_input):
-        return {
-            "intent": "request_change",
-            "correction_text": user_input.strip(),
-            "has_reports": None,
-            "wants_upload": None,
-        }
-    vague_change_responses = {
-        "no", "nope", "incorrect", "wrong", "not correct", "not right",
-        "this is incorrect", "this is wrong", "this is not correct",
-        "that is incorrect", "that is wrong", "that is not correct",
-        "it is incorrect", "it is wrong", "it is not correct",
-        "i want to make changes", "i want some changes", "i want a change",
-        "want to make changes", "want some changes", "make changes",
-        "i would like to make changes", "i would like to make some changes",
-        "i would like to make any changes", "i need to change something",
-        "change something",
-    }
-    if normalized in vague_change_responses:
+    if normalized in _CHANGE_WITHOUT_DETAIL:
         return {
             "intent": "request_change",
             "correction_text": None,
@@ -204,7 +205,7 @@ def classify_summary_response(
         }
 
     prompt = f"""You are assisting with a medical intake interview. The patient has just been shown
-a summary and asked: "Is this information correct, or would you like to make any changes?"
+a summary and asked: "{SUMMARY_QUESTION}"
 
 SUMMARY SHOWN TO THE PATIENT:
 {summary_text}
@@ -213,15 +214,14 @@ The patient responded: "{user_input}"
 
 Classify their intent. Choose EXACTLY ONE intent from below:
 
-- "confirm": patient says YES — the summary is correct (e.g. "yes", "correct", "looks good", "that's right", "ok", "sure", "yep")
+- "confirm": patient has nothing to change — the summary is correct (e.g. "no", "nothing", "it's all correct", "looks good", "no changes needed")
 - "new_complaint": patient reveals an ADDITIONAL specific health issue, pain, or symptom that was NOT in the summary
   Use when: patient says "i have neck pain", "actually my knee hurts", "i forgot to mention my back", "i have a complaint", "wait i have pain" etc.
   This means they want to ADD new medical information, not correct existing data.
   Set addition_text to ONLY the concise clinical complaint (for example
   "tingling in the left fingers"), never the patient's instruction words.
 - "request_change": patient wants to CORRECT or UPDATE something already stated in the summary
-  CRITICAL: "no" in response to "Is this correct?" → request_change (no, it is NOT correct)
-  Also: "not right", "wrong", "incorrect", "change X to Y", "actually it was X"
+  ("yes", "something is wrong", "change X to Y", "actually it was X")
   Set correction_text to null when the patient only says that something is wrong or asks to make
   changes without identifying the information and its corrected value. Otherwise set it to the
   patient's exact correction request.

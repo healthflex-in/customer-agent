@@ -18,7 +18,7 @@ class ChatHistoryTests(unittest.TestCase):
     def setUp(self):
         self.created_at = datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc)
 
-    def test_message_has_investigation_context_and_ten_day_expiry(self):
+    def test_message_has_investigation_context_and_thirty_day_expiry(self):
         user_id = "699c2877476d59d4a3a8cc12"
         document = build_chat_message_document(
             user_id=user_id,
@@ -37,7 +37,7 @@ class ChatHistoryTests(unittest.TestCase):
             transcription_id="TRN-test",
             audio_capture_id="capture-test",
             audio_filename="capture-test.webm",
-            retention_days=10,
+            retention_days=30,
             created_at=self.created_at,
         )
 
@@ -52,7 +52,7 @@ class ChatHistoryTests(unittest.TestCase):
         self.assertEqual(document["audioFilename"], "capture-test.webm")
         self.assertEqual(document["createdAt"], self.created_at)
         self.assertEqual(
-            document["expiresAt"], self.created_at + timedelta(days=10)
+            document["expiresAt"], self.created_at + timedelta(days=30)
         )
 
     def test_ttl_and_lookup_indexes_are_created(self):

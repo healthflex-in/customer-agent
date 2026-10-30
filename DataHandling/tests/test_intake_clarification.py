@@ -25,6 +25,17 @@ except ModuleNotFoundError as exc:
     from src.graph.nodes.extract import make_extract_node
 
 
+def mapping_llm(answers):
+    import json
+
+    payload = json.dumps({
+        "visit_context": "specific_complaint",
+        "answers": answers,
+        "reports": {"has_reports": None, "wants_upload": None},
+    })
+    return lambda _prompt: payload
+
+
 class IntakeClarificationTests(unittest.TestCase):
     def test_return_to_sport_question_gets_safe_answer(self):
         for text in (
@@ -188,7 +199,6 @@ class IntakeClarificationTests(unittest.TestCase):
         for text in (
             "there is no additional complaint",
             "I don't have any additional complaint",
-            "lets skip this",
             "no need enough bye",
             "no need of additional complaint",
             "no need of additional compamnt",
@@ -261,34 +271,27 @@ class IntakeClarificationTests(unittest.TestCase):
             "and I work out once a week."
         )
 
-        reasoned_form = state["form"].copy()
-        reasoned_form["History & Diagnostics"] = dict(
-            reasoned_form["History & Diagnostics"]
-        )
-        reasoned_form["History & Diagnostics"][
-            "Systemic Illness and Surgical History"
-        ] = "Jaundice last year"
-        reasoned_form["History & Diagnostics"]["Current Lifestyle"] = (
-            "Works out once a week"
-        )
-
-        def reasoning_llm(_prompt):
-            import json
-            return json.dumps(reasoned_form)
-
-        def llm_complete(prompt):
-            if "diagnostic reports" in prompt:
-                return '{"has_reports": null, "wants_upload": null}'
-            return "THINKING: surgery details remain unclear\nQUESTION: Tell me more about the surgery."
+        reasoning_llm = mapping_llm([
+            {
+                "field_id": "History & Diagnostics.Systemic Illness and Surgical History",
+                "status": "answered",
+                "value": "Jaundice last year",
+            },
+            {
+                "field_id": "History & Diagnostics.Current Lifestyle — Activity or Exercise",
+                "status": "answered",
+                "value": "Works out once a week",
+            },
+        ])
 
         with patch("src.graph.nodes.extract.get_stream_writer", return_value=lambda _event: None):
-            result = make_extract_node(llm_complete, reasoning_llm=reasoning_llm)(state)
+            result = make_extract_node(lambda _prompt: "{}", reasoning_llm=reasoning_llm)(state)
 
         self.assertTrue(result["direct_response_handled"])
         self.assertIn("what procedure", result["response_text"])
-        lifestyle = result["form"]["History & Diagnostics"]["Current Lifestyle"]
-        self.assertIn("Activity/exercise:", lifestyle)
-        self.assertIn("work out once a week", lifestyle.lower())
+        diagnostics = result["form"]["History & Diagnostics"]
+        self.assertEqual(diagnostics["Systemic Illness and Surgical History"], "Jaundice last year")
+        self.assertEqual(diagnostics["Current Lifestyle"], "Activity/exercise: Works out once a week")
         self.assertEqual(result["history"][-1]["role"], "agent")
         self.assertEqual(result["history"][-1]["message"], result["response_text"])
 
@@ -304,20 +307,13 @@ class IntakeClarificationTests(unittest.TestCase):
                 "message": "Where is the pain and how severe is it from 0 to 10?",
             }],
         )
-        reasoned_form = state["form"].copy()
-        reasoned_form["Pain Assessment"] = dict(reasoned_form["Pain Assessment"])
-        reasoned_form["Pain Assessment"]["Primary Location of Pain"] = "Knee"
-        reasoned_form["Pain Assessment"]["Severity (1-10)"] = "8/10"
-
-        def reasoning_llm(_prompt):
-            import json
-            return json.dumps(reasoned_form)
-
-        def llm_complete(_prompt):
-            return '{"has_reports": null, "wants_upload": null}'
+        reasoning_llm = mapping_llm([
+            {"field_id": "Pain Assessment.Primary Location of Pain", "status": "answered", "value": "Knee"},
+            {"field_id": "Pain Assessment.Severity (1-10)", "status": "answered", "value": "8"},
+        ])
 
         with patch("src.graph.nodes.extract.get_stream_writer", return_value=lambda _event: None):
-            result = make_extract_node(llm_complete, reasoning_llm=reasoning_llm)(state)
+            result = make_extract_node(lambda _prompt: "{}", reasoning_llm=reasoning_llm)(state)
 
         self.assertTrue(result["direct_response_handled"])
         self.assertTrue(result["response_text"].startswith(OUT_OF_FLOW_RESPONSE))

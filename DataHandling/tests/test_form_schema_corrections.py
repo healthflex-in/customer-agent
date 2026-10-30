@@ -2,10 +2,7 @@ import json
 import unittest
 
 from src.graph.nodes.correction import make_apply_correction_node
-from src.graph.pure_functions.form_extraction import (
-    apply_form_correction,
-    detect_form_correction,
-)
+from src.graph.pure_functions.form_extraction import apply_form_correction, detect_form_correction
 from src.graph.pure_functions.form_schema import FormTarget, resolve_form_target
 from src.graph.state import get_fresh_interview_state
 
@@ -25,42 +22,21 @@ class FormSchemaCorrectionTests(unittest.TestCase):
 
     def test_schema_resolves_exact_alias_virtual_and_fuzzy_targets(self):
         cases = (
-            (
-                "Pain Assessment",
-                "pain rating",
-                FormTarget("Pain Assessment", "Severity (1-10)"),
-            ),
-            (
-                "Present Complaint",
-                "how long",
-                FormTarget("Present Complaint", "Duration of the Issue"),
-            ),
-            (
-                "Additional Complaint 1",
-                "pain rating",
-                FormTarget("Additional Complaint 1", "Severity (1-10)"),
-            ),
-            (
-                "Current Lifestyle",
-                "occupation",
-                FormTarget("History & Diagnostics", "Current Lifestyle", "work"),
-            ),
-            (
-                "History & Diagnostics",
-                "alcohol use",
-                FormTarget("History & Diagnostics", "Current Lifestyle", "alcohol"),
-            ),
-            (
-                "Treatment Goals",
-                "Specific Expectations from Treatmnt",
-                FormTarget("Treatment Goals", "Specific Expectations from Treatment"),
-            ),
+            ("Pain Assessment", "pain rating", FormTarget("Pain Assessment", "Severity (1-10)")),
+            ("Present Complaint", "how long", FormTarget("Present Complaint", "Duration of the Issue")),
+            ("Additional Complaint 1", "pain rating", FormTarget("Additional Complaint 1", "Severity (1-10)")),
+            ("Current Lifestyle", "occupation", FormTarget("History & Diagnostics", "Current Lifestyle", "work")),
+            ("History & Diagnostics", "exercise routine", FormTarget("History & Diagnostics", "Current Lifestyle", "activity")),
+            ("Treatment Goals", "Specific Expectations from Treatmnt", FormTarget("Treatment Goals", "Specific Expectations from Treatment")),
         )
         for section, field, expected in cases:
             with self.subTest(section=section, field=field):
-                self.assertEqual(
-                    resolve_form_target(self.form, section, field), expected
-                )
+                self.assertEqual(resolve_form_target(self.form, section, field), expected)
+
+    def test_retired_lifestyle_components_are_not_targets(self):
+        for field in ("smoking", "tobacco", "drinking", "alcohol use"):
+            with self.subTest(field=field):
+                self.assertIsNone(resolve_form_target(self.form, "Current Lifestyle", field))
 
     def test_every_live_form_field_resolves_from_schema_identity(self):
         for section, fields in self.form.items():
@@ -69,22 +45,12 @@ class FormSchemaCorrectionTests(unittest.TestCase):
             for field in fields:
                 with self.subTest(section=section, field=field):
                     self.assertEqual(
-                        resolve_form_target(
-                            self.form,
-                            section.swapcase(),
-                            field.swapcase(),
-                        ),
+                        resolve_form_target(self.form, section.swapcase(), field.swapcase()),
                         FormTarget(section, field),
                     )
 
     def test_unknown_or_invented_target_is_rejected(self):
-        self.assertIsNone(
-            resolve_form_target(
-                self.form,
-                "Imaginary Clinical Section",
-                "Patient Happiness Number",
-            )
-        )
+        self.assertIsNone(resolve_form_target(self.form, "Imaginary Clinical Section", "Patient Happiness Number"))
 
     def test_ambiguous_duplicate_field_is_never_guessed(self):
         self.assertIsNone(resolve_form_target(self.form, "", "Primary Complaint"))
@@ -110,13 +76,11 @@ class FormSchemaCorrectionTests(unittest.TestCase):
         self.assertEqual(updated["Present Complaint"]["Duration of the Issue"], "")
         self.assertEqual(updated["Present Complaint"]["Primary Complaint"], "Knee pain")
 
-    def test_one_free_text_message_can_update_multiple_schema_fields(self):
+    def test_one_message_updates_work_and_goal_while_preserving_unrelated_text(self):
         self.form["History & Diagnostics"]["Current Lifestyle"] = (
-            "Work: Designer; Alcohol: Does not drink alcohol"
+            "Work: Designer; Historical note: preserve exactly"
         )
-        self.form["Treatment Goals"]["Long-Term Goals (after 3 months)"] = (
-            "Walk comfortably"
-        )
+        self.form["Treatment Goals"]["Long-Term Goals (after 3 months)"] = "Walk comfortably"
         model_result = {
             "is_correction": True,
             "confidence": "high",
@@ -124,8 +88,8 @@ class FormSchemaCorrectionTests(unittest.TestCase):
                 {
                     "operation": "update",
                     "section_name": "Current Lifestyle",
-                    "field_name": "Alcohol",
-                    "new_value": "Drinks alcohol occasionally",
+                    "field_name": "Work",
+                    "new_value": "Architect",
                 },
                 {
                     "operation": "update",
@@ -137,25 +101,22 @@ class FormSchemaCorrectionTests(unittest.TestCase):
             "needs_clarification": False,
             "clarification_question": "",
         }
-
         correction = detect_form_correction(
-            "Actually I drink occasionally, and my long-term goal is swimming again",
+            "Actually my occupation is architect, and my long-term goal is swimming again",
             self.form,
             is_summary_mode=True,
             llm_complete=lambda _prompt: json.dumps(model_result),
         )
-        state = {
+        result = make_apply_correction_node(lambda _: "unused")({
             "form": self.form,
             "history": [{"role": "user", "message": "correction"}],
             "correction_data": correction,
             "phase": "summary",
-        }
-        result = make_apply_correction_node(lambda _: "unused")(state)
-
+        })
         self.assertTrue(result["correction_applied"])
-        self.assertIn(
-            "Alcohol: Drinks alcohol",
+        self.assertEqual(
             result["form"]["History & Diagnostics"]["Current Lifestyle"],
+            "Historical note: preserve exactly; Work: Architect",
         )
         self.assertEqual(
             result["form"]["Treatment Goals"]["Long-Term Goals (after 3 months)"],

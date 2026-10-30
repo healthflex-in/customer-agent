@@ -55,6 +55,7 @@ audio_files/
 transcripts/
 tts_cache/
 received_audio/
+audio_debug/
 
 # Database files (will be mounted as volumes)
 db/
