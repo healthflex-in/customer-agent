@@ -41,8 +41,8 @@ except ImportError:
         from llm.utils import load_gemini_key, init_llm, final_form_filling
 
 from src.enums import ENUMS
-from app.ai.models import MODEL_REGISTRY
-from app.observability.ai_usage import gemini_usage, tracked_ai_call
+from app.ai.models import LLM_CONFIG
+from app.observability.ai_usage import tracked_ai_call
 from app.observability.privacy import error_type
 from src.prompts import (
     WELCOME_PROMPT,
@@ -119,8 +119,14 @@ class HealthAgent:
         self.history.append({"role": "agent", "message": self.welcome_prompt})
 
         try:
-            # Initialize LLM
-            self.gemini_api_key = load_gemini_key()
+            # The Gemini key is only required when the interview/reasoning
+            # role is still routed through Gemini (LLM_PROVIDER=google_genai,
+            # the default). Anthropic/Bedrock resolve their own credentials
+            # inside create_llm() — independently of speech-to-text's own
+            # GEMINI_API_KEY (app/audio/stt.py), which LLM_PROVIDER never affects.
+            self.gemini_api_key = (
+                load_gemini_key() if LLM_CONFIG.provider == "google_genai" else None
+            )
             self.llm = init_llm(self.gemini_api_key)
         except Exception as e:
             print(f"LLM initialization failed: {error_type(e)}")
@@ -168,24 +174,36 @@ class HealthAgent:
         return _ensure_string(text)
 
     def llm_complete(self, prompt):
-        """Call LLM with model rotation fallback on transient 503/429 errors."""
+        """Call LLM with model rotation fallback on transient provider errors.
+
+        Provider-agnostic: LLM_CONFIG.provider decides what create_llm()
+        builds on each rotation step, so this loop is unchanged whether
+        LLM_PROVIDER is google_genai, anthropic, or bedrock.
+        """
         import time as _time
-        from llama_index.llms.google_genai import GoogleGenAI as _GoogleGenAI
+        from app.ai.factory import create_llm, telemetry_provider_label, usage_extractor_for
 
         if self.llm is None:
             raise ValueError("LLM not initialized")
 
         # Model rotation: rotate fast under load — shorter delays, more fallbacks
-        _MODEL_ROTATION = MODEL_REGISTRY.rotation
+        _MODEL_ROTATION = LLM_CONFIG.rotation
         _RETRY_DELAYS = [0.5, 1, 3]    # shorter waits: rotate fast under heavy load
 
-        _api_key = getattr(self.llm, "api_key", None) or os.environ.get("GEMINI_API_KEY", "")
+        _provider = LLM_CONFIG.provider
+        _telemetry_provider = telemetry_provider_label(_provider)
+        _usage_extractor = usage_extractor_for(_provider)
+        # Only meaningful on the google_genai path; Anthropic/Bedrock resolve
+        # their own credentials inside create_llm() regardless of this value.
+        _api_key = getattr(self.llm, "api_key", None) or (
+            os.environ.get("GEMINI_API_KEY", "") if _provider == "google_genai" else ""
+        )
 
         for attempt, model_name in enumerate(_MODEL_ROTATION):
             # Switch the active LLM to the current rotation model
             if attempt > 0:
                 try:
-                    rotated_llm = _GoogleGenAI(model=model_name, api_key=_api_key)
+                    rotated_llm = create_llm(model_name, api_key=_api_key)
                     print(f"[llm] Rotating to fallback model: {model_name} (attempt {attempt + 1})")
                 except Exception as _init_err:
                     print(f"[llm] Fallback model {model_name} failed to initialize: {error_type(_init_err)}")
@@ -195,18 +213,21 @@ class HealthAgent:
 
             try:
                 response = tracked_ai_call(
-                    provider="google_genai",
+                    provider=_telemetry_provider,
                     model=model_name,
                     operation="interview_text",
                     call=lambda: rotated_llm.complete(prompt),
-                    usage_extractor=gemini_usage,
+                    usage_extractor=_usage_extractor,
                 )
                 result_text = self.ensure_string(response)
                 return result_text
 
             except Exception as e:
                 err_str = str(e)
-                is_transient = any(code in err_str for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+                is_transient = any(code in err_str for code in (
+                    "503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED",
+                    "overloaded_error", "ThrottlingException", "ServiceUnavailableException",
+                ))
                 next_model = _MODEL_ROTATION[attempt + 1] if attempt + 1 < len(_MODEL_ROTATION) else None
                 # Total budget check: if this is the last model and still failing, raise immediately
                 if attempt >= len(_MODEL_ROTATION) - 1:
@@ -214,7 +235,7 @@ class HealthAgent:
                     raise
                 if is_transient and next_model:
                     delay = _RETRY_DELAYS[attempt] if attempt < len(_RETRY_DELAYS) else 5
-                    print(f"[llm] {model_name} unavailable (503/429) — waiting {delay}s then trying {next_model}")
+                    print(f"[llm] {model_name} unavailable — waiting {delay}s then trying {next_model}")
                     _time.sleep(delay)
                     continue  # loop increments attempt → next model
                 print(f"LLM completion failed (model={model_name}): {error_type(e)}")

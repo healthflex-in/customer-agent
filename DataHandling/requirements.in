@@ -19,6 +19,10 @@ llama-index-core==0.14.24
 llama-index-llms-google-genai==0.11.0
 langgraph==1.2.11
 
+# Anthropic API (LLM_PROVIDER=anthropic). Bedrock (LLM_PROVIDER=bedrock)
+# needs no new package — it reuses boto3 below via the Converse API.
+anthropic>=2,<3
+
 # Audio transcription and decoding
 google-cloud-speech==2.31.1
 pydub==0.25.1
