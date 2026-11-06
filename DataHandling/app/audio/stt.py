@@ -94,15 +94,6 @@ _GEMINI_STT_PROMPT = (
     "Return ONLY the transcription text, nothing else."
 )
 
-def _key_shape() -> dict:
-    """Which key variable is used and its shape, without revealing the key."""
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        value = os.environ.get(name)
-        if value:
-            return {"key_variable": name, "key_length": len(value), "key_starts_aiza": value.startswith("AIza")}
-    return {"key_variable": None}
-
-
 def _detect_mime_type(raw_bytes: bytes) -> str:
     """Detect audio MIME type from magic bytes."""
     if raw_bytes[:4] == b'\x1aE\xdf\xa3':
@@ -122,7 +113,7 @@ def _detect_mime_type(raw_bytes: bytes) -> str:
 def _transcribe_with_gemini(raw_audio_bytes: bytes) -> str:
     """Transcribe audio using the configured Gemini audio model."""
     import time as _time
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("No GEMINI_API_KEY set")
 
@@ -306,7 +297,7 @@ def transcribe_audio_bytes(raw_audio_bytes: bytes) -> str:
     log.info(
         "audio_stt_input", bytes=len(raw_audio_bytes), head=raw_audio_bytes[:12].hex(),
         mime=_detect_mime_type(raw_audio_bytes), audio_model=MODEL_REGISTRY.audio,
-        env_audio_model=os.environ.get("GEMINI_AUDIO_MODEL"), **_key_shape(),
+        env_audio_model=os.environ.get("GEMINI_AUDIO_MODEL"),
     )
     raw_audio_bytes = _pad_with_silence(raw_audio_bytes)
     log.info("audio_stt_after_pad", bytes=len(raw_audio_bytes), mime=_detect_mime_type(raw_audio_bytes))

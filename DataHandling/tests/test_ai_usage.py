@@ -76,20 +76,18 @@ class AIUsageTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(
-            ai_usage.estimate_cost_usd("google_genai", "gemini-2.5-flash", text_usage),
-            2.80,
-        )
-        self.assertAlmostEqual(
-            ai_usage.estimate_cost_usd(
-                "google_genai", "gemini-2.5-flash-lite", text_usage
-            ),
-            0.50,
-        )
-        self.assertAlmostEqual(
             ai_usage.estimate_cost_usd(
                 "google_genai", "gemini-3.5-flash-lite", text_usage
             ),
             2.80,
+        )
+        self.assertAlmostEqual(
+            ai_usage.estimate_cost_usd("anthropic", "claude-haiku-5-5", text_usage),
+            0.60,
+        )
+        self.assertAlmostEqual(
+            ai_usage.estimate_cost_usd("anthropic", "claude-sonnet-5-5", text_usage),
+            12.00,
         )
 
     def test_audio_cost_is_not_guessed_without_a_configured_rate(self):
@@ -103,27 +101,22 @@ class AIUsageTests(unittest.TestCase):
         self.assertAlmostEqual(
             ai_usage.estimate_cost_usd(
                 "google_genai",
-                "gemini-2.5-flash",
-                AIUsage(input_audio_tokens=1_000_000),
-            ),
-            1.00,
-        )
-        self.assertAlmostEqual(
-            ai_usage.estimate_cost_usd(
-                "google_genai",
-                "gemini-2.5-flash-lite",
-                AIUsage(input_audio_tokens=1_000_000),
-            ),
-            0.30,
-        )
-        self.assertAlmostEqual(
-            ai_usage.estimate_cost_usd(
-                "google_genai",
                 "gemini-3.5-flash-lite",
                 AIUsage(input_audio_tokens=1_000_000),
             ),
             0.30,
         )
+
+    def test_retired_gemini_models_are_no_longer_priced(self):
+        """gemini-2.5-flash/-lite were removed from DEFAULT_PRICING as deprecated;
+        confirm they fall back to unpriced rather than a stale rate."""
+        for model in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):
+            with self.subTest(model=model):
+                self.assertIsNone(
+                    ai_usage.estimate_cost_usd(
+                        "google_genai", model, AIUsage(input_text_tokens=1_000_000)
+                    )
+                )
 
     def test_unknown_provider_rate_is_never_guessed(self):
         self.assertIsNone(

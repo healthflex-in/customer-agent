@@ -25,52 +25,61 @@ def _get_chroma_client():
     return None
 
 
-def _answer_with_web_search(user_input: str) -> str:
-    """
-    Use Gemini with Google Search grounding to answer brand questions.
-    This gives real, up-to-date answers (founder name, centers, news, etc.)
-    rather than making things up or deflecting.
-    """
-    import os
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        return ""
-
-    try:
-        from google import genai as _genai
-        from google.genai import types as _types
-
-        client = _genai.Client(api_key=api_key)
-        search_prompt = (
-            f"You are Sage, a warm assistant for Stance Health (https://www.stance.health/), "
-            f"India's first technology-enabled MSK health platform. "
-            f"A patient asked: \"{user_input}\"\n\n"
-            f"Search for information about Stance Health and answer warmly in 2-4 sentences. "
-            f"If you can't find specific information, say you'll connect them with the team."
-        )
-        response = tracked_ai_call(
-            # Grounding has a separate quota/charge, so it remains explicitly
-            # unpriced until the deployment supplies a billing-aware rate.
-            provider="google_genai_grounded",
-            model=MODEL_REGISTRY.search,
-            operation="grounded_brand_search",
-            call=lambda: client.models.generate_content(
-                model=MODEL_REGISTRY.search,
-                contents=search_prompt,
-                config=_types.GenerateContentConfig(
-                    tools=[_types.Tool(google_search=_types.GoogleSearch())],
-                    temperature=0.3,
-                ),
-            ),
-            usage_extractor=gemini_usage,
-        )
-        text = response.text.strip() if response.text else ""
-        if text and len(text) > 20:
-            print(f"[brand_web_search] Answered via Google Search grounding")
-            return text
-    except Exception as e:
-        print(f"[brand_web_search] Failed: {error_type(e)}")
-    return ""
+# Disabled 2026-11-06: confirmed zero callers anywhere in the workspace (not
+# wired into make_extract_node or anything else — _answer_brand_question,
+# using ChromaDB + hardcoded facts, is the active brand-question path below).
+# Hardcodes Gemini with no LLM_PROVIDER check, so it's the one place that
+# would run Gemini unconditionally if ever reconnected — do not re-enable
+# without adding that check first. Kept (not deleted) in case Google Search
+# grounding is wanted again later; see _answer_brand_question's docstring
+# for why it was abandoned (web search hallucinated incorrect founder names).
+#
+# def _answer_with_web_search(user_input: str) -> str:
+#     """
+#     Use Gemini with Google Search grounding to answer brand questions.
+#     This gives real, up-to-date answers (founder name, centers, news, etc.)
+#     rather than making things up or deflecting.
+#     """
+#     import os
+#     api_key = os.environ.get("GEMINI_API_KEY")
+#     if not api_key:
+#         return ""
+#
+#     try:
+#         from google import genai as _genai
+#         from google.genai import types as _types
+#
+#         client = _genai.Client(api_key=api_key)
+#         search_prompt = (
+#             f"You are Sage, a warm assistant for Stance Health (https://www.stance.health/), "
+#             f"India's first technology-enabled MSK health platform. "
+#             f"A patient asked: \"{user_input}\"\n\n"
+#             f"Search for information about Stance Health and answer warmly in 2-4 sentences. "
+#             f"If you can't find specific information, say you'll connect them with the team."
+#         )
+#         response = tracked_ai_call(
+#             # Grounding has a separate quota/charge, so it remains explicitly
+#             # unpriced until the deployment supplies a billing-aware rate.
+#             provider="google_genai_grounded",
+#             model=MODEL_REGISTRY.search,
+#             operation="grounded_brand_search",
+#             call=lambda: client.models.generate_content(
+#                 model=MODEL_REGISTRY.search,
+#                 contents=search_prompt,
+#                 config=_types.GenerateContentConfig(
+#                     tools=[_types.Tool(google_search=_types.GoogleSearch())],
+#                     temperature=0.3,
+#                 ),
+#             ),
+#             usage_extractor=gemini_usage,
+#         )
+#         text = response.text.strip() if response.text else ""
+#         if text and len(text) > 20:
+#             print(f"[brand_web_search] Answered via Google Search grounding")
+#             return text
+#     except Exception as e:
+#         print(f"[brand_web_search] Failed: {error_type(e)}")
+#     return ""
 
 
 def _answer_brand_question(user_input: str, llm_complete) -> str:
