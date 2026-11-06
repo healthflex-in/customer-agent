@@ -55,22 +55,6 @@ class PriceRate:
 # Deployment can replace/extend these entries via AI_PRICING_JSON.
 DEFAULT_PRICING_VERSION = "google-standard-2026-10-18"
 DEFAULT_PRICING: dict[str, PriceRate] = {
-    # Text $0.30, audio $1.00, output $2.50, cached text $0.03, cached audio $0.10.
-    "google_genai/gemini-2.5-flash": PriceRate(
-        input_text_per_million=0.30,
-        input_audio_per_million=1.00,
-        output_per_million=2.50,
-        cached_text_per_million=0.03,
-        cached_audio_per_million=0.10,
-    ),
-    # Text $0.10, audio $0.30, output $0.40, cached text $0.01, cached audio $0.03.
-    "google_genai/gemini-2.5-flash-lite": PriceRate(
-        input_text_per_million=0.10,
-        input_audio_per_million=0.30,
-        output_per_million=0.40,
-        cached_text_per_million=0.01,
-        cached_audio_per_million=0.03,
-    ),
     # Text and audio share one input rate, $0.30. Output $2.50. Cache $0.03.
     "google_genai/gemini-3.5-flash-lite": PriceRate(
         input_text_per_million=0.30,
@@ -78,6 +62,40 @@ DEFAULT_PRICING: dict[str, PriceRate] = {
         output_per_million=2.50,
         cached_text_per_million=0.03,
         cached_audio_per_million=0.03,
+    ),
+    # AWS Bedrock on-demand rates (USD per 1M tokens).
+    # Source: https://aws.amazon.com/bedrock/pricing/
+    # Claude 3 Haiku: $0.25 input / $1.25 output.
+    "aws_bedrock/anthropic.claude-3-haiku-20240307-v1:0": PriceRate(
+        input_text_per_million=0.25,
+        output_per_million=1.25,
+    ),
+    # Claude 3.5 Haiku: $0.80 input / $4.00 output.
+    "aws_bedrock/anthropic.claude-3-5-haiku-20241022-v1:0": PriceRate(
+        input_text_per_million=0.80,
+        output_per_million=4.00,
+    ),
+    # Anthropic direct API, standard (non-batch, non-fast-mode) tier.
+    # Source: https://platform.claude.com/docs/en/about-claude/pricing
+    # Checked 2026-11-06. Not yet reconciled against an actual invoice.
+    #
+    # Haiku 5.5 has a pricing cliff at 100,000 PROMPT tokens: above it, every
+    # rate here is 5x higher ($0.50 input / $2.50 output / $0.05 cached).
+    # This catalog has no per-request length awareness, so a request that
+    # crosses that threshold is silently costed at the rate below — an
+    # underestimate, not a safe fallback. Revisit if conversation history can
+    # ever realistically approach 100k tokens; today's interview prompts are
+    # nowhere close.
+    "anthropic/claude-haiku-5-5": PriceRate(
+        input_text_per_million=0.10,
+        output_per_million=0.50,
+        cached_text_per_million=0.01,
+    ),
+    # Text $2.00, output $10.00, cached text $0.10. No prompt-length cliff.
+    "anthropic/claude-sonnet-5-5": PriceRate(
+        input_text_per_million=2.00,
+        output_per_million=10.00,
+        cached_text_per_million=0.10,
     ),
 }
 
@@ -273,6 +291,27 @@ def bedrock_usage(response: object) -> AIUsage:
         measured=True,
         input_text_tokens=int(_value(usage, "inputTokens", "input_tokens", default=0) or 0),
         output_tokens=int(_value(usage, "outputTokens", "output_tokens", default=0) or 0),
+    )
+
+
+def anthropic_usage(response: object) -> AIUsage:
+    """Extract usage from an Anthropic Messages API response.
+
+    Accepts either the raw SDK response (`.usage.input_tokens` etc.) or a
+    wrapper exposing that response as `.raw` (see app/ai/factory.py and
+    app/ai/anthropic_completer.py), mirroring gemini_usage's raw/wrapped
+    duck-typing above.
+    """
+
+    raw = getattr(response, "raw", None) or response
+    usage = _value(raw, "usage", default=None)
+    if not usage:
+        return AIUsage()
+    return AIUsage(
+        measured=True,
+        input_text_tokens=int(_value(usage, "input_tokens", default=0) or 0),
+        output_tokens=int(_value(usage, "output_tokens", default=0) or 0),
+        cached_text_tokens=int(_value(usage, "cache_read_input_tokens", default=0) or 0),
     )
 
 

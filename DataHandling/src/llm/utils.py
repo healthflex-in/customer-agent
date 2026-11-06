@@ -1,7 +1,6 @@
-# Migrated from the deprecated `llama_index.llms.gemini.Gemini` wrapper to the
-# unified `llama_index.llms.google_genai.GoogleGenAI` wrapper, which uses
-# Google's current SDK and exposes usage metadata (token counts) on responses.
-from llama_index.llms.google_genai import GoogleGenAI
+# init_llm/init_reasoning_llm build whatever LLM_PROVIDER resolves to via
+# app.ai.factory.create_llm — Anthropic, Bedrock, or (by default) Gemini
+# through the unified llama_index.llms.google_genai.GoogleGenAI wrapper.
 from llama_index.core import Settings
 from src.enums import ENUMS
 import json
@@ -10,8 +9,9 @@ import time as _time
 from pathlib import Path
 from dotenv import load_dotenv
 from app.observability.privacy import error_type
-from app.observability.ai_usage import gemini_usage, tracked_ai_call
-from app.ai.models import MODEL_REGISTRY
+from app.observability.ai_usage import tracked_ai_call
+from app.ai.factory import create_llm, telemetry_provider_label, usage_extractor_for
+from app.ai.models import LLM_CONFIG
 
 # Load environment variables from .env file
 # Try multiple locations: current directory, parent directory, and relative to this file
@@ -49,21 +49,31 @@ def load_gemini_key(key_path=enums_obj.config_key_path):
         )
 
 
-def init_llm(api_key):
-    """Initialize the main LLM (flash-lite) for conversation flow."""
-    model_name = MODEL_REGISTRY.general
-    llm = GoogleGenAI(model=model_name, api_key=api_key)
-    Settings.llm = llm
+def init_llm(api_key=None):
+    """Initialize the main (general-role) LLM for conversation flow.
+
+    Provider + model name come from LLM_CONFIG (LLM_PROVIDER env var).
+    `api_key` is only consulted on the google_genai path, for backward
+    compatibility — Anthropic/Bedrock resolve their own credentials inside
+    create_llm().
+    """
+    model_name = LLM_CONFIG.general
+    llm = create_llm(model_name, api_key=api_key)
+    if LLM_CONFIG.provider == "google_genai":
+        # Settings.llm is a llama-index global consumed only by the optional,
+        # best-effort Chroma/RAG path below — not by the live LangGraph
+        # interview — so it's only meaningful for a real llama-index LLM.
+        Settings.llm = llm
     return llm
 
 
-def init_reasoning_llm(api_key):
+def init_reasoning_llm(api_key=None):
     """
-    Initialize the reasoning-grade Gemini model used exclusively for form extraction.
-    The model is selected through the validated model registry.
+    Initialize the reasoning-grade LLM used exclusively for form extraction.
+    The model is selected through LLM_CONFIG (LLM_PROVIDER env var).
     """
-    model_name = MODEL_REGISTRY.reasoning
-    return GoogleGenAI(model=model_name, api_key=api_key)
+    model_name = LLM_CONFIG.reasoning
+    return create_llm(model_name, api_key=api_key)
 
 
 def final_form_filling(llm, prompt, history, form):
@@ -76,15 +86,15 @@ def final_form_filling(llm, prompt, history, form):
         )
 
         _t0 = _time.perf_counter()
-        model_name = str(getattr(llm, "model", MODEL_REGISTRY.general))
+        model_name = str(getattr(llm, "model", LLM_CONFIG.general))
         if model_name.startswith("models/"):
             model_name = model_name.removeprefix("models/")
         response = tracked_ai_call(
-            provider="google_genai",
+            provider=telemetry_provider_label(LLM_CONFIG.provider),
             model=model_name,
             operation="final_form_legacy",
             call=lambda: llm.complete(prompt_text),
-            usage_extractor=gemini_usage,
+            usage_extractor=usage_extractor_for(LLM_CONFIG.provider),
         )
         print(f"[timing] final_form_filling_llm={(_time.perf_counter() - _t0) * 1000:.0f}ms")
 

@@ -18,11 +18,7 @@ from app.observability.privacy import error_type
 
 
 def _gemini_api_key() -> str:
-    api_key = (
-        os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_API_KEY")
-        or os.getenv("GOOGLE_GEMINI_API_KEY")
-    )
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         try:
             from src.llm.utils import load_gemini_key
